@@ -1,0 +1,31 @@
+[package]
+name = "st0x-oracle-server"
+version = "0.1.0"
+edition = "2021"
+description = "Signed context oracle server for st0x tokenized equities on Raindex"
+license = "CAL-1.0-Combined-Work-Exception"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+alloy = { version = "1.0", features = ["signers", "signer-local", "sol-types"] }
+rain-math-float = { path = "lib/rain.math.float/crates/float" }
+hex = "0.4"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["cors"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+wasm-bindgen = "=0.2.100"
+
+[patch."https://github.com/rainlanguage/rain.wasm"]
+wasm-bindgen-utils = { path = "lib/rain.wasm" }
+wasm-bindgen-utils-macros = { path = "lib/rain.wasm/macros" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

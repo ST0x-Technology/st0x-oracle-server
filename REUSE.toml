@@ -1,0 +1,6 @@
+version = 1
+
+[[annotations]]
+path = ["**"]
+SPDX-FileCopyrightText = "2026 ST0x Technology"
+SPDX-License-Identifier = "CAL-1.0-Combined-Work-Exception"
