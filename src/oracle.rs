@@ -17,8 +17,8 @@ pub struct OracleResponse {
 /// - For sell orders (input=tStock, output=USDC): 1/bid price (inverted)
 ///
 /// Context layout (all Rain DecimalFloats):
-/// - [0]: price
-/// - [1]: expiry timestamp
+/// - `context[0]`: price
+/// - `context[1]`: expiry timestamp
 pub fn build_context(
     price: f64,
     expiry: u64,
@@ -53,10 +53,7 @@ pub fn build_context(
     let price_bytes: alloy::primitives::B256 = final_price.into();
     let expiry_bytes: alloy::primitives::B256 = expiry_float.into();
 
-    Ok(vec![
-        FixedBytes::from(price_bytes),
-        FixedBytes::from(expiry_bytes),
-    ])
+    Ok(vec![price_bytes.into(), expiry_bytes.into()])
 }
 
 /// Format an f64 price as a string suitable for Float::parse.
