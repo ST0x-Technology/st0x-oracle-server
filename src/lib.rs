@@ -43,7 +43,12 @@ sol! {
     }
 }
 
-type OracleRequestBody = (OrderV4, alloy::primitives::U256, alloy::primitives::U256, Address);
+type OracleRequestBody = (
+    OrderV4,
+    alloy::primitives::U256,
+    alloy::primitives::U256,
+    Address,
+);
 
 pub struct AppState {
     signer: Signer,

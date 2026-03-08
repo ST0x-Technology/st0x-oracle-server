@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, Bytes, FixedBytes};
-use alloy::signers::Signer as AlloySigner;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer as AlloySigner;
 // EIP-191 signing for Rain signed context
 
 /// EIP-191 signer for Rain signed context.

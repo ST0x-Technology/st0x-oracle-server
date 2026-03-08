@@ -25,21 +25,30 @@ pub fn build_context(
     inverted: bool,
 ) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
     let price_str = format_price(price);
-    let price_float = Float::parse(price_str.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to parse price '{}' as Rain float: {:?}", price_str, e))?;
+    let price_float = Float::parse(price_str.clone()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse price '{}' as Rain float: {:?}",
+            price_str,
+            e
+        )
+    })?;
 
     let final_price = if inverted {
         let one = Float::parse("1".to_string())
             .map_err(|e| anyhow::anyhow!("Failed to parse '1' as Rain float: {:?}", e))?;
-        (one / price_float)
-            .map_err(|e| anyhow::anyhow!("Failed to invert price: {:?}", e))?
+        (one / price_float).map_err(|e| anyhow::anyhow!("Failed to invert price: {:?}", e))?
     } else {
         price_float
     };
 
     let expiry_str = expiry.to_string();
-    let expiry_float = Float::parse(expiry_str.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to parse expiry '{}' as Rain float: {:?}", expiry_str, e))?;
+    let expiry_float = Float::parse(expiry_str.clone()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse expiry '{}' as Rain float: {:?}",
+            expiry_str,
+            e
+        )
+    })?;
 
     let price_bytes: alloy::primitives::B256 = final_price.into();
     let expiry_bytes: alloy::primitives::B256 = expiry_float.into();

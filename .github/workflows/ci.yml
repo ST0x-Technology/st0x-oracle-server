@@ -1,0 +1,45 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.ref }}-ci
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  rust-checks:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        task: [oracle-rs-test, oracle-rs-static]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 10G
+
+      - name: Build sol artifacts
+        run: nix develop -c bash prep.sh
+
+      - name: Run ${{ matrix.task }}
+        run: nix develop -c ${{ matrix.task }}

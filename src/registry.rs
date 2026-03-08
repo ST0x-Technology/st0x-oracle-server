@@ -30,10 +30,7 @@ impl TokenRegistry {
     ///
     /// `entries` is a list of (token_address, alpaca_symbol) pairs.
     /// `quote_token` is the USDC address.
-    pub fn new(
-        entries: Vec<(String, String)>,
-        quote_token: &str,
-    ) -> anyhow::Result<Self> {
+    pub fn new(entries: Vec<(String, String)>, quote_token: &str) -> anyhow::Result<Self> {
         let quote = Address::from_str(quote_token)
             .map_err(|e| anyhow::anyhow!("Invalid quote token address: {}", e))?;
 
@@ -58,15 +55,9 @@ impl TokenRegistry {
     ) -> anyhow::Result<ResolvedPair> {
         // Case 1: input=USDC, output=tStock → price as-is (how many USDC per share)
         if input_token == self.quote_token {
-            let symbol = self
-                .tokens
-                .get(&output_token)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Unknown tStock token: {} (not in registry)",
-                        output_token
-                    )
-                })?;
+            let symbol = self.tokens.get(&output_token).ok_or_else(|| {
+                anyhow::anyhow!("Unknown tStock token: {} (not in registry)", output_token)
+            })?;
             return Ok(ResolvedPair {
                 symbol: symbol.clone(),
                 inverted: false,
@@ -75,15 +66,9 @@ impl TokenRegistry {
 
         // Case 2: input=tStock, output=USDC → inverted (how many shares per USDC)
         if output_token == self.quote_token {
-            let symbol = self
-                .tokens
-                .get(&input_token)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Unknown tStock token: {} (not in registry)",
-                        input_token
-                    )
-                })?;
+            let symbol = self.tokens.get(&input_token).ok_or_else(|| {
+                anyhow::anyhow!("Unknown tStock token: {} (not in registry)", input_token)
+            })?;
             return Ok(ResolvedPair {
                 symbol: symbol.clone(),
                 inverted: true,
@@ -106,8 +91,14 @@ mod tests {
     fn test_registry() -> TokenRegistry {
         TokenRegistry::new(
             vec![
-                ("0x1111111111111111111111111111111111111111".into(), "COIN".into()),
-                ("0x2222222222222222222222222222222222222222".into(), "RKLB".into()),
+                (
+                    "0x1111111111111111111111111111111111111111".into(),
+                    "COIN".into(),
+                ),
+                (
+                    "0x2222222222222222222222222222222222222222".into(),
+                    "RKLB".into(),
+                ),
             ],
             "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
         )

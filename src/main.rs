@@ -1,8 +1,8 @@
 use clap::Parser;
-use st0x_oracle_server::{create_app, AppState};
 use st0x_oracle_server::alpaca::AlpacaClient;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
+use st0x_oracle_server::{create_app, AppState};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
