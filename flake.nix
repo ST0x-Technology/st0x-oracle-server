@@ -1,37 +1,62 @@
 {
-  description = "st0x Oracle Server - Signed context oracle for st0x tokenized equities on Raindex";
+  description = "st0x Oracle Server - Signed context oracle for st0x tokenized equities";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    rainix.url = "github:rainlanguage/rainix";
     flake-utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+  outputs = { self, flake-utils, rainix, crane }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs { inherit system overlays; };
-        rustToolchain = pkgs.rust-bin.stable."1.89.0".default.override {
-          extensions = [ "rust-src" "clippy" "rustfmt" ];
-        };
+        pkgs = rainix.pkgs.${system};
+        craneLib =
+          (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
+        st0xRust = pkgs.callPackage ./rust.nix { inherit craneLib; };
       in {
-        devShells.default = pkgs.mkShell {
-          buildInputs = [
-            rustToolchain
-            pkgs.pkg-config
-            pkgs.openssl
-            pkgs.flyctl
-          ];
+        packages = rainix.packages.${system} // {
+          st0x-oracle-server = st0xRust.package;
+          default = st0xRust.package;
+
+          prepSolArtifacts = rainix.mkTask.${system} {
+            name = "prep-sol-artifacts";
+            additionalBuildInputs = rainix.sol-build-inputs.${system};
+            body = ''
+              set -euxo pipefail
+              (cd lib/rain.math.float/ && forge build)
+            '';
+          };
+
+          oracle-rs-test = rainix.mkTask.${system} {
+            name = "oracle-rs-test";
+            body = ''
+              set -euxo pipefail
+              cargo test
+            '';
+          };
+
+          oracle-rs-static = rainix.mkTask.${system} {
+            name = "oracle-rs-static";
+            body = ''
+              set -euxo pipefail
+              cargo fmt --all -- --check
+              cargo clippy -- -D warnings
+            '';
+          };
         };
 
-        packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "st0x-oracle-server";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.openssl ];
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            gh
+            self.packages.${system}.prepSolArtifacts
+            self.packages.${system}.oracle-rs-test
+            self.packages.${system}.oracle-rs-static
+          ];
+          shellHook = rainix.devShells.${system}.default.shellHook;
+          buildInputs = rainix.devShells.${system}.default.buildInputs;
+          nativeBuildInputs = rainix.devShells.${system}.default.nativeBuildInputs;
         };
-      });
+      }
+    );
 }
