@@ -1,0 +1,118 @@
+version: 4
+
+orders:
+  base:
+    orderbook: base
+    oracle-url: ${ORACLE_URL}
+    inputs:
+      - token: token1
+    outputs:
+      - token: token2
+
+scenarios:
+  base:
+    orderbook: base
+    runs: 1
+    bindings:
+      raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
+
+deployments:
+  base:
+    order: base
+    scenario: base
+
+tokens:
+  usdc:
+    network: base
+    address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+    decimals: 6
+    label: USDC
+    symbol: USDC
+
+gui:
+  name: st0x Oracle Limit
+  description: >
+    A limit order for st0x tokenized equities that uses the st0x oracle
+    server for pricing. The oracle provides real-time Alpaca NBBO quotes
+    signed by a trusted signer. The order uses the oracle price directly
+    as the IO ratio, ensuring on-chain pricing tracks executable
+    off-chain hedging prices.
+
+    The oracle automatically returns the correct price direction:
+    - Buy tStock (input USDC, output tStock): ask price
+    - Sell tStock (input tStock, output USDC): 1/bid price
+
+    This means the order always prices at the executable hedge price,
+    minimising basis risk between on-chain and off-chain positions.
+  short-description: A limit order for tStocks priced at real-time Alpaca NBBO via signed context oracle.
+  deployments:
+    base:
+      name: Base
+      description: Deploy an oracle-priced tStock limit order on Base.
+      deposits:
+        - token: token2
+      fields:
+        - binding: oracle-signer
+          name: Oracle Signer Address
+          description: >
+            The trusted signer address for the st0x oracle server. Only
+            signed contexts from this address will be accepted.
+        - binding: max-age
+          name: Max Price Age (seconds)
+          description: >
+            Maximum age of the oracle price in seconds. If the signed
+            context has expired beyond this threshold, the order will
+            revert. Default is 30 seconds.
+          default: 30
+          min: 5
+          max: 300
+      select-tokens:
+        - key: token1
+          name: Token to Buy
+          description: Select the token you want to purchase (e.g. wtCOIN, USDC)
+        - key: token2
+          name: Token to Sell
+          description: Select the token you want to sell (e.g. wtCOIN, USDC)
+
+---
+#raindex-subparser !The subparser to use.
+
+#oracle-signer !The trusted signer address for the st0x oracle server.
+
+#max-age !Maximum age of oracle price data in seconds before the order reverts. Default 30.
+
+#calculate-io
+using-words-from raindex-subparser
+
+/* Verify the signed context comes from the trusted st0x oracle signer */
+:ensure(
+  equal-to(signer<0>() oracle-signer)
+  "Untrusted oracle signer"
+),
+
+/* Read oracle price from signed context column 0, row 0 */
+oracle-price: signed-context<0 0>(),
+
+/* Read expiry timestamp from signed context column 0, row 1 */
+oracle-expiry: signed-context<0 1>(),
+
+/* Ensure the oracle data hasn't expired */
+:ensure(
+  greater-than(oracle-expiry now())
+  "Oracle data expired"
+),
+
+/* Ensure the price isn't too stale (expiry - max-age should be < now + max-age) */
+:ensure(
+  greater-than(oracle-expiry sub-saturating(now() max-age))
+  "Oracle price too stale"
+),
+
+max-output: max-positive-value(),
+ratio: oracle-price;
+
+#handle-io
+:;
+
+#handle-add-order
+:;
