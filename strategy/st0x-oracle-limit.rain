@@ -3,7 +3,7 @@ version: 4
 orders:
   base:
     orderbook: base
-    oracle-url: ${ORACLE_URL}
+    oracle-url: http://st0x-oracle.com
     inputs:
       - token: token1
     outputs:
@@ -15,6 +15,7 @@ scenarios:
     runs: 1
     bindings:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
+      oracle-signer: 0x0000000000000000000000000000000000000000
 
 deployments:
   base:
@@ -51,21 +52,7 @@ gui:
       description: Deploy an oracle-priced tStock limit order on Base.
       deposits:
         - token: token2
-      fields:
-        - binding: oracle-signer
-          name: Oracle Signer Address
-          description: >
-            The trusted signer address for the st0x oracle server. Only
-            signed contexts from this address will be accepted.
-        - binding: max-age
-          name: Max Price Age (seconds)
-          description: >
-            Maximum age of the oracle price in seconds. If the signed
-            context has expired beyond this threshold, the order will
-            revert. Default is 30 seconds.
-          default: 30
-          min: 5
-          max: 300
+      fields: []
       select-tokens:
         - key: token1
           name: Token to Buy
@@ -78,8 +65,6 @@ gui:
 #raindex-subparser !The subparser to use.
 
 #oracle-signer !The trusted signer address for the st0x oracle server.
-
-#max-age !Maximum age of oracle price data in seconds before the order reverts. Default 30.
 
 #calculate-io
 using-words-from raindex-subparser
@@ -100,12 +85,6 @@ oracle-expiry: signed-context<0 1>(),
 :ensure(
   greater-than(oracle-expiry now())
   "Oracle data expired"
-),
-
-/* Ensure the price isn't too stale (expiry - max-age should be < now + max-age) */
-:ensure(
-  greater-than(oracle-expiry sub-saturating(now() max-age))
-  "Oracle price too stale"
 ),
 
 max-output: max-positive-value(),
