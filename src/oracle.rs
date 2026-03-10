@@ -53,7 +53,7 @@ pub fn build_context(
     let price_bytes: alloy::primitives::B256 = final_price.into();
     let expiry_bytes: alloy::primitives::B256 = expiry_float.into();
 
-    Ok(vec![price_bytes.into(), expiry_bytes.into()])
+    Ok(vec![price_bytes, expiry_bytes])
 }
 
 /// Format an f64 price as a string suitable for Float::parse.
