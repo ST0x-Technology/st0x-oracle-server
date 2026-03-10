@@ -24,4 +24,4 @@ deployers:
 local-db-remotes:
   raindex: https://raindex-bootstrap-db.lon1.digitaloceanspaces.com/manifest.yaml
 using-tokens-from:
-  - https://raw.githubusercontent.com/ST0x-Technology/st0x.registry/main/token-lists/base.json
+  - https://raw.githubusercontent.com/S01-Issuer/st0x-tokens/ad1a637a79d5a220ad089aecdc5b7239d3473f6e/src/st0xTokens.json
