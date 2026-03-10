@@ -58,7 +58,7 @@ gui:
           description: >
             Floor price as a safety guard. If the oracle returns a price
             below this, the order reverts. Protects against catastrophic
-            mispricings or broken oracle data. Set based on the asset —
+            mispricings or broken oracle data. Set based on the asset -
             e.g. 0.01 for penny stocks, 10 for blue chips.
           default: 0.01
           min: 0.000001
@@ -111,11 +111,11 @@ oracle-expiry: signed-context<0 1>(),
 /*
  * SAFETY GUARDS
  * These protect against bugs, malformed oracle data, or server mishaps.
- * They are NOT market risk controls — expiry already handles that.
+ * They are NOT market risk controls - expiry already handles that.
  */
 
 /* Guard: zero ratio
- * A zero price means something is fundamentally broken — bad encoding,
+ * A zero price means something is fundamentally broken - bad encoding,
  * uninitialised data, or a server bug. Allowing it would give away
  * tokens for free. */
 :ensure(
@@ -126,7 +126,7 @@ oracle-expiry: signed-context<0 1>(),
 /* Guard: minimum price bound
  * Configurable floor to catch catastrophic mispricings. If the oracle
  * returns a price below this, something is broken upstream. Set per
- * asset — e.g. $0.01 for penny stocks, $10 for blue chips. */
+ * asset - e.g. $0.01 for penny stocks, $10 for blue chips. */
 :ensure(
   greater-than(oracle-price min-price)
   "Price below minimum bound"
@@ -134,7 +134,7 @@ oracle-expiry: signed-context<0 1>(),
 
 /* Guard: maximum price bound
  * Configurable ceiling to catch overflow or encoding errors. No single
- * equity share should price above this. Set per asset — e.g. $1,000
+ * equity share should price above this. Set per asset - e.g. $1,000
  * for a mid-cap, $100,000 as a generous catch-all. */
 :ensure(
   less-than(oracle-price max-price)
