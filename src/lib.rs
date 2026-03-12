@@ -158,6 +158,15 @@ async fn post_signed_context(
         quote.ask_price
     };
 
+    // Reject zero prices — market is likely closed or data is stale.
+    // Signing a zero price would allow taking tokens for free.
+    if price <= 0.0 {
+        return Err(AppError::BadRequest(format!(
+            "Zero or negative price for {} (bid={}, ask={}). Market may be closed.",
+            pair.symbol, quote.bid_price, quote.ask_price
+        )));
+    }
+
     tracing::info!(
         symbol = %pair.symbol,
         bid = quote.bid_price,
