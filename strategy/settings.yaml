@@ -17,16 +17,9 @@ orderbooks:
     subgraph: base
     deployment-block: 41747644
     local-db-remote: raindex
-deployers:
-  base:
-    address: 0xd905B56949284Bb1d28eeFC05be78Af69cCf3668
-    network: base
 rainlangs:
   base:
-    address: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
-    network: base
-rainlangs:
-  base:
+    address: 0x22508460712C350e914b49155982d3A92D923b10
     network: base
 local-db-remotes:
   raindex: https://raindex-bootstrap-db.lon1.digitaloceanspaces.com/manifest.yaml
