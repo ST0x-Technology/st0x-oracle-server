@@ -191,7 +191,7 @@ async fn post_signed_context(
         signature,
     };
 
-    Ok(Json(response))
+    Ok(Json(vec![response]))
 }
 
 pub enum AppError {
