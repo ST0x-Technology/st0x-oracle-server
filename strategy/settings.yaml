@@ -21,6 +21,9 @@ deployers:
   base:
     address: 0xd905B56949284Bb1d28eeFC05be78Af69cCf3668
     network: base
+rainlangs:
+  base:
+    network: base
 local-db-remotes:
   raindex: https://raindex-bootstrap-db.lon1.digitaloceanspaces.com/manifest.yaml
 using-tokens-from:
