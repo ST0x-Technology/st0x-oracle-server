@@ -124,19 +124,51 @@ async fn test_old_context_route_is_404() {
 async fn test_v1_invalid_body_returns_400() {
     let app = test_app().await;
 
+    // 5 bytes can't decode as either an ABI-encoded tuple or an
+    // ABI-encoded array of tuples, so both paths in decode_request_body
+    // must reject it.
     let response = app
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
                 .uri("/context/v1")
                 .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(vec![0u8; 32]))
+                .body(axum::body::Body::from(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00]))
                 .unwrap(),
         )
         .await
         .unwrap();
 
     assert_eq!(response.status(), 400);
+}
+
+#[tokio::test]
+async fn test_v1_empty_batch_returns_empty_array() {
+    let app = test_app().await;
+
+    // ABI-encoded empty Vec<OracleRequestTuple>: a properly encoded
+    // batch with zero elements. Per upstream contract the response
+    // length must match the request length, so this should be a 200
+    // with `[]`, not a 400.
+    let empty: Vec<(OrderV4, U256, U256, Address)> = Vec::new();
+    let body = Bytes::from(empty.abi_encode());
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v1")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert!(responses.is_empty(), "empty batch must return empty array");
 }
 
 #[tokio::test]

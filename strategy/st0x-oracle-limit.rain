@@ -124,8 +124,19 @@ oracle-price: signed-context<0 1>(),
 
 /* Read Alpaca-reported publish time (seconds since epoch) from
  * signed context column 0, row 2. This is the time Alpaca says the
- * price was valid at — NOT our fetch time or sign time. */
+ * price was valid at -- NOT our fetch time or sign time. */
 oracle-publish-time: signed-context<0 2>(),
+
+/* Future-timestamp guard: publish_time must not be ahead of
+ * block.timestamp. Without this, a future publish_time would make
+ * `sub(now() oracle-publish-time)` negative, and a negative number
+ * is always less than max-staleness, so the staleness check below
+ * would silently pass. Catches clock skew on the signer side and
+ * outright bad data. */
+:ensure(
+  less-than-or-equal-to(oracle-publish-time now())
+  "Oracle publish_time is in the future"
+),
 
 /* Staleness guard: reject if the quote is older than max-staleness
  * seconds relative to block.timestamp. */

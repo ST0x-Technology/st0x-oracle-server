@@ -52,7 +52,7 @@ USDC on Base is hardcoded as the quote token in `src/main.rs` — it's a chain i
 
 ### Endpoint
 
-```
+```http
 POST /context/v1
 Content-Type: application/octet-stream
 ```

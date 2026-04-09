@@ -27,6 +27,39 @@ impl QuoteCache {
     pub async fn get(&self, symbol: &str) -> Option<QuoteData> {
         self.entries.read().await.get(symbol).cloned()
     }
+
+    /// Snapshot multiple symbols under a single read lock.
+    ///
+    /// Used by the batch handler so that all elements of one HTTP
+    /// response are built from a coherent view of the cache. Without
+    /// this, the poll loop could update one entry between two
+    /// `get(...)` calls in the same batch, mixing quotes for the same
+    /// symbol within one response. Returned map only contains entries
+    /// that are currently cached — missing symbols are simply absent.
+    pub async fn snapshot_many(
+        &self,
+        symbols: &[&str],
+    ) -> std::collections::HashMap<String, QuoteData> {
+        let guard = self.entries.read().await;
+        let mut out = std::collections::HashMap::with_capacity(symbols.len());
+        for sym in symbols {
+            if let Some(q) = guard.get(*sym) {
+                out.insert((*sym).to_string(), q.clone());
+            }
+        }
+        out
+    }
+
+    /// Returns the set of symbols not currently cached. Used at startup
+    /// to gate readiness on every configured symbol being warm.
+    pub async fn missing(&self, symbols: &[String]) -> Vec<String> {
+        let guard = self.entries.read().await;
+        symbols
+            .iter()
+            .filter(|s| !guard.contains_key(s.as_str()))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Fetch every symbol once, updating the cache on success. Used both to
@@ -66,6 +99,12 @@ pub fn spawn_poll_loop(
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // tokio's default is `Burst`, which queues missed ticks and fires
+        // them back-to-back when the task catches up. If a poll ever
+        // overruns the interval (slow Alpaca, network blip), that would
+        // hammer Alpaca with rapid catch-up calls and risk rate limiting.
+        // Skip just rebases onto the current schedule.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // first tick is immediate; we already prime synchronously at
         // startup, so skip it to avoid a double-poll right at boot.
         ticker.tick().await;

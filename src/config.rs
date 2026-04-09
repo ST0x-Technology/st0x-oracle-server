@@ -1,5 +1,6 @@
 use alloy::primitives::Address;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -39,11 +40,22 @@ impl Config {
         if self.tokens.is_empty() {
             anyhow::bail!("config.toml has no [[tokens]] entries");
         }
+        // Reject duplicate addresses up front. The TokenRegistry stores
+        // entries in a HashMap so a repeated address would silently
+        // overwrite the earlier symbol — better to fail loud at config
+        // load than serve the wrong market for that token.
+        let mut seen_addresses: HashSet<Address> = HashSet::with_capacity(self.tokens.len());
         for t in &self.tokens {
-            Address::from_str(&t.address)
+            let addr = Address::from_str(&t.address)
                 .map_err(|e| anyhow::anyhow!("Invalid token address {:?}: {}", t.address, e))?;
             if t.symbol.trim().is_empty() {
                 anyhow::bail!("Empty symbol for token {}", t.address);
+            }
+            if !seen_addresses.insert(addr) {
+                anyhow::bail!(
+                    "Duplicate token address {} in config.toml — each address must appear at most once",
+                    t.address
+                );
             }
         }
         if self.poll_interval_secs == 0 {
@@ -113,6 +125,26 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_addresses() {
+        // Addresses with different casing should still be rejected (the
+        // Address parser normalizes via checksum decode).
+        let text = r#"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "COIN"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "OTHER"
+        "#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("Duplicate token address"),
+            "expected duplicate-address error, got: {err}"
+        );
     }
 
     #[test]

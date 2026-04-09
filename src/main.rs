@@ -72,10 +72,27 @@ async fn main() -> anyhow::Result<()> {
 
     // Prime the cache synchronously before opening the socket so the
     // first /context/v1 request doesn't race the poll loop.
+    // Prime the cache synchronously before opening the socket. We
+    // *require* every configured symbol to be present after priming —
+    // /context/v1 would otherwise degrade to 503 for those symbols on a
+    // cold start, which is the failure mode this is trying to avoid.
+    // Failing fast here forces the operator to notice and react instead
+    // of silently coming up half-warm.
     let cache = Arc::new(QuoteCache::new());
     let symbols = config.symbols();
     tracing::info!("Priming quote cache with {} symbols...", symbols.len());
     poll_once(&cache, &alpaca, &symbols).await;
+    let missing = cache.missing(&symbols).await;
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Initial cache warm-up failed for {} symbol(s): {}. \
+             Refusing to start with an incomplete cache. Check Alpaca \
+             credentials, network reachability, and ticker spelling in config.toml.",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+    tracing::info!("Cache primed for all {} symbols", symbols.len());
 
     // Start background poller.
     spawn_poll_loop(
