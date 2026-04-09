@@ -135,7 +135,7 @@ oracle-publish-time: signed-context<0 2>(),
  * outright bad data. */
 :ensure(
   less-than-or-equal-to(oracle-publish-time now())
-  "Oracle publish_time is in the future"
+  "Publish time in future"
 ),
 
 /* Staleness guard: reject if the quote is older than max-staleness
