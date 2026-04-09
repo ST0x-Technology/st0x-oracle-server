@@ -1,0 +1,58 @@
+# st0x-oracle-server runtime config. Secrets (SIGNER_PRIVATE_KEY,
+# ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY) are supplied via environment
+# variables — only non-secret operational settings live here.
+
+port = 3000
+
+# How often the background poller fetches fresh quotes from Alpaca for
+# every configured symbol. Requests to /context/v1 always serve from this
+# cache — they never hit Alpaca synchronously.
+poll_interval_secs = 10
+
+# Token registry: maps on-chain Base token addresses (st0x wrapped
+# equities) to Alpaca tickers. USDC is the implicit quote token and is
+# hardcoded in main.rs because it's a chain invariant.
+
+[[tokens]]
+address = "0x997baE3EC193a249596d3708C3fAB7C501Bb8a53"
+symbol  = "AMZN"
+
+[[tokens]]
+address = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
+symbol  = "BMNR"
+
+[[tokens]]
+address = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"
+symbol  = "COIN"
+
+[[tokens]]
+address = "0x8AFba81DEc38DE0A18E2Df5E1967a7493651eebf"
+symbol  = "CRCL"
+
+[[tokens]]
+address = "0x1E46d7eFef64A833AFB1CD49299a7AD5B439f4d8"
+symbol  = "IAU"
+
+[[tokens]]
+address = "0xFF05E1bD696900dc6A52CA35Ca61Bb1024eDa8e2"
+symbol  = "MSTR"
+
+[[tokens]]
+address = "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"
+symbol  = "NVDA"
+
+[[tokens]]
+address = "0x82f5BAEE1076334357a34A19E04f7c282D51cE47"
+symbol  = "PPLT"
+
+[[tokens]]
+address = "0xEB7F3E4093C9d68253b6104FbbfF561F3eC0442F"
+symbol  = "SIVR"
+
+[[tokens]]
+address = "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"
+symbol  = "SPYM"
+
+[[tokens]]
+address = "0x219A8d384a10BF19b9f24cB5cC53F79Dd0e5A03D"
+symbol  = "TSLA"

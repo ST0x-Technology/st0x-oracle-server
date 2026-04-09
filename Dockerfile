@@ -5,6 +5,7 @@ WORKDIR /app
 # Copy source and config
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY config.toml ./config.toml
 COPY .gitmodules ./
 
 # Clone submodules directly (avoids needing them initialized locally)
@@ -20,4 +21,6 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/st0x-oracle-server /usr/local/bin/
+COPY config.toml /app/config.toml
+WORKDIR /app
 ENTRYPOINT ["st0x-oracle-server"]

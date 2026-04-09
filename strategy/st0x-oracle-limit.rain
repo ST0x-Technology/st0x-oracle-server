@@ -3,7 +3,7 @@ version: 5
 orders:
   base:
     orderbook: base
-    oracle-url: https://st0x-oracle-server.fly.dev/context
+    oracle-url: https://st0x-oracle-server.fly.dev/context/v1
     inputs:
       - token: token1
     outputs:
@@ -17,6 +17,7 @@ scenarios:
     bindings:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-schema-version: 1
 
 deployments:
   base:
@@ -72,6 +73,16 @@ gui:
             asset's expected range.
           default: 100000
           min: 1
+        - binding: max-staleness
+          name: Max Staleness (seconds)
+          description: >
+            Maximum allowed age (in seconds) of the oracle's Alpaca
+            publish_time relative to block.timestamp. If the cached
+            oracle quote is older than this, the order reverts. 30
+            seconds is a reasonable default given the server polls
+            Alpaca every 10 seconds.
+          default: 30
+          min: 1
       select-tokens:
         - key: token1
           name: Token to Buy
@@ -84,9 +95,11 @@ gui:
 #raindex-subparser !The subparser to use.
 
 #oracle-signer !The trusted signer address for the st0x oracle server.
+#oracle-schema-version !Expected oracle context schema version.
 
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
 #max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
+#max-staleness !Maximum age in seconds between Alpaca publish_time and block.timestamp. Orders revert past this.
 
 #calculate-io
 using-words-from raindex-subparser
@@ -97,22 +110,37 @@ using-words-from raindex-subparser
   "Untrusted oracle signer"
 ),
 
-/* Read oracle price from signed context column 0, row 0 */
-oracle-price: signed-context<0 0>(),
-
-/* Read expiry timestamp from signed context column 0, row 1 */
-oracle-expiry: signed-context<0 1>(),
-
-/* Ensure the oracle data hasn't expired */
+/* Schema version guard
+ * If the server ever changes the context layout, live orders must
+ * revert instead of interpreting the new layout as the old one. */
+oracle-version: signed-context<0 0>(),
 :ensure(
-  greater-than(oracle-expiry now())
-  "Oracle data expired"
+  equal-to(oracle-version oracle-schema-version)
+  "Oracle schema version mismatch"
+),
+
+/* Read oracle price from signed context column 0, row 1 */
+oracle-price: signed-context<0 1>(),
+
+/* Read Alpaca-reported publish time (seconds since epoch) from
+ * signed context column 0, row 2. This is the time Alpaca says the
+ * price was valid at — NOT our fetch time or sign time. */
+oracle-publish-time: signed-context<0 2>(),
+
+/* Staleness guard: reject if the quote is older than max-staleness
+ * seconds relative to block.timestamp. */
+:ensure(
+  less-than-or-equal-to(
+    sub(now() oracle-publish-time)
+    max-staleness
+  )
+  "Oracle data stale"
 ),
 
 /*
  * SAFETY GUARDS
  * These protect against bugs, malformed oracle data, or server mishaps.
- * They are NOT market risk controls - expiry already handles that.
+ * They are NOT market risk controls - staleness already handles that.
  */
 
 /* Guard: zero ratio

@@ -1,3 +1,4 @@
+use crate::config::TokenEntry;
 use alloy::primitives::Address;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -45,6 +46,15 @@ impl TokenRegistry {
             tokens,
             quote_token: quote,
         })
+    }
+
+    /// Build a registry from parsed config.toml entries.
+    pub fn from_config(entries: &[TokenEntry], quote_token: &str) -> anyhow::Result<Self> {
+        let pairs: Vec<(String, String)> = entries
+            .iter()
+            .map(|t| (t.address.clone(), t.symbol.clone()))
+            .collect();
+        Self::new(pairs, quote_token)
     }
 
     /// Resolve an input/output token pair to an Alpaca symbol and direction.
