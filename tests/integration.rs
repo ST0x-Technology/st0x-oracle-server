@@ -232,9 +232,9 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
     let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
     assert_eq!(version.format().unwrap(), SCHEMA_VERSION.to_string());
 
-    // price (ask = 101.0 for buys)
+    // price (bid = 100.0 — we always use bid, inverted via Float when needed)
     let price = Float::from(alloy::primitives::B256::from(resp.context[1]));
-    assert_eq!(price.format().unwrap(), "101");
+    assert_eq!(price.format().unwrap(), "100");
 
     // publish_time = the cached Alpaca `t`, not server now().
     // Compare against a Float-round-tripped canonical form since Rain
@@ -271,9 +271,9 @@ async fn test_v1_batch_returns_length_matching_array() {
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
-    // First: buy → ask (101)
+    // First: buy → bid (100) — both directions use the same underlying price
     let buy_price = Float::from(alloy::primitives::B256::from(responses[0].context[1]));
-    assert_eq!(buy_price.format().unwrap(), "101");
+    assert_eq!(buy_price.format().unwrap(), "100");
 
     // Second: sell → 1/bid, where bid = 100 → exactly 0.01
     let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));

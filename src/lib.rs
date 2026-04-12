@@ -215,13 +215,12 @@ async fn build_response_from_quote(
     pair: &ResolvedPair,
     quote: &crate::alpaca::QuoteData,
 ) -> Result<oracle::OracleResponse, AppError> {
-    // Select the side we want to sign. For inverted pairs we pass the raw
-    // bid to build_context and let it invert in Rain Float precision.
-    let raw_price = if pair.inverted {
-        quote.bid_price
-    } else {
-        quote.ask_price
-    };
+    // Use a single price for both directions. The bid is the most
+    // reliably populated side of the NBBO — the ask is often zero on
+    // free-tier Alpaca data outside regular hours. build_context()
+    // handles inversion in Rain Float precision when needed, so we
+    // always pass the same underlying price regardless of direction.
+    let raw_price = quote.bid_price;
 
     if raw_price <= 0.0 {
         return Err(AppError::BadRequest(format!(
