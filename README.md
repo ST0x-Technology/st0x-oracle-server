@@ -6,12 +6,13 @@ Serves `SignedContextV1` data using real-time Alpaca NBBO quotes, enabling Raind
 
 ## How it works
 
-1. Receives ABI-encoded order data from a Raindex solver/taker
-2. Resolves the order's input/output tokens to an Alpaca ticker via the token registry
-3. Fetches the latest NBBO quote from Alpaca Markets API
-4. Selects the executable price (ask for buys, bid for sells)
-5. Encodes price + expiry as Rain DecimalFloats
-6. Signs via EIP-191 and returns `SignedContextV1`
+1. A background loop polls Alpaca every `poll_interval_secs` (default 10s) for every configured symbol and caches the quote alongside its Alpaca-reported timestamp.
+2. On each `POST /context/v1`, the server decodes the ABI-encoded request body, resolves the input/output tokens to an Alpaca ticker via the token registry, and serves the **cached** quote — it never hits Alpaca synchronously.
+3. Selects the executable price (ask for buys, `1/bid` for sells), encoding the inversion in Rain DecimalFloat precision (not f64).
+4. Encodes `[schema_version, price, publish_time]` as Rain DecimalFloats where `publish_time` is Alpaca's own quote timestamp (NOT our fetch time).
+5. Signs via EIP-191 and returns a JSON array of `OracleResponse` whose length matches the request length.
+
+If Alpaca is temporarily unreachable, the poll loop logs the error and leaves the previous cached quote in place. The Rainlang strategy bounds freshness via a `max-staleness` guard against `block.timestamp`.
 
 ## Usage
 
@@ -19,52 +20,73 @@ Serves `SignedContextV1` data using real-time Alpaca NBBO quotes, enabling Raind
 # Enter nix dev shell
 nix develop
 
-# Run with required config
+# Run with secrets in env + config.toml on disk
 SIGNER_PRIVATE_KEY=0x... \
 ALPACA_API_KEY_ID=... \
 ALPACA_API_SECRET_KEY=... \
-TOKEN_REGISTRY=0xTOKEN_ADDR=COIN,0xTOKEN_ADDR=RKLB \
-cargo run
+cargo run -- --config config.toml
 ```
 
-### Environment variables
+### Environment variables (secrets only)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SIGNER_PRIVATE_KEY` | (required) | Hex private key for EIP-191 signing |
-| `ALPACA_API_KEY_ID` | (required) | Alpaca read-only API key |
-| `ALPACA_API_SECRET_KEY` | (required) | Alpaca API secret |
-| `TOKEN_REGISTRY` | (required) | Comma-separated `ADDRESS=SYMBOL` pairs |
-| `EXPIRY_SECONDS` | `5` | Signed context expiry in seconds |
-| `PORT` | `3000` | Server port |
+| Variable | Description |
+|----------|-------------|
+| `SIGNER_PRIVATE_KEY` | Hex private key for EIP-191 signing |
+| `ALPACA_API_KEY_ID` | Alpaca read-only API key |
+| `ALPACA_API_SECRET_KEY` | Alpaca API secret |
+
+### config.toml
+
+Everything non-secret lives in `config.toml` at the repo root:
+
+```toml
+port = 3000
+poll_interval_secs = 10
+
+[[tokens]]
+address = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"
+symbol  = "COIN"
+```
+
+USDC on Base is hardcoded as the quote token in `src/main.rs` — it's a chain invariant.
 
 ### Endpoint
 
-```
-POST /context
+```http
+POST /context/v1
 Content-Type: application/octet-stream
-Body: ABI-encoded (OrderV4, uint256 inputIOIndex, uint256 outputIOIndex, address counterparty)
 ```
 
-Response:
+Accepts either form (matching upstream `rain.orderbook/crates/quote/src/oracle.rs`):
+
+- **Single**: ABI-encoded `(OrderV4, uint256 inputIOIndex, uint256 outputIOIndex, address counterparty)`
+- **Batch**:  ABI-encoded `(OrderV4, uint256, uint256, address)[]`
+
+The response is always a JSON array of `OracleResponse`, with length matching the request:
+
 ```json
-{
-  "signer": "0x...",
-  "context": ["0x...", "0x..."],
-  "signature": "0x..."
-}
+[
+  {
+    "signer": "0x...",
+    "context": ["0x...", "0x...", "0x..."],
+    "signature": "0x..."
+  }
+]
 ```
 
-Context layout (Rain DecimalFloats):
-- `context[0]`: price (ask for buys, 1/bid for sells)
-- `context[1]`: expiry timestamp
+Schema v1 context layout (all Rain DecimalFloats):
+- `context[0]`: schema version (= 1)
+- `context[1]`: price (ask for buys, `1/bid` for sells)
+- `context[2]`: publish_time — Alpaca's own quote timestamp as Unix seconds UTC
+
+The old `/context` endpoint has been removed; it now returns `404`.
 
 ### Price direction
 
 The server automatically determines price direction from the order's IO tokens:
 
 - **Buy tStock** (input=USDC, output=tStock): returns **ask price** (cost to buy)
-- **Sell tStock** (input=tStock, output=USDC): returns **1/bid price** (inverted)
+- **Sell tStock** (input=tStock, output=USDC): returns **1/bid price** (inverted in Rain Float precision)
 
 This ensures the on-chain price matches what can be immediately hedged on Alpaca.
 

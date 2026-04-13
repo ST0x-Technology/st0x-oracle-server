@@ -20,6 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
+toml = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "now"] }
 wasm-bindgen = "=0.2.100"
 
 [patch."https://github.com/rainlanguage/rain.wasm"]

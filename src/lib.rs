@@ -1,4 +1,6 @@
 pub mod alpaca;
+pub mod cache;
+pub mod config;
 pub mod oracle;
 pub mod registry;
 pub mod sign;
@@ -19,8 +21,8 @@ use sign::Signer;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::alpaca::AlpacaClient;
-use crate::registry::TokenRegistry;
+use crate::cache::QuoteCache;
+use crate::registry::{ResolvedPair, TokenRegistry};
 
 sol! {
     struct IOV2 {
@@ -43,7 +45,14 @@ sol! {
     }
 }
 
-type OracleRequestBody = (
+/// Upstream (`rain.orderbook/crates/quote/src/oracle.rs`) posts one of
+/// two ABI-encoded shapes:
+/// - single: `(OrderV4, uint256 inputIOIndex, uint256 outputIOIndex, address counterparty)`
+/// - batch:  `(OrderV4, uint256, uint256, address)[]`
+///
+/// We decode either. The response is always a JSON array of
+/// `OracleResponse` whose length matches the number of requests.
+type OracleRequestTuple = (
     OrderV4,
     alloy::primitives::U256,
     alloy::primitives::U256,
@@ -52,23 +61,16 @@ type OracleRequestBody = (
 
 pub struct AppState {
     signer: Signer,
-    alpaca: AlpacaClient,
     registry: TokenRegistry,
-    expiry_seconds: u64,
+    cache: Arc<QuoteCache>,
 }
 
 impl AppState {
-    pub fn new(
-        signer: Signer,
-        alpaca: AlpacaClient,
-        registry: TokenRegistry,
-        expiry_seconds: u64,
-    ) -> Self {
+    pub fn new(signer: Signer, registry: TokenRegistry, cache: Arc<QuoteCache>) -> Self {
         Self {
             signer,
-            alpaca,
             registry,
-            expiry_seconds,
+            cache,
         }
     }
 
@@ -81,7 +83,7 @@ pub fn create_app(state: AppState) -> Router {
     let shared_state = Arc::new(state);
     Router::new()
         .route("/", get(health))
-        .route("/context", post(post_signed_context))
+        .route("/context/v1", post(post_signed_context_v1))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -96,15 +98,71 @@ struct ErrorResponse {
     detail: String,
 }
 
-async fn post_signed_context(
+/// Decode the POST body as either a single tuple or a batch array.
+/// Returns a `Vec` in either case so downstream logic is uniform.
+///
+/// We try the batch form first because the empty-batch case (`[]`) is
+/// a valid input upstream — returning an empty response array preserves
+/// the "response length matches request length" contract. A batch
+/// containing one element will also decode correctly here. Only when
+/// the batch decoder rejects the body do we fall back to the single
+/// tuple form (which is what most current callers send).
+fn decode_request_body(body: &[u8]) -> Result<Vec<OracleRequestTuple>, AppError> {
+    if let Ok(batch) = <Vec<OracleRequestTuple>>::abi_decode(body) {
+        return Ok(batch);
+    }
+    let single = <OracleRequestTuple>::abi_decode(body)
+        .map_err(|e| AppError::BadRequest(format!("Invalid ABI-encoded body: {}", e)))?;
+    Ok(vec![single])
+}
+
+async fn post_signed_context_v1(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    // Decode ABI-encoded request
-    let (order, input_io_index, output_io_index, _counterparty) =
-        <OracleRequestBody>::abi_decode(&body)
-            .map_err(|e| AppError::BadRequest(format!("Invalid ABI-encoded body: {}", e)))?;
+    let requests = decode_request_body(&body)?;
 
+    if requests.is_empty() {
+        return Ok(Json(Vec::<oracle::OracleResponse>::new()));
+    }
+
+    // Resolve every request's token pair first so we know which symbols
+    // we need from the cache. This lets us take a single snapshot of
+    // exactly those entries, so a poll loop update mid-iteration can't
+    // mix quotes (or publish_time values) for the same symbol within
+    // one HTTP response.
+    let mut resolved: Vec<(OrderV4, ResolvedPair)> = Vec::with_capacity(requests.len());
+    for (order, input_io_index, output_io_index, _counterparty) in requests {
+        let pair = resolve_pair_for_order(&state, &order, input_io_index, output_io_index)?;
+        resolved.push((order, pair));
+    }
+
+    let needed_symbols: Vec<&str> = resolved.iter().map(|(_, p)| p.symbol.as_str()).collect();
+    let snapshot = state.cache.snapshot_many(&needed_symbols).await;
+
+    let mut responses = Vec::with_capacity(resolved.len());
+    for (_, pair) in &resolved {
+        let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
+            AppError::Unavailable(format!(
+                "No cached quote for {} yet. The poll loop has not succeeded since startup.",
+                pair.symbol
+            ))
+        })?;
+        let resp = build_response_from_quote(&state, pair, &quote).await?;
+        responses.push(resp);
+    }
+
+    Ok(Json(responses))
+}
+
+/// Decode a request's IO indices into the actual input/output addresses
+/// and look them up in the token registry. Pure: never touches the cache.
+fn resolve_pair_for_order(
+    state: &AppState,
+    order: &OrderV4,
+    input_io_index: alloy::primitives::U256,
+    output_io_index: alloy::primitives::U256,
+) -> Result<ResolvedPair, AppError> {
     let input_idx: usize = input_io_index.try_into().unwrap_or(usize::MAX);
     let output_idx: usize = output_io_index.try_into().unwrap_or(usize::MAX);
 
@@ -132,8 +190,7 @@ async fn post_signed_context(
         })?
         .token;
 
-    // Resolve token pair to Alpaca symbol + direction
-    let pair = state
+    let pair: ResolvedPair = state
         .registry
         .resolve(input_token, output_token)
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -146,57 +203,65 @@ async fn post_signed_context(
         "Oracle request"
     );
 
-    // Fetch NBBO quote from Alpaca
-    let quote = state.alpaca.latest_quote(&pair.symbol).await?;
+    Ok(pair)
+}
 
-    // Use the executable price:
-    // - Buy tStock (not inverted): taker pays ask price
-    // - Sell tStock (inverted): taker receives bid price (then we invert)
-    let price = if pair.inverted {
-        quote.bid_price
-    } else {
-        quote.ask_price
-    };
+/// Build a signed response from a pre-resolved pair and a snapshotted
+/// quote. All quotes for a single batch must come from one snapshot so
+/// concurrent poller updates can't mix prices/publish_times across
+/// elements of the same response.
+async fn build_response_from_quote(
+    state: &AppState,
+    pair: &ResolvedPair,
+    quote: &crate::alpaca::QuoteData,
+) -> Result<oracle::OracleResponse, AppError> {
+    // Use a single price for both directions. The bid is the most
+    // reliably populated side of the NBBO — the ask is often zero on
+    // free-tier Alpaca data outside regular hours. build_context()
+    // handles inversion in Rain Float precision when needed, so we
+    // always pass the same underlying price regardless of direction.
+    let raw_price = quote.bid_price;
 
-    // Reject zero prices — market is likely closed or data is stale.
-    // Signing a zero price would allow taking tokens for free.
-    if price <= 0.0 {
+    if raw_price <= 0.0 {
         return Err(AppError::BadRequest(format!(
-            "Zero or negative price for {} (bid={}, ask={}). Market may be closed.",
+            "Zero or negative price for {} (bid={}, ask={}). Market may be closed or data is bad.",
             pair.symbol, quote.bid_price, quote.ask_price
         )));
     }
+
+    let publish_time: u64 = quote
+        .t
+        .timestamp()
+        .try_into()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
 
     tracing::info!(
         symbol = %pair.symbol,
         bid = quote.bid_price,
         ask = quote.ask_price,
-        selected_price = price,
+        raw_price = raw_price,
         inverted = pair.inverted,
-        "Alpaca NBBO"
+        publish_time = publish_time,
+        "Building signed context from cache"
     );
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let expiry = now + state.expiry_seconds;
-
-    let context = oracle::build_context(price, expiry, pair.inverted)?;
+    let context = oracle::build_context(raw_price, publish_time, pair.inverted)?;
     let (signature, signer) = state.signer.sign_context(&context).await?;
 
-    let response = oracle::OracleResponse {
+    Ok(oracle::OracleResponse {
         signer,
         context,
         signature,
-    };
-
-    Ok(Json(vec![response]))
+    })
 }
 
 pub enum AppError {
     Internal(anyhow::Error),
     BadRequest(String),
+    /// The server is alive but the poll loop hasn't produced a quote yet
+    /// for this symbol. Distinct from BadRequest because it's transient
+    /// and retrying may succeed.
+    Unavailable(String),
 }
 
 impl IntoResponse for AppError {
@@ -219,6 +284,17 @@ impl IntoResponse for AppError {
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
                         error: "bad_request".to_string(),
+                        detail,
+                    }),
+                )
+                    .into_response()
+            }
+            AppError::Unavailable(detail) => {
+                tracing::warn!("Service unavailable: {}", detail);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "service_unavailable".to_string(),
                         detail,
                     }),
                 )
