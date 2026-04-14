@@ -197,7 +197,7 @@ async fn test_v1_unknown_token_returns_200_with_inner_err() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
 
-    matches!(responses[0], OracleResponse::Err(_));
+    assert!(matches!(responses[0], OracleResponse::Err(_)));
 }
 
 #[tokio::test]
