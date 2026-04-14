@@ -172,7 +172,7 @@ async fn test_v1_empty_batch_returns_empty_array() {
 }
 
 #[tokio::test]
-async fn test_v1_unknown_token_returns_400() {
+async fn test_v1_unknown_token_returns_200_with_inner_err() {
     let app = test_app().await;
 
     let body = encode_single(
@@ -192,7 +192,12 @@ async fn test_v1_unknown_token_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 400);
+    assert_eq!(response.status(), 200);
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+
+    matches!(responses[0], OracleResponse::Err(_));
 }
 
 #[tokio::test]
@@ -221,7 +226,7 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
         1,
         "single-request must return length-1 array"
     );
-    let resp = &responses[0];
+    let resp = responses[0].as_result().unwrap();
     assert_eq!(
         resp.context.len(),
         3,
@@ -272,10 +277,14 @@ async fn test_v1_batch_returns_length_matching_array() {
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
     // First: buy → bid (100) — both directions use the same underlying price
-    let buy_price = Float::from(alloy::primitives::B256::from(responses[0].context[1]));
+    let buy_price = Float::from(alloy::primitives::B256::from(
+        responses[0].as_result().unwrap().context[1],
+    ));
     assert_eq!(buy_price.format().unwrap(), "100");
 
     // Second: sell → 1/bid, where bid = 100 → exactly 0.01
-    let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
+    let sell_price = Float::from(alloy::primitives::B256::from(
+        responses[1].as_result().unwrap().context[1],
+    ));
     assert_eq!(sell_price.format().unwrap(), "0.01");
 }
