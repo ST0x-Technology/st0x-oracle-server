@@ -19,6 +19,7 @@ const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7b
 // Token addresses for testing
 const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x1111111111111111111111111111111111111111";
+const UNKNOWN_TOKEN: &str = "0x2222222222222222222222222222222222222222";
 
 const FIXED_PUBLISH_TIME: i64 = 1_800_000_000;
 
@@ -287,4 +288,44 @@ async fn test_v1_batch_returns_length_matching_array() {
         responses[1].as_result().unwrap().context[1],
     ));
     assert_eq!(sell_price.format().unwrap(), "0.01");
+}
+
+#[tokio::test]
+async fn test_v1_batch_returns_mixed_result() {
+    let app = test_app().await;
+    // Two orders: one i sknown and chade, other is unknown and not cached.
+    let body = encode_batch(&[(USDC, WCOIN), (UNKNOWN_TOKEN, USDC)]);
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v1")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
+
+    // First: known order pair
+    let buy_price = Float::from(alloy::primitives::B256::from(
+        responses[0].as_result().unwrap().context[1],
+    ));
+    assert_eq!(buy_price.format().unwrap(), "100");
+
+    // Second: error as the UNKNOWN_TOKEN is not cached
+    assert_eq!(
+        responses[1].as_result().unwrap_err().msg,
+        format!(
+            "Bad request: Unknown tStock token: {} (not in registry)",
+            UNKNOWN_TOKEN.to_string()
+        )
+    );
 }
