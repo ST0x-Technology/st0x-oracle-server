@@ -37,7 +37,9 @@ impl From<AppError> for OracleErrResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum OracleResult {
+    #[serde(rename = "ok")]
     Ok(OracleOkResponse),
+    #[serde(rename = "error")]
     Err(OracleErrResponse),
 }
 impl OracleResult {
