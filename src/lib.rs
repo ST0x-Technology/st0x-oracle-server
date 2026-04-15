@@ -22,10 +22,13 @@ use std::sync::Arc;
 use thiserror::Error;
 use tower_http::cors::CorsLayer;
 
-use crate::registry::{ResolvedPair, TokenRegistry};
 use crate::{
     cache::QuoteCache,
-    oracle::{OracleErrResponse, OracleOkResponse, OracleResponse},
+    oracle::{OracleErrResponse, OracleOkResponse, OracleResult},
+};
+use crate::{
+    oracle::OracleResponse,
+    registry::{ResolvedPair, TokenRegistry},
 };
 
 sol! {
@@ -127,7 +130,7 @@ async fn post_signed_context_v1(
     let requests = decode_request_body(&body)?;
 
     if requests.is_empty() {
-        return Ok(Json(Vec::<oracle::OracleResponse>::new()));
+        return Ok(Json(OracleResponse::new()));
     }
 
     // Resolve every request's token pair first so we know which symbols
@@ -148,19 +151,19 @@ async fn post_signed_context_v1(
         .collect();
     let snapshot = state.cache.snapshot_many(&needed_symbols).await;
 
-    let mut responses = Vec::with_capacity(resolved.len());
+    let mut responses: OracleResponse = Vec::with_capacity(resolved.len());
     for (_, res) in resolved {
         let resp = match res {
             Ok(pair) => {
                 match snapshot.get(&pair.symbol).cloned() {
                     Some(quote) => build_response_from_quote(&state, &pair, &quote).await,
-                    None => OracleResponse::Err(AppError::Unavailable(format!(
+                    None => OracleResult::Err(AppError::Unavailable(format!(
                         "No cached quote for {} yet. The poll loop has not succeeded since startup.",
                         pair.symbol
                     )).into())
                 }
             }
-            Err(e) => OracleResponse::Err(e),
+            Err(e) => OracleResult::Err(e),
         };
         responses.push(resp);
     }
@@ -227,7 +230,7 @@ async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
     quote: &crate::alpaca::QuoteData,
-) -> OracleResponse {
+) -> OracleResult {
     // Use a single price for both directions. The bid is the most
     // reliably populated side of the NBBO — the ask is often zero on
     // free-tier Alpaca data outside regular hours. build_context()
@@ -236,7 +239,7 @@ async fn build_response_from_quote(
     let raw_price = quote.bid_price;
 
     if raw_price <= 0.0 {
-        return OracleResponse::Err(
+        return OracleResult::Err(
             AppError::BadRequest(format!(
             "Zero or negative price for {} (bid={}, ask={}). Market may be closed or data is bad.",
             pair.symbol, quote.bid_price, quote.ask_price
@@ -248,7 +251,7 @@ async fn build_response_from_quote(
     let publish_time: u64 = match quote.t.timestamp().try_into() {
         Ok(v) => v,
         Err(_) => {
-            return OracleResponse::Err(
+            return OracleResult::Err(
                 AppError::Internal(anyhow::anyhow!("publish_time out of range")).into(),
             )
         }
@@ -265,15 +268,15 @@ async fn build_response_from_quote(
     );
 
     match oracle::build_context(raw_price, publish_time, pair.inverted) {
-        Err(e) => OracleResponse::Err(OracleErrResponse { msg: e.to_string() }),
+        Err(e) => OracleResult::Err(OracleErrResponse { msg: e.to_string() }),
         Ok(context) => state.signer.sign_context(&context).await.map_or_else(
             |err| {
-                OracleResponse::Err(OracleErrResponse {
+                OracleResult::Err(OracleErrResponse {
                     msg: err.to_string(),
                 })
             },
             |(signature, signer)| {
-                OracleResponse::Ok(OracleOkResponse {
+                OracleResult::Ok(OracleOkResponse {
                     signer,
                     context,
                     signature,

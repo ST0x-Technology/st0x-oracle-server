@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use rain_math_float::Float;
 use st0x_oracle_server::alpaca::QuoteData;
 use st0x_oracle_server::cache::QuoteCache;
-use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
+use st0x_oracle_server::oracle::{OracleResponse, OracleResult, SCHEMA_VERSION};
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::{create_app, AppState, EvaluableV4, OrderV4, IOV2};
@@ -168,7 +168,7 @@ async fn test_v1_empty_batch_returns_empty_array() {
 
     assert_eq!(response.status(), 200);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
     assert!(responses.is_empty(), "empty batch must return empty array");
 }
 
@@ -196,9 +196,9 @@ async fn test_v1_unknown_token_returns_200_with_inner_err() {
     assert_eq!(response.status(), 200);
 
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
 
-    assert!(matches!(responses[0], OracleResponse::Err(_)));
+    assert!(matches!(responses[0], OracleResult::Err(_)));
 }
 
 #[tokio::test]
@@ -220,7 +220,7 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
 
     assert_eq!(response.status(), 200);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(
         responses.len(),
@@ -273,7 +273,7 @@ async fn test_v1_batch_returns_length_matching_array() {
 
     assert_eq!(response.status(), 200);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
@@ -310,7 +310,7 @@ async fn test_v1_batch_returns_mixed_result() {
 
     assert_eq!(response.status(), 200);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 

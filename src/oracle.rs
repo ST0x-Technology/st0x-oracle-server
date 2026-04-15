@@ -31,16 +31,16 @@ impl From<AppError> for OracleErrResponse {
     }
 }
 
-/// Oracle response, can be ok or err.
+/// Single oracle result, can be ok or err.
 /// The JSON array shape of this struct is what upstream
 /// `rain.orderbook/crates/quote/src/oracle.rs` expects to deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
-pub enum OracleResponse {
+pub enum OracleResult {
     Ok(OracleOkResponse),
     Err(OracleErrResponse),
 }
-impl OracleResponse {
+impl OracleResult {
     pub fn into_result(self) -> Result<OracleOkResponse, OracleErrResponse> {
         match self {
             Self::Ok(v) => Ok(v),
@@ -55,6 +55,11 @@ impl OracleResponse {
         }
     }
 }
+
+/// List of oracle result.
+/// The JSON shape of this struct is what upstream
+/// `rain.orderbook/crates/quote/src/oracle.rs` expects to deserialize.
+pub type OracleResponse = Vec<OracleResult>;
 
 /// Build the signed context array from a raw NBBO price + publish time.
 ///
