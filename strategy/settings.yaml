@@ -24,4 +24,4 @@ rainlangs:
 local-db-remotes:
   raindex: https://raindex-bootstrap-db.lon1.digitaloceanspaces.com/manifest.yaml
 using-tokens-from:
-  - https://raw.githubusercontent.com/S01-Issuer/st0x-tokens/0e739bae5e46c9a99fd71adcb103588166314c53/src/st0xTokens.json
+  - https://raw.githubusercontent.com/S01-Issuer/st0x-tokens/037a863ed49a0de41861c35aca3864f9e73f7f0b/src/st0xTokens.json
