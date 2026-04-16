@@ -243,15 +243,15 @@ gui:
     :ensure(
      less-than(oracle-price max-price)
      "Price above maximum bound"
-    )
+    ),
     _: oracle-price;
 
 #st0x-feed-price
-  baseline: call<'st0x-oracle-baseline>()
+  baseline: call<'st0x-oracle-baseline>(),
   _: mul(call<'baseline-fn>() baseline-multiplier);
 
 #st0x-feed-price-inv
-  baseline: call<'st0x-oracle-baseline>()
+  baseline: call<'st0x-oracle-baseline>(),
   _: inv(mul(call<'baseline-fn>() baseline-multiplier));
 
 
