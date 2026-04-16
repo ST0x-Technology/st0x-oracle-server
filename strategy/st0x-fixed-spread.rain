@@ -176,6 +176,8 @@ gui:
 #baseline-fn !Function that returns the benchmark IO.
 #baseline-multiplier !WAD multiplier to apply to the baseline (e.g. 1.001).
 #oracle-schema-version !Expected oracle context schema version.
+#min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
+#max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
 #max-staleness !Maximum age in seconds between Alpaca publish_time and block.timestamp. Orders revert past this.
 
 
