@@ -2,7 +2,7 @@ version: 5
 
 orders:
   base:
-    raindex: base
+    orderbook: base
     oracle-url: https://st0x-oracle-server.fly.dev/context/v1
     inputs:
       - token: input
@@ -11,7 +11,7 @@ orders:
 
 scenarios:
   st0x-oracle-baseline-base:
-    raindex: base
+    orderbook: base
     rainlang: base
     runs: 1
     bindings:
@@ -20,7 +20,6 @@ scenarios:
       oracle-schema-version: 1
       baseline-fn: '''st0x-feed-price'
   st0x-oracle-baseline-base-inv:
-    raindex: base
     rainlang: base
     runs: 1
     bindings:
