@@ -248,11 +248,11 @@ gui:
 
 #st0x-feed-price
   baseline: call<'st0x-oracle-baseline>(),
-  _: mul(call<'baseline-fn>() baseline-multiplier);
+  _: mul(baseline baseline-multiplier);
 
 #st0x-feed-price-inv
   baseline: call<'st0x-oracle-baseline>(),
-  _: inv(mul(call<'baseline-fn>() baseline-multiplier));
+  _: inv(mul(baseline baseline-multiplier));
 
 
 
