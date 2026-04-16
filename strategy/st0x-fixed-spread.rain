@@ -18,7 +18,6 @@ scenarios:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
       oracle-schema-version: 1
-      baseline-fn: '''st0x-feed-price'
   st0x-oracle-baseline-base-inv:
     orderbook: base
     rainlang: base
@@ -27,7 +26,6 @@ scenarios:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
       oracle-schema-version: 1
-      baseline-fn: '''st0x-feed-price-inv'
 
 
 deployments:
@@ -159,7 +157,6 @@ gui:
 #raindex-subparser !Raindex subparser.
 
 #oracle-signer !The trusted signer address for the st0x oracle server.
-#baseline-fn !Function that returns the benchmark IO.
 #baseline-multiplier !WAD multiplier to apply to the baseline (e.g. 1.001).
 #oracle-schema-version !Expected oracle context schema version.
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
@@ -246,20 +243,10 @@ gui:
     ),
     _: oracle-price;
 
-#st0x-feed-price
-  baseline: call<'st0x-oracle-baseline>(),
-  _: mul(baseline baseline-multiplier);
-
-#st0x-feed-price-inv
-  baseline: call<'st0x-oracle-baseline>(),
-  _: inv(mul(baseline baseline-multiplier));
-
-
-
 #calculate-io
 using-words-from raindex-subparser
 offer-amount: max-positive-value(), 
-io: call<'baseline-fn>();
+io: mul(call<'st0x-oracle-baseline>() baseline-multiplier);
 
 
 #handle-io
