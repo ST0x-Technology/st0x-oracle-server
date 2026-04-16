@@ -20,6 +20,7 @@ scenarios:
       oracle-schema-version: 1
       baseline-fn: '''st0x-feed-price'
   st0x-oracle-baseline-base-inv:
+    orderbook: base
     rainlang: base
     runs: 1
     bindings:
