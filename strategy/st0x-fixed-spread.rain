@@ -18,23 +18,12 @@ scenarios:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
       oracle-schema-version: 1
-  st0x-oracle-baseline-base-inv:
-    orderbook: base
-    rainlang: base
-    runs: 1
-    bindings:
-      raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
-      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
-      oracle-schema-version: 1
 
 
 deployments:
   base-st0x:
     order: base
     scenario: st0x-oracle-baseline-base
-  base-st0x-inv:
-    order: base
-    scenario: st0x-oracle-baseline-base-inv
 
 
 gui:
@@ -44,8 +33,8 @@ gui:
     A strategy where the ratio tracks a benchmark price with a fixed multiplier
   deployments:
     base-st0x:
-      name: Base st0x sell shares
-      description: Deploy an fixed-spread strategy on Base using St0x price feeds to sell shares.
+      name: Base st0x fixed spread
+      description: Deploy an fixed-spread strategy on Base using St0x price feeds.
       deposits:
         - token: output
       fields:
@@ -97,62 +86,6 @@ gui:
         - key: input
           name: Token to Buy
           description: Select the token you want to purchase
-    base-st0x-inv:
-      name: Base st0x buy shares
-      description: Deploy an fixed-spread trategy on Base using St0x price feeds to buy shares.
-      deposits:
-        - token: output
-      fields:
-        - binding: baseline-multiplier
-          name: Benchmark price multiplier
-          description: |
-            The multiplier to be applied to the benchmark when calculating the price the strategy will offer at
-          show-custom-field: true
-          default: 1.001
-          presets:
-            - name: 1.001x
-              value: 1.001
-            - name: 1.005x
-              value: 1.005
-            - name: 1.0025x
-              value: 1.0025
-        - binding: min-price
-          name: Minimum Price
-          description: >
-            Floor price as a safety guard. If the oracle returns a price
-            below this, the order reverts. Protects against catastrophic
-            mispricings or broken oracle data. Set based on the asset -
-            e.g. 0.01 for penny stocks, 10 for blue chips.
-          default: 0.01
-          min: 0.000001
-        - binding: max-price
-          name: Maximum Price
-          description: >
-            Ceiling price as a safety guard. If the oracle returns a
-            price above this, the order reverts. Protects against
-            overflow or encoding errors. Set generously above the
-            asset's expected range.
-          default: 100000
-          min: 1
-        - binding: max-staleness
-          name: Max Staleness (seconds)
-          description: >
-            Maximum allowed age (in seconds) of the oracle's Alpaca
-            publish_time relative to block.timestamp. If the cached
-            oracle quote is older than this, the order reverts. 30
-            seconds is a reasonable default given the server polls
-            Alpaca every 10 seconds.
-          default: 30
-          min: 1
-      select-tokens:
-        - key: output
-          name: Token to Sell
-          description: Select the token you want to sell
-        - key: input
-          name: Token to Buy
-          description: Select the token you want to purchase
-
-
 ---
 #raindex-subparser !Raindex subparser.
 
