@@ -2,20 +2,66 @@ use alloy::primitives::{Address, Bytes, FixedBytes};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 
+use crate::AppError;
+
 /// Schema version for the signed context array. Bump this whenever the
 /// layout changes — strategies assert on it to reject data they don't
 /// understand.
 pub const SCHEMA_VERSION: u64 = 1;
 
-/// Oracle response matching Rain's SignedContextV1 format.
-/// The JSON array shape of this struct is what upstream
-/// `rain.orderbook/crates/quote/src/oracle.rs` expects to deserialize.
+/// Oracle ok response matching Rain's SignedContextV2 format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OracleResponse {
+pub struct OracleOkResponse {
     pub signer: Address,
     pub context: Vec<FixedBytes<32>>,
     pub signature: Bytes,
 }
+
+/// Oracle err response containing a short error msg.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OracleErrResponse {
+    pub msg: String,
+}
+
+impl From<AppError> for OracleErrResponse {
+    fn from(value: AppError) -> Self {
+        OracleErrResponse {
+            msg: value.to_string(),
+        }
+    }
+}
+
+/// Single oracle result, can be ok or err.
+/// The JSON array shape of this struct is what upstream
+/// `rain.orderbook/crates/quote/src/oracle.rs` expects to deserialize.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum OracleResult {
+    #[serde(rename = "ok")]
+    Ok(OracleOkResponse),
+    #[serde(rename = "error")]
+    Err(OracleErrResponse),
+}
+impl OracleResult {
+    pub fn into_result(self) -> Result<OracleOkResponse, OracleErrResponse> {
+        match self {
+            Self::Ok(v) => Ok(v),
+            Self::Err(e) => Err(e),
+        }
+    }
+
+    pub fn as_result(&self) -> Result<&OracleOkResponse, &OracleErrResponse> {
+        match self {
+            Self::Ok(v) => Ok(v),
+            Self::Err(e) => Err(e),
+        }
+    }
+}
+
+/// List of oracle result.
+/// The JSON shape of this struct is what upstream
+/// `rain.orderbook/crates/quote/src/oracle.rs` expects to deserialize.
+pub type OracleResponse = Vec<OracleResult>;
 
 /// Build the signed context array from a raw NBBO price + publish time.
 ///

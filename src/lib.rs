@@ -19,10 +19,17 @@ use axum::{
 use serde::Serialize;
 use sign::Signer;
 use std::sync::Arc;
+use thiserror::Error;
 use tower_http::cors::CorsLayer;
 
-use crate::cache::QuoteCache;
-use crate::registry::{ResolvedPair, TokenRegistry};
+use crate::{
+    cache::QuoteCache,
+    oracle::{OracleErrResponse, OracleOkResponse, OracleResult},
+};
+use crate::{
+    oracle::OracleResponse,
+    registry::{ResolvedPair, TokenRegistry},
+};
 
 sol! {
     struct IOV2 {
@@ -123,7 +130,7 @@ async fn post_signed_context_v1(
     let requests = decode_request_body(&body)?;
 
     if requests.is_empty() {
-        return Ok(Json(Vec::<oracle::OracleResponse>::new()));
+        return Ok(Json(OracleResponse::new()));
     }
 
     // Resolve every request's token pair first so we know which symbols
@@ -131,24 +138,33 @@ async fn post_signed_context_v1(
     // exactly those entries, so a poll loop update mid-iteration can't
     // mix quotes (or publish_time values) for the same symbol within
     // one HTTP response.
-    let mut resolved: Vec<(OrderV4, ResolvedPair)> = Vec::with_capacity(requests.len());
+    let mut resolved: Vec<(OrderV4, Result<ResolvedPair, OracleErrResponse>)> =
+        Vec::with_capacity(requests.len());
     for (order, input_io_index, output_io_index, _counterparty) in requests {
-        let pair = resolve_pair_for_order(&state, &order, input_io_index, output_io_index)?;
-        resolved.push((order, pair));
+        let res = resolve_pair_for_order(&state, &order, input_io_index, output_io_index);
+        resolved.push((order, res));
     }
 
-    let needed_symbols: Vec<&str> = resolved.iter().map(|(_, p)| p.symbol.as_str()).collect();
+    let needed_symbols: Vec<&str> = resolved
+        .iter()
+        .filter_map(|(_, res)| res.as_ref().ok().and_then(|p| Some(p.symbol.as_str())))
+        .collect();
     let snapshot = state.cache.snapshot_many(&needed_symbols).await;
 
-    let mut responses = Vec::with_capacity(resolved.len());
-    for (_, pair) in &resolved {
-        let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
-            AppError::Unavailable(format!(
-                "No cached quote for {} yet. The poll loop has not succeeded since startup.",
-                pair.symbol
-            ))
-        })?;
-        let resp = build_response_from_quote(&state, pair, &quote).await?;
+    let mut responses: OracleResponse = Vec::with_capacity(resolved.len());
+    for (_, res) in resolved {
+        let resp = match res {
+            Ok(pair) => {
+                match snapshot.get(&pair.symbol).cloned() {
+                    Some(quote) => build_response_from_quote(&state, &pair, &quote).await,
+                    None => OracleResult::Err(AppError::Unavailable(format!(
+                        "No cached quote for {} yet. The poll loop has not succeeded since startup.",
+                        pair.symbol
+                    )).into())
+                }
+            }
+            Err(e) => OracleResult::Err(e),
+        };
         responses.push(resp);
     }
 
@@ -162,7 +178,7 @@ fn resolve_pair_for_order(
     order: &OrderV4,
     input_io_index: alloy::primitives::U256,
     output_io_index: alloy::primitives::U256,
-) -> Result<ResolvedPair, AppError> {
+) -> Result<ResolvedPair, OracleErrResponse> {
     let input_idx: usize = input_io_index.try_into().unwrap_or(usize::MAX);
     let output_idx: usize = output_io_index.try_into().unwrap_or(usize::MAX);
 
@@ -214,7 +230,7 @@ async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
     quote: &crate::alpaca::QuoteData,
-) -> Result<oracle::OracleResponse, AppError> {
+) -> OracleResult {
     // Use a single price for both directions. The bid is the most
     // reliably populated side of the NBBO — the ask is often zero on
     // free-tier Alpaca data outside regular hours. build_context()
@@ -223,17 +239,23 @@ async fn build_response_from_quote(
     let raw_price = quote.bid_price;
 
     if raw_price <= 0.0 {
-        return Err(AppError::BadRequest(format!(
+        return OracleResult::Err(
+            AppError::BadRequest(format!(
             "Zero or negative price for {} (bid={}, ask={}). Market may be closed or data is bad.",
             pair.symbol, quote.bid_price, quote.ask_price
-        )));
+        ))
+            .into(),
+        );
     }
 
-    let publish_time: u64 = quote
-        .t
-        .timestamp()
-        .try_into()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
+    let publish_time: u64 = match quote.t.timestamp().try_into() {
+        Ok(v) => v,
+        Err(_) => {
+            return OracleResult::Err(
+                AppError::Internal(anyhow::anyhow!("publish_time out of range")).into(),
+            )
+        }
+    };
 
     tracing::info!(
         symbol = %pair.symbol,
@@ -245,22 +267,34 @@ async fn build_response_from_quote(
         "Building signed context from cache"
     );
 
-    let context = oracle::build_context(raw_price, publish_time, pair.inverted)?;
-    let (signature, signer) = state.signer.sign_context(&context).await?;
-
-    Ok(oracle::OracleResponse {
-        signer,
-        context,
-        signature,
-    })
+    match oracle::build_context(raw_price, publish_time, pair.inverted) {
+        Err(e) => OracleResult::Err(OracleErrResponse { msg: e.to_string() }),
+        Ok(context) => state.signer.sign_context(&context).await.map_or_else(
+            |err| {
+                OracleResult::Err(OracleErrResponse {
+                    msg: err.to_string(),
+                })
+            },
+            |(signature, signer)| {
+                OracleResult::Ok(OracleOkResponse {
+                    signer,
+                    context,
+                    signature,
+                })
+            },
+        ),
+    }
 }
-
+#[derive(Error, Debug)]
 pub enum AppError {
+    #[error("Internal error: {0}")]
     Internal(anyhow::Error),
+    #[error("Bad request: {0}")]
     BadRequest(String),
     /// The server is alive but the poll loop hasn't produced a quote yet
     /// for this symbol. Distinct from BadRequest because it's transient
     /// and retrying may succeed.
+    #[error("Service unavailable: {0}")]
     Unavailable(String),
 }
 

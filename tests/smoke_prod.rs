@@ -61,10 +61,10 @@ async fn prod_single_buy_coin() {
         .unwrap();
 
     assert_eq!(resp.status(), 200, "status");
-    let responses: Vec<OracleResponse> = resp.json().await.unwrap();
+    let responses: OracleResponse = resp.json().await.unwrap();
     assert_eq!(responses.len(), 1, "single request → length-1 array");
 
-    let r = &responses[0];
+    let r = responses[0].as_result().unwrap();
     assert_eq!(
         r.context.len(),
         3,
@@ -118,25 +118,30 @@ async fn prod_batch_buy_sell_coin() {
         .unwrap();
 
     assert_eq!(resp.status(), 200);
-    let responses: Vec<OracleResponse> = resp.json().await.unwrap();
+    let responses: OracleResponse = resp.json().await.unwrap();
     assert_eq!(responses.len(), 2, "batch → length-2 array");
-    assert_eq!(responses[0].context.len(), 3);
-    assert_eq!(responses[1].context.len(), 3);
+    assert_eq!(responses[0].as_result().unwrap().context.len(), 3);
+    assert_eq!(responses[1].as_result().unwrap().context.len(), 3);
 
     // The two responses should carry the SAME publish_time because both
     // resolve to COIN and read the same cache entry.
     assert_eq!(
-        responses[0].context[2], responses[1].context[2],
+        responses[0].as_result().unwrap().context[2],
+        responses[1].as_result().unwrap().context[2],
         "both orders resolve to COIN and should share publish_time"
     );
 
     // And the second should be the inverse (1/bid) of the first side.
-    let buy = Float::from(alloy::primitives::B256::from(responses[0].context[1]))
-        .format()
-        .unwrap();
-    let sell = Float::from(alloy::primitives::B256::from(responses[1].context[1]))
-        .format()
-        .unwrap();
+    let buy = Float::from(alloy::primitives::B256::from(
+        responses[0].as_result().unwrap().context[1],
+    ))
+    .format()
+    .unwrap();
+    let sell = Float::from(alloy::primitives::B256::from(
+        responses[1].as_result().unwrap().context[1],
+    ))
+    .format()
+    .unwrap();
     eprintln!("  buy={}  sell={}", buy, sell);
     assert_ne!(buy, sell, "buy and sell sides should not be identical");
 }
@@ -160,7 +165,7 @@ async fn prod_publish_time_is_monotonic_and_dedupes() {
 
     let mut publish_times: Vec<alloy::primitives::FixedBytes<32>> = Vec::with_capacity(10);
     for _ in 0..10 {
-        let r: Vec<OracleResponse> = client
+        let r: OracleResponse = client
             .post(PROD_URL)
             .header("content-type", "application/octet-stream")
             .body(body.clone())
@@ -170,7 +175,7 @@ async fn prod_publish_time_is_monotonic_and_dedupes() {
             .json()
             .await
             .unwrap();
-        publish_times.push(r[0].context[2]);
+        publish_times.push(r[0].as_result().unwrap().context[2]);
     }
 
     // Decode all publish_times to numeric Unix seconds via Float.

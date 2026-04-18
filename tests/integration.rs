@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use rain_math_float::Float;
 use st0x_oracle_server::alpaca::QuoteData;
 use st0x_oracle_server::cache::QuoteCache;
-use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
+use st0x_oracle_server::oracle::{OracleResponse, OracleResult, SCHEMA_VERSION};
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::{create_app, AppState, EvaluableV4, OrderV4, IOV2};
@@ -19,6 +19,7 @@ const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7b
 // Token addresses for testing
 const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x1111111111111111111111111111111111111111";
+const UNKNOWN_TOKEN: &str = "0x2222222222222222222222222222222222222222";
 
 const FIXED_PUBLISH_TIME: i64 = 1_800_000_000;
 
@@ -167,12 +168,12 @@ async fn test_v1_empty_batch_returns_empty_array() {
 
     assert_eq!(response.status(), 200);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
     assert!(responses.is_empty(), "empty batch must return empty array");
 }
 
 #[tokio::test]
-async fn test_v1_unknown_token_returns_400() {
+async fn test_v1_unknown_token_returns_200_with_inner_err() {
     let app = test_app().await;
 
     let body = encode_single(
@@ -192,7 +193,12 @@ async fn test_v1_unknown_token_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 400);
+    assert_eq!(response.status(), 200);
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
+
+    assert!(matches!(responses[0], OracleResult::Err(_)));
 }
 
 #[tokio::test]
@@ -214,14 +220,14 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
 
     assert_eq!(response.status(), 200);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(
         responses.len(),
         1,
         "single-request must return length-1 array"
     );
-    let resp = &responses[0];
+    let resp = responses[0].as_result().unwrap();
     assert_eq!(
         resp.context.len(),
         3,
@@ -267,15 +273,59 @@ async fn test_v1_batch_returns_length_matching_array() {
 
     assert_eq!(response.status(), 200);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
     // First: buy → bid (100) — both directions use the same underlying price
-    let buy_price = Float::from(alloy::primitives::B256::from(responses[0].context[1]));
+    let buy_price = Float::from(alloy::primitives::B256::from(
+        responses[0].as_result().unwrap().context[1],
+    ));
     assert_eq!(buy_price.format().unwrap(), "100");
 
     // Second: sell → 1/bid, where bid = 100 → exactly 0.01
-    let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
+    let sell_price = Float::from(alloy::primitives::B256::from(
+        responses[1].as_result().unwrap().context[1],
+    ));
     assert_eq!(sell_price.format().unwrap(), "0.01");
+}
+
+#[tokio::test]
+async fn test_v1_batch_returns_mixed_result() {
+    let app = test_app().await;
+    // Two orders: one i sknown and chade, other is unknown and not cached.
+    let body = encode_batch(&[(USDC, WCOIN), (UNKNOWN_TOKEN, USDC)]);
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v1")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: OracleResponse = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
+
+    // First: known order pair
+    let buy_price = Float::from(alloy::primitives::B256::from(
+        responses[0].as_result().unwrap().context[1],
+    ));
+    assert_eq!(buy_price.format().unwrap(), "100");
+
+    // Second: error as the UNKNOWN_TOKEN is not cached
+    assert_eq!(
+        responses[1].as_result().unwrap_err().msg,
+        format!(
+            "Bad request: Unknown tStock token: {} (not in registry)",
+            UNKNOWN_TOKEN.to_string()
+        )
+    );
 }
