@@ -27,13 +27,22 @@ struct Cli {
     #[arg(long, env = "SIGNER_PRIVATE_KEY")]
     signer_private_key: String,
 
-    /// Alpaca API key ID (read-only)
+    /// Alpaca Broker API key (used as HTTP Basic auth username).
+    /// We read reference prices from the issuer's brokerage positions,
+    /// so these are Broker API creds, not Market Data creds.
     #[arg(long, env = "ALPACA_API_KEY_ID")]
     alpaca_api_key_id: String,
 
-    /// Alpaca API secret key
+    /// Alpaca Broker API secret (HTTP Basic auth password).
     #[arg(long, env = "ALPACA_API_SECRET_KEY")]
     alpaca_api_secret_key: String,
+
+    /// Alpaca brokerage account ID whose positions back the oracle.
+    /// Must be the issuer's account that holds every symbol listed in
+    /// config.toml — startup will fail loud if any registered symbol
+    /// has no current position.
+    #[arg(long, env = "ALPACA_BROKER_ACCOUNT_ID")]
+    alpaca_broker_account_id: String,
 }
 
 #[tokio::main]
@@ -54,7 +63,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let signer = Signer::new(&cli.signer_private_key)?;
-    let alpaca = AlpacaClient::new(&cli.alpaca_api_key_id, &cli.alpaca_api_secret_key);
+    let alpaca = AlpacaClient::new(
+        &cli.alpaca_api_key_id,
+        &cli.alpaca_api_secret_key,
+        &cli.alpaca_broker_account_id,
+    );
 
     let registry = TokenRegistry::from_config(&config.tokens, USDC_BASE)?;
 

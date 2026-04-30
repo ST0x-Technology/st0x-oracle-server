@@ -17,25 +17,27 @@ pub struct OracleResponse {
     pub signature: Bytes,
 }
 
-/// Build the signed context array from a raw NBBO price + publish time.
+/// Build the signed context array from a broker mark + publish time.
 ///
-/// `price` is the relevant side of the Alpaca NBBO:
-/// - For buy orders  (input=USDC, output=tStock): pass the ask price. The
-///   resulting context carries the ask directly (USDC per share).
-/// - For sell orders (input=tStock, output=USDC): pass the bid price and
-///   `inverted = true`. This function parses the **raw bid** as a
-///   `Float` first and then computes `1 / bid` in full Rain DecimalFloat
-///   precision. Do NOT pre-compute `1.0 / bid` at f64 precision before
-///   calling — you'll lose digits that the Float could otherwise retain.
+/// `price` is the issuer's broker-side `current_price` for the symbol —
+/// a single fair-value number, not a bid/ask pair. Buy orders sign the
+/// mark directly (USDC per share); sell orders pass `inverted = true`
+/// and this function computes `1 / price` in full Rain DecimalFloat
+/// precision. Do NOT pre-compute `1.0 / price` at f64 precision before
+/// calling — you'll lose digits that the Float could otherwise retain.
 ///
-/// `publish_time` must be the Alpaca-reported quote time (Unix seconds,
-/// UTC). Never use server-side `SystemTime::now()` or a receive time —
-/// network latency and clock skew could make the signed timestamp lie
-/// about when the price was actually valid.
+/// `publish_time` is the time at which the oracle fetched the mark
+/// from the broker (Unix seconds, UTC). Unlike a Market Data API quote
+/// (which carries an exchange-stamped `t`), the broker positions
+/// endpoint exposes no per-mark timestamp, so the freshest defensible
+/// "as-of" we can sign is fetch time. Polling cadence
+/// (config.poll_interval_secs) bounds how stale this is relative to
+/// the broker's actual mark; consumers gate further with
+/// `max-staleness`.
 ///
 /// Schema v1 context layout (all Rain DecimalFloats):
 /// - `context[0]`: schema version (= 1)
-/// - `context[1]`: price (ask for buys, 1/bid for sells)
+/// - `context[1]`: price (mark for buys, 1/mark for sells)
 /// - `context[2]`: publish_time (Unix seconds)
 pub fn build_context(
     price: f64,

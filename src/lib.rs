@@ -207,25 +207,24 @@ fn resolve_pair_for_order(
 }
 
 /// Build a signed response from a pre-resolved pair and a snapshotted
-/// quote. All quotes for a single batch must come from one snapshot so
+/// mark. All marks for a single batch must come from one snapshot so
 /// concurrent poller updates can't mix prices/publish_times across
 /// elements of the same response.
+///
+/// The broker mark is a single fair-value number per symbol, so buy and
+/// sell directions both use it; `build_context` inverts via Rain Float
+/// when `pair.inverted` is true.
 async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
     quote: &crate::alpaca::QuoteData,
 ) -> Result<oracle::OracleResponse, AppError> {
-    // Use a single price for both directions. The bid is the most
-    // reliably populated side of the NBBO — the ask is often zero on
-    // free-tier Alpaca data outside regular hours. build_context()
-    // handles inversion in Rain Float precision when needed, so we
-    // always pass the same underlying price regardless of direction.
-    let raw_price = quote.bid_price;
-
-    if raw_price <= 0.0 {
+    // The fetch path already drops non-positive marks, so this is a
+    // belt-and-braces guard for any future code path that bypasses it.
+    if quote.price <= 0.0 {
         return Err(AppError::BadRequest(format!(
-            "Zero or negative price for {} (bid={}, ask={}). Market may be closed or data is bad.",
-            pair.symbol, quote.bid_price, quote.ask_price
+            "Zero or negative broker mark for {} (price={}). Market may be closed or data is bad.",
+            pair.symbol, quote.price
         )));
     }
 
@@ -237,15 +236,13 @@ async fn build_response_from_quote(
 
     tracing::info!(
         symbol = %pair.symbol,
-        bid = quote.bid_price,
-        ask = quote.ask_price,
-        raw_price = raw_price,
+        price = quote.price,
         inverted = pair.inverted,
         publish_time = publish_time,
         "Building signed context from cache"
     );
 
-    let context = oracle::build_context(raw_price, publish_time, pair.inverted)?;
+    let context = oracle::build_context(quote.price, publish_time, pair.inverted)?;
     let (signature, signer) = state.signer.sign_context(&context).await?;
 
     Ok(oracle::OracleResponse {

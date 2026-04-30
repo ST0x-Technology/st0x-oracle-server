@@ -56,8 +56,8 @@ fn encode_batch(pairs: &[(&str, &str)]) -> Bytes {
 }
 
 /// Build a test app with a pre-populated cache so tests don't need to
-/// hit Alpaca. The cache contains a fixed quote for COIN with a known
-/// timestamp we can assert against.
+/// hit Alpaca. The cache contains a fixed broker mark for COIN with a
+/// known fetch timestamp we can assert against.
 async fn test_app() -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
@@ -67,8 +67,7 @@ async fn test_app() -> axum::Router {
         .update(
             "COIN",
             QuoteData {
-                bid_price: 100.0,
-                ask_price: 101.0,
+                price: 100.0,
                 t: Utc.timestamp_opt(FIXED_PUBLISH_TIME, 0).unwrap(),
             },
         )
@@ -232,13 +231,14 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
     let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
     assert_eq!(version.format().unwrap(), SCHEMA_VERSION.to_string());
 
-    // price (bid = 100.0 — we always use bid, inverted via Float when needed)
+    // price (broker mark = 100.0 — same number for both directions,
+    // build_context inverts via Float when needed)
     let price = Float::from(alloy::primitives::B256::from(resp.context[1]));
     assert_eq!(price.format().unwrap(), "100");
 
-    // publish_time = the cached Alpaca `t`, not server now().
-    // Compare against a Float-round-tripped canonical form since Rain
-    // Float formats large integers in scientific notation.
+    // publish_time = the cached fetch time, not server now() at request
+    // time. Compare against a Float-round-tripped canonical form since
+    // Rain Float formats large integers in scientific notation.
     let publish = Float::from(alloy::primitives::B256::from(resp.context[2]));
     let expected = Float::parse(FIXED_PUBLISH_TIME.to_string())
         .unwrap()
@@ -271,11 +271,11 @@ async fn test_v1_batch_returns_length_matching_array() {
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
-    // First: buy → bid (100) — both directions use the same underlying price
+    // First: buy → broker mark (100)
     let buy_price = Float::from(alloy::primitives::B256::from(responses[0].context[1]));
     assert_eq!(buy_price.format().unwrap(), "100");
 
-    // Second: sell → 1/bid, where bid = 100 → exactly 0.01
+    // Second: sell → 1/mark, where mark = 100 → exactly 0.01
     let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
     assert_eq!(sell_price.format().unwrap(), "0.01");
 }
