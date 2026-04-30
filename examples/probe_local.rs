@@ -56,7 +56,9 @@ fn order_tuple(input: &str, output: &str) -> (OrderV4, U256, U256, Address) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let symbol = std::env::args().nth(1).unwrap_or_else(|| "SPYM".to_string());
+    let symbol = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "SPYM".to_string());
     let token = TOKENS
         .iter()
         .find(|(s, _)| *s == symbol)
