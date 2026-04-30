@@ -1,0 +1,147 @@
+//! Quick smoke probe against a locally-running oracle server. Compares
+//! the signed price for a buy and a sell of the configured token against
+//! the broker mark fetched directly from Alpaca.
+//!
+//! Usage:
+//!   cargo run --example probe_local -- SPYM
+//!
+//! Requires the same Alpaca creds as the running server (so it can fetch
+//! the comparison mark).
+
+use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::sol_types::SolValue;
+use rain_math_float::Float;
+use st0x_oracle_server::oracle::OracleResponse;
+use st0x_oracle_server::{EvaluableV4, OrderV4, IOV2};
+use std::str::FromStr;
+
+const LOCAL_URL: &str = "http://127.0.0.1:3000/context/v1";
+const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+// Same registry as config.toml — keep in sync.
+const TOKENS: &[(&str, &str)] = &[
+    ("AMZN", "0x997baE3EC193a249596d3708C3fAB7C501Bb8a53"),
+    ("BMNR", "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"),
+    ("COIN", "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"),
+    ("CRCL", "0x8AFba81DEc38DE0A18E2Df5E1967a7493651eebf"),
+    ("IAU", "0x1E46d7eFef64A833AFB1CD49299a7AD5B439f4d8"),
+    ("MSTR", "0xFF05E1bD696900dc6A52CA35Ca61Bb1024eDa8e2"),
+    ("NVDA", "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"),
+    ("PPLT", "0x82f5BAEE1076334357a34A19E04f7c282D51cE47"),
+    ("SIVR", "0xEB7F3E4093C9d68253b6104FbbfF561F3eC0442F"),
+    ("SPYM", "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"),
+    ("TSLA", "0x219A8d384a10BF19b9f24cB5cC53F79Dd0e5A03D"),
+];
+
+fn order_tuple(input: &str, output: &str) -> (OrderV4, U256, U256, Address) {
+    let order = OrderV4 {
+        owner: Address::ZERO,
+        evaluable: EvaluableV4 {
+            interpreter: Address::ZERO,
+            store: Address::ZERO,
+            bytecode: alloy::primitives::Bytes::new(),
+        },
+        validInputs: vec![IOV2 {
+            token: Address::from_str(input).unwrap(),
+            vaultId: FixedBytes::ZERO,
+        }],
+        validOutputs: vec![IOV2 {
+            token: Address::from_str(output).unwrap(),
+            vaultId: FixedBytes::ZERO,
+        }],
+        nonce: FixedBytes::ZERO,
+    };
+    (order, U256::from(0u64), U256::from(0u64), Address::ZERO)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let symbol = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "SPYM".to_string());
+    let token = TOKENS
+        .iter()
+        .find(|(s, _)| *s == symbol)
+        .map(|(_, addr)| *addr)
+        .ok_or_else(|| anyhow::anyhow!("unknown symbol: {symbol}"))?;
+
+    let client = reqwest::Client::new();
+
+    // BUY: input=USDC → output=wtToken. Should sign mark directly.
+    let buy = order_tuple(USDC_BASE, token).abi_encode();
+    let buy_resp: Vec<OracleResponse> = client
+        .post(LOCAL_URL)
+        .header("content-type", "application/octet-stream")
+        .body(buy)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    // SELL: input=wtToken → output=USDC. Should sign 1/mark.
+    let sell = order_tuple(token, USDC_BASE).abi_encode();
+    let sell_resp: Vec<OracleResponse> = client
+        .post(LOCAL_URL)
+        .header("content-type", "application/octet-stream")
+        .body(sell)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let buy_price = Float::from(alloy::primitives::B256::from(buy_resp[0].context[1]))
+        .format()
+        .unwrap();
+    let sell_price = Float::from(alloy::primitives::B256::from(sell_resp[0].context[1]))
+        .format()
+        .unwrap();
+    let publish = Float::from(alloy::primitives::B256::from(buy_resp[0].context[2]))
+        .format()
+        .unwrap();
+
+    println!("=== {symbol} via local oracle ===");
+    println!("  buy  (USDC→{symbol}) price : {buy_price}");
+    println!("  sell ({symbol}→USDC) price : {sell_price}");
+    println!("  publish_time              : {publish}");
+    println!("  signer                    : {:?}", buy_resp[0].signer);
+
+    // Independently fetch the broker mark for cross-check.
+    let key = std::env::var("ALPACA_API_KEY_ID")?;
+    let secret = std::env::var("ALPACA_API_SECRET_KEY")?;
+    let acc = std::env::var("ALPACA_BROKER_ACCOUNT_ID")?;
+    let auth = format!(
+        "Basic {}",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{key}:{secret}")
+        )
+    );
+    let url = format!("https://broker-api.alpaca.markets/v1/trading/accounts/{acc}/positions");
+    let positions: serde_json::Value = client
+        .get(&url)
+        .header("Authorization", auth)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mark = positions
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p["symbol"] == symbol))
+        .and_then(|p| p["current_price"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("no broker position for {symbol}"))?;
+    println!("  broker current_price      : {mark}");
+
+    // Sanity: oracle buy price must be within 1% of broker mark.
+    let oracle_buy: f64 = buy_price.parse()?;
+    let broker_mark: f64 = mark.parse()?;
+    let drift_pct = (oracle_buy - broker_mark).abs() / broker_mark * 100.0;
+    println!("  drift (oracle vs broker)  : {drift_pct:.4}%");
+    if drift_pct > 1.0 {
+        anyhow::bail!("drift {drift_pct:.4}% > 1% — oracle and broker disagree");
+    }
+
+    Ok(())
+}

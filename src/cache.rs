@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// In-memory cache of the latest known quote for each symbol.
+/// In-memory cache of the latest known mark for each symbol.
 ///
 /// On poll failure we intentionally leave the previous entry untouched so
-/// that `/context/v1` can serve the last-known-good quote (with its
-/// original Alpaca `t` timestamp) rather than hard-failing. The strategy
+/// that `/context/v1` can serve the last-known-good mark (with its
+/// original fetch timestamp) rather than hard-failing. The strategy
 /// is responsible for bounding staleness via `max-staleness`.
 #[derive(Debug, Default)]
 pub struct QuoteCache {
@@ -33,15 +33,12 @@ impl QuoteCache {
     /// Used by the batch handler so that all elements of one HTTP
     /// response are built from a coherent view of the cache. Without
     /// this, the poll loop could update one entry between two
-    /// `get(...)` calls in the same batch, mixing quotes for the same
+    /// `get(...)` calls in the same batch, mixing prices for the same
     /// symbol within one response. Returned map only contains entries
     /// that are currently cached — missing symbols are simply absent.
-    pub async fn snapshot_many(
-        &self,
-        symbols: &[&str],
-    ) -> std::collections::HashMap<String, QuoteData> {
+    pub async fn snapshot_many(&self, symbols: &[&str]) -> HashMap<String, QuoteData> {
         let guard = self.entries.read().await;
-        let mut out = std::collections::HashMap::with_capacity(symbols.len());
+        let mut out = HashMap::with_capacity(symbols.len());
         for sym in symbols {
             if let Some(q) = guard.get(*sym) {
                 out.insert((*sym).to_string(), q.clone());
@@ -62,35 +59,41 @@ impl QuoteCache {
     }
 }
 
-/// Fetch every symbol once, updating the cache on success. Used both to
-/// prime the cache at startup and as the per-tick body of the poll loop.
+/// Fetch every position once via the Broker API and update the cache
+/// for any registered symbol the issuer holds. Used both to prime the
+/// cache at startup and as the per-tick body of the poll loop.
+///
+/// Symbols not held by the broker (or dropped during parsing) are
+/// logged but not removed from the cache — `/context/v1` will continue
+/// serving the last-known-good mark until `max-staleness` rejects it.
 pub async fn poll_once(cache: &QuoteCache, alpaca: &AlpacaClient, symbols: &[String]) {
+    let marks = match alpaca.fetch_marks().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "Broker positions fetch failed; keeping previous cache");
+            return;
+        }
+    };
+
     for symbol in symbols {
-        match alpaca.latest_quote(symbol).await {
-            Ok(q) => {
-                tracing::debug!(
-                    symbol = %symbol,
-                    bid = q.bid_price,
-                    ask = q.ask_price,
-                    t = %q.t,
-                    "Polled Alpaca quote"
-                );
-                cache.update(symbol, q).await;
+        match marks.get(symbol) {
+            Some(q) => {
+                tracing::debug!(symbol = %symbol, price = q.price, t = %q.t, "Polled broker mark");
+                cache.update(symbol, q.clone()).await;
             }
-            Err(e) => {
+            None => {
                 tracing::warn!(
                     symbol = %symbol,
-                    error = %e,
-                    "Failed to poll Alpaca quote; keeping previous entry"
+                    "Broker has no position for this symbol; keeping previous entry"
                 );
             }
         }
     }
 }
 
-/// Spawn a background task that polls Alpaca every `interval` for every
-/// configured symbol. Returns immediately; task runs until the process
-/// exits.
+/// Spawn a background task that polls the broker every `interval` and
+/// refreshes every configured symbol. Returns immediately; task runs
+/// until the process exits.
 pub fn spawn_poll_loop(
     cache: Arc<QuoteCache>,
     alpaca: AlpacaClient,
@@ -101,9 +104,9 @@ pub fn spawn_poll_loop(
         let mut ticker = tokio::time::interval(interval);
         // tokio's default is `Burst`, which queues missed ticks and fires
         // them back-to-back when the task catches up. If a poll ever
-        // overruns the interval (slow Alpaca, network blip), that would
-        // hammer Alpaca with rapid catch-up calls and risk rate limiting.
-        // Skip just rebases onto the current schedule.
+        // overruns the interval (slow broker, network blip), that would
+        // hammer the API with rapid catch-up calls and risk rate
+        // limiting. Skip just rebases onto the current schedule.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // first tick is immediate; we already prime synchronously at
         // startup, so skip it to avoid a double-poll right at boot.
@@ -120,10 +123,9 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
 
-    fn quote(bid: f64, ask: f64, ts: i64) -> QuoteData {
+    fn quote(price: f64, ts: i64) -> QuoteData {
         QuoteData {
-            bid_price: bid,
-            ask_price: ask,
+            price,
             t: Utc.timestamp_opt(ts, 0).unwrap(),
         }
     }
@@ -131,12 +133,9 @@ mod tests {
     #[tokio::test]
     async fn update_and_get_roundtrip() {
         let cache = QuoteCache::new();
-        cache
-            .update("COIN", quote(100.0, 101.0, 1_700_000_000))
-            .await;
+        cache.update("COIN", quote(100.0, 1_700_000_000)).await;
         let got = cache.get("COIN").await.expect("expected cached quote");
-        assert_eq!(got.bid_price, 100.0);
-        assert_eq!(got.ask_price, 101.0);
+        assert_eq!(got.price, 100.0);
         assert_eq!(got.t.timestamp(), 1_700_000_000);
     }
 
@@ -149,10 +148,10 @@ mod tests {
     #[tokio::test]
     async fn update_overwrites_previous() {
         let cache = QuoteCache::new();
-        cache.update("COIN", quote(100.0, 101.0, 1)).await;
-        cache.update("COIN", quote(200.0, 201.0, 2)).await;
+        cache.update("COIN", quote(100.0, 1)).await;
+        cache.update("COIN", quote(200.0, 2)).await;
         let got = cache.get("COIN").await.unwrap();
-        assert_eq!(got.bid_price, 200.0);
+        assert_eq!(got.price, 200.0);
         assert_eq!(got.t.timestamp(), 2);
     }
 }
