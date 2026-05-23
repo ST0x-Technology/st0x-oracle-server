@@ -19,6 +19,7 @@ const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7b
 // Token addresses for testing
 const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x1111111111111111111111111111111111111111";
+const WDRAM: &str = "0x2222222222222222222222222222222222222222";
 
 const FIXED_PUBLISH_TIME: i64 = 1_800_000_000;
 
@@ -59,21 +60,39 @@ fn encode_batch(pairs: &[(&str, &str)]) -> Bytes {
 /// hit Alpaca. The cache contains a fixed broker mark for COIN with a
 /// known fetch timestamp we can assert against.
 async fn test_app() -> axum::Router {
+    test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await
+}
+
+/// Build a test app from an explicit list of `(token_address, symbol,
+/// price_opt)` tuples. `price_opt = Some(p)` pre-populates the cache
+/// for that symbol; `None` leaves it uncached so tests can exercise the
+/// partial-cache code paths.
+async fn test_app_with(entries: &[(&str, &str, Option<f64>)]) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
-    let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
+
+    let registry_entries: Vec<(String, String)> = entries
+        .iter()
+        .map(|(addr, sym, _)| (addr.to_string(), sym.to_string()))
+        .collect();
+    let registry = TokenRegistry::new(registry_entries, USDC).unwrap();
 
     let cache = Arc::new(QuoteCache::new());
-    cache
-        .update(
-            "COIN",
-            QuoteData {
-                price: 100.0,
-                t: Utc.timestamp_opt(FIXED_PUBLISH_TIME, 0).unwrap(),
-            },
-        )
-        .await;
+    for (_, sym, price) in entries {
+        if let Some(p) = price {
+            cache
+                .update(
+                    sym,
+                    QuoteData {
+                        price: *p,
+                        t: Utc.timestamp_opt(FIXED_PUBLISH_TIME, 0).unwrap(),
+                    },
+                )
+                .await;
+        }
+    }
 
-    let state = AppState::new(signer, registry, cache);
+    let configured_symbols: Vec<String> = entries.iter().map(|(_, s, _)| s.to_string()).collect();
+    let state = AppState::new(signer, registry, cache, configured_symbols);
     create_app(state)
 }
 
@@ -245,6 +264,112 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
         .format()
         .unwrap();
     assert_eq!(publish.format().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_status_reports_no_missing_when_all_cached() {
+    let app = test_app().await;
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(body["configured_symbols"], serde_json::json!(["COIN"]));
+    assert_eq!(body["missing_symbols"], serde_json::json!([]));
+    assert!(
+        body["signer"].as_str().unwrap().starts_with("0x"),
+        "signer should be a 0x-prefixed address"
+    );
+}
+
+#[tokio::test]
+async fn test_status_reports_missing_when_symbol_uncached() {
+    // Configure two symbols but only cache COIN. /status should list
+    // DRAM as missing so operators / monitoring can pick up the partial
+    // state without parsing logs.
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(
+        body["configured_symbols"],
+        serde_json::json!(["COIN", "DRAM"])
+    );
+    assert_eq!(body["missing_symbols"], serde_json::json!(["DRAM"]));
+}
+
+#[tokio::test]
+async fn test_v1_returns_503_for_uncached_symbol() {
+    // Configured-but-uncached symbol is the post-soft-start failure
+    // mode: server is up, healthy symbols quote, an unfilled position
+    // returns 503 per request instead of taking down the whole oracle.
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+
+    // Healthy symbol still works.
+    let ok_response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v1")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_response.status(), 200);
+
+    // Uncached symbol returns 503.
+    let degraded_response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v1")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WDRAM)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        degraded_response.status(),
+        503,
+        "uncached symbol must 503 instead of taking down the whole server"
+    );
+    let bytes = degraded_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("DRAM"),
+        "503 body should name the missing symbol; got: {body}"
+    );
 }
 
 #[tokio::test]
