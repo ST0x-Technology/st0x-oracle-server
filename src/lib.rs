@@ -63,14 +63,23 @@ pub struct AppState {
     signer: Signer,
     registry: TokenRegistry,
     cache: Arc<QuoteCache>,
+    /// Every symbol declared in config.toml. /status compares this
+    /// against the cache to surface the partial-serving set.
+    configured_symbols: Vec<String>,
 }
 
 impl AppState {
-    pub fn new(signer: Signer, registry: TokenRegistry, cache: Arc<QuoteCache>) -> Self {
+    pub fn new(
+        signer: Signer,
+        registry: TokenRegistry,
+        cache: Arc<QuoteCache>,
+        configured_symbols: Vec<String>,
+    ) -> Self {
         Self {
             signer,
             registry,
             cache,
+            configured_symbols,
         }
     }
 
@@ -83,6 +92,7 @@ pub fn create_app(state: AppState) -> Router {
     let shared_state = Arc::new(state);
     Router::new()
         .route("/", get(health))
+        .route("/status", get(status))
         .route("/context/v1", post(post_signed_context_v1))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
@@ -90,6 +100,27 @@ pub fn create_app(state: AppState) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    signer: String,
+    configured_symbols: Vec<String>,
+    missing_symbols: Vec<String>,
+}
+
+/// Operational status of the server. `/health` is for Fly liveness and
+/// stays lenient ("ok" whenever the process is running). `/status` is
+/// for ops/monitoring and reports the configured-vs-cached set so a
+/// missing broker position is visible without parsing logs. Always
+/// returns 200; consumers gate on the contents of `missing_symbols`.
+async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+    let missing = state.cache.missing(&state.configured_symbols).await;
+    Json(StatusResponse {
+        signer: format!("{:?}", state.signer.address()),
+        configured_symbols: state.configured_symbols.clone(),
+        missing_symbols: missing,
+    })
 }
 
 #[derive(Serialize)]

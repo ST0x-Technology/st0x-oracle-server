@@ -84,38 +84,49 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Prime the cache synchronously before opening the socket so the
-    // first /context/v1 request doesn't race the poll loop.
-    // Prime the cache synchronously before opening the socket. We
-    // *require* every configured symbol to be present after priming —
-    // /context/v1 would otherwise degrade to 503 for those symbols on a
-    // cold start, which is the failure mode this is trying to avoid.
-    // Failing fast here forces the operator to notice and react instead
-    // of silently coming up half-warm.
+    // first /context/v1 request doesn't race the poll loop. Missing
+    // symbols are logged loudly but no longer fatal: the server starts
+    // in a partial-serving state where healthy symbols quote normally
+    // and missing symbols return 503 at request time. /status exposes
+    // the missing set so monitoring can pick up the partial state. We
+    // chose this over the old hard-bail because the bail took the whole
+    // oracle down on the next Fly restart whenever any single position
+    // went to 0 — and the "alert" was the outage itself.
     let cache = Arc::new(QuoteCache::new());
     let symbols = config.symbols();
     tracing::info!("Priming quote cache with {} symbols...", symbols.len());
     poll_once(&cache, &alpaca, &symbols).await;
     let missing = cache.missing(&symbols).await;
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "Initial cache warm-up failed for {} symbol(s): {}. \
-             Refusing to start with an incomplete cache. Check Alpaca \
-             credentials, network reachability, and ticker spelling in config.toml.",
-            missing.len(),
-            missing.join(", ")
+    if missing.is_empty() {
+        tracing::info!("Cache primed for all {} symbols", symbols.len());
+    } else {
+        for sym in &missing {
+            tracing::error!(
+                symbol = %sym,
+                "No broker position for configured symbol after initial poll. \
+                 /context/v1 will return 503 for requests resolving to this symbol \
+                 until the issuer acquires inventory or the symbol is removed from \
+                 config.toml. See /status for the current missing-symbol set."
+            );
+        }
+        tracing::warn!(
+            missing_count = missing.len(),
+            primed_count = symbols.len() - missing.len(),
+            total = symbols.len(),
+            "Starting in degraded mode. Healthy symbols quote normally; missing \
+             symbols return 503 at request time and appear in /status."
         );
     }
-    tracing::info!("Cache primed for all {} symbols", symbols.len());
 
     // Start background poller.
     spawn_poll_loop(
         cache.clone(),
         alpaca.clone(),
-        symbols,
+        symbols.clone(),
         Duration::from_secs(config.poll_interval_secs),
     );
 
-    let state = AppState::new(signer, registry, cache);
+    let state = AppState::new(signer, registry, cache, symbols);
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
