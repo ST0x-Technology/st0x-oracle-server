@@ -17,8 +17,9 @@
 //! Mirror of the approach in `st0x.liquidity-monitor`'s
 //! `src/prices/alpaca_positions.rs`.
 
+use crate::market_hours::{anchor_session_to_utc, SessionWindow};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -100,6 +101,52 @@ impl AlpacaClient {
 
         Ok(positions_to_marks(positions, Utc::now()))
     }
+
+    /// Fetch the trading calendar over `[start, end]` (inclusive). Each
+    /// returned `SessionWindow` carries the extended-hours boundaries
+    /// (04:00 ET pre-market open and 20:00 ET after-hours close) as UTC
+    /// instants. Non-trading dates simply aren't in the response. Used
+    /// by `MarketHoursCache` to decide whether `publish_time` should be
+    /// `now` or the last `session_close`.
+    pub async fn fetch_calendar(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> anyhow::Result<Vec<SessionWindow>> {
+        let url = format!(
+            "{}/v1/calendar?start={}&end={}",
+            self.broker_url, start, end
+        );
+        let raw: Vec<CalendarResponse> = self
+            .http
+            .get(&url)
+            .header("Authorization", self.basic_auth())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        raw.into_iter().map(calendar_row_to_window).collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CalendarResponse {
+    date: String,
+    /// "HHMM" in ET — extended-session open (pre-market start, usually "0400").
+    session_open: String,
+    /// "HHMM" in ET — extended-session close (after-hours end, usually "2000").
+    session_close: String,
+}
+
+fn calendar_row_to_window(r: CalendarResponse) -> anyhow::Result<SessionWindow> {
+    let date = NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("invalid calendar date {:?}: {}", r.date, e))?;
+    Ok(SessionWindow {
+        date,
+        session_open: anchor_session_to_utc(date, &r.session_open)?,
+        session_close: anchor_session_to_utc(date, &r.session_close)?,
+    })
 }
 
 /// Pure transform from the broker's positions response to the cache
