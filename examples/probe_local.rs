@@ -15,22 +15,30 @@ use st0x_oracle_server::oracle::OracleResponse;
 use st0x_oracle_server::{EvaluableV4, OrderV4, IOV2};
 use std::str::FromStr;
 
-const LOCAL_URL: &str = "http://127.0.0.1:3000/context/v1";
+/// Probed URL. Override with ORACLE_URL=https://st0x-oracle-server.fly.dev/context/v1
+/// to compare prod against the broker.
+fn oracle_url() -> String {
+    std::env::var("ORACLE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000/context/v1".to_string())
+}
 const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 // Same registry as config.toml — keep in sync.
 const TOKENS: &[(&str, &str)] = &[
     ("AMZN", "0x997baE3EC193a249596d3708C3fAB7C501Bb8a53"),
     ("BMNR", "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"),
+    ("CEG", "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"),
     ("COIN", "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"),
     ("CRCL", "0x8AFba81DEc38DE0A18E2Df5E1967a7493651eebf"),
+    ("DRAM", "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"),
     ("IAU", "0x1E46d7eFef64A833AFB1CD49299a7AD5B439f4d8"),
     ("MSTR", "0xFF05E1bD696900dc6A52CA35Ca61Bb1024eDa8e2"),
     ("NVDA", "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"),
     ("PPLT", "0x82f5BAEE1076334357a34A19E04f7c282D51cE47"),
+    ("SGOV", "0x78c31580c97101694C70022c83D570150c11e935"),
     ("SIVR", "0xEB7F3E4093C9d68253b6104FbbfF561F3eC0442F"),
     ("SPYM", "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"),
     ("TSLA", "0x219A8d384a10BF19b9f24cB5cC53F79Dd0e5A03D"),
+    ("TSM", "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"),
 ];
 
 fn order_tuple(input: &str, output: &str) -> (OrderV4, U256, U256, Address) {
@@ -70,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     // BUY: input=USDC → output=wtToken. Should sign mark directly.
     let buy = order_tuple(USDC_BASE, token).abi_encode();
     let buy_resp: Vec<OracleResponse> = client
-        .post(LOCAL_URL)
+        .post(oracle_url())
         .header("content-type", "application/octet-stream")
         .body(buy)
         .send()
@@ -82,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     // SELL: input=wtToken → output=USDC. Should sign 1/mark.
     let sell = order_tuple(token, USDC_BASE).abi_encode();
     let sell_resp: Vec<OracleResponse> = client
-        .post(LOCAL_URL)
+        .post(oracle_url())
         .header("content-type", "application/octet-stream")
         .body(sell)
         .send()
