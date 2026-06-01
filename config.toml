@@ -22,12 +22,20 @@ address = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
 symbol  = "BMNR"
 
 [[tokens]]
+address = "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"
+symbol  = "CEG"
+
+[[tokens]]
 address = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"
 symbol  = "COIN"
 
 [[tokens]]
 address = "0x8AFba81DEc38DE0A18E2Df5E1967a7493651eebf"
 symbol  = "CRCL"
+
+[[tokens]]
+address = "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"
+symbol  = "DRAM"
 
 [[tokens]]
 address = "0x1E46d7eFef64A833AFB1CD49299a7AD5B439f4d8"
@@ -46,6 +54,10 @@ address = "0x82f5BAEE1076334357a34A19E04f7c282D51cE47"
 symbol  = "PPLT"
 
 [[tokens]]
+address = "0x78c31580c97101694C70022c83D570150c11e935"
+symbol  = "SGOV"
+
+[[tokens]]
 address = "0xEB7F3E4093C9d68253b6104FbbfF561F3eC0442F"
 symbol  = "SIVR"
 
@@ -56,3 +68,7 @@ symbol  = "SPYM"
 [[tokens]]
 address = "0x219A8d384a10BF19b9f24cB5cC53F79Dd0e5A03D"
 symbol  = "TSLA"
+
+[[tokens]]
+address = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
+symbol  = "TSM"
