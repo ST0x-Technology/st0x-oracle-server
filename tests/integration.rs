@@ -1,11 +1,12 @@
 use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::sol_types::SolValue;
 use axum::body::Bytes;
-use chrono::{TimeZone, Utc};
+use chrono::{Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use http_body_util::BodyExt;
 use rain_math_float::Float;
 use st0x_oracle_server::alpaca::QuoteData;
 use st0x_oracle_server::cache::QuoteCache;
+use st0x_oracle_server::market_hours::{MarketHoursCache, SessionWindow};
 use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
@@ -21,7 +22,12 @@ const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x1111111111111111111111111111111111111111";
 const WDRAM: &str = "0x2222222222222222222222222222222222222222";
 
-const FIXED_PUBLISH_TIME: i64 = 1_800_000_000;
+// Used both as the cached QuoteData.t (just bookkeeping post-RAI-693)
+// and as the `last_session_close` in the default out-of-session
+// MarketHoursCache. Must be in the past relative to wall-clock now so the
+// cache's `publish_time_for` returns it via the "most recent past close"
+// branch. 1_700_000_000 = 2023-11-14T22:13:20Z.
+const FIXED_PUBLISH_TIME: i64 = 1_700_000_000;
 
 fn test_order_tuple(input_token: &str, output_token: &str) -> (OrderV4, U256, U256, Address) {
     let order = OrderV4 {
@@ -56,18 +62,24 @@ fn encode_batch(pairs: &[(&str, &str)]) -> Bytes {
     Bytes::from(tuples.abi_encode())
 }
 
-/// Build a test app with a pre-populated cache so tests don't need to
-/// hit Alpaca. The cache contains a fixed broker mark for COIN with a
-/// known fetch timestamp we can assert against.
+/// Build a test app with a pre-populated cache. By default we use a
+/// market-hours cache pinned **outside** any session window so signed
+/// `publish_time` is deterministic — the `last_session_close` is set
+/// to `FIXED_PUBLISH_TIME` and tests can assert against it.
 async fn test_app() -> axum::Router {
     test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await
 }
 
-/// Build a test app from an explicit list of `(token_address, symbol,
-/// price_opt)` tuples. `price_opt = Some(p)` pre-populates the cache
-/// for that symbol; `None` leaves it uncached so tests can exercise the
-/// partial-cache code paths.
 async fn test_app_with(entries: &[(&str, &str, Option<f64>)]) -> axum::Router {
+    test_app_full(entries, fixed_close_market_hours().await).await
+}
+
+/// Same as `test_app_with` but lets a caller plug in any
+/// `MarketHoursCache` configuration — used by the publish_time tests.
+async fn test_app_full(
+    entries: &[(&str, &str, Option<f64>)],
+    market_hours: Arc<MarketHoursCache>,
+) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
 
     let registry_entries: Vec<(String, String)> = entries
@@ -92,8 +104,42 @@ async fn test_app_with(entries: &[(&str, &str, Option<f64>)]) -> axum::Router {
     }
 
     let configured_symbols: Vec<String> = entries.iter().map(|(_, s, _)| s.to_string()).collect();
-    let state = AppState::new(signer, registry, cache, configured_symbols);
+    let state = AppState::new(signer, registry, cache, configured_symbols, market_hours);
     create_app(state)
+}
+
+/// Cache configured with one prior session window whose `session_close`
+/// equals `FIXED_PUBLISH_TIME`. Since that close is far in the past (the
+/// sampler runs in the present), every `publish_time_for(now)` returns
+/// the close — i.e. the app behaves as "out of session" and signs
+/// `FIXED_PUBLISH_TIME` deterministically.
+async fn fixed_close_market_hours() -> Arc<MarketHoursCache> {
+    let mh = Arc::new(MarketHoursCache::new());
+    let close = Utc.timestamp_opt(FIXED_PUBLISH_TIME, 0).unwrap();
+    let open = close - ChronoDuration::hours(16);
+    let window = SessionWindow {
+        date: NaiveDate::from_ymd_opt(2027, 1, 14).unwrap(),
+        session_open: open,
+        session_close: close,
+    };
+    mh.set(vec![window]).await;
+    mh
+}
+
+/// Cache that places `now` strictly inside an active session window —
+/// publish_time will be the request's wall-clock `Utc::now()`. Used for
+/// the in-session test where we just need `publish_time` to be close to
+/// the signing instant.
+async fn always_in_session_market_hours() -> Arc<MarketHoursCache> {
+    let mh = Arc::new(MarketHoursCache::new());
+    let now = Utc::now();
+    let window = SessionWindow {
+        date: now.date_naive(),
+        session_open: now - ChronoDuration::hours(8),
+        session_close: now + ChronoDuration::hours(8),
+    };
+    mh.set(vec![window]).await;
+    mh
 }
 
 #[tokio::test]
@@ -255,15 +301,61 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
     let price = Float::from(alloy::primitives::B256::from(resp.context[1]));
     assert_eq!(price.format().unwrap(), "100");
 
-    // publish_time = the cached fetch time, not server now() at request
-    // time. Compare against a Float-round-tripped canonical form since
-    // Rain Float formats large integers in scientific notation.
+    // publish_time = the cached MarketHoursCache's last session_close.
+    // Default test_app() is "out of session" with session_close pinned
+    // to FIXED_PUBLISH_TIME, so we expect to see that exact value here.
+    // Compare against a Float-round-tripped canonical form since Rain
+    // Float formats large integers in scientific notation.
     let publish = Float::from(alloy::primitives::B256::from(resp.context[2]));
     let expected = Float::parse(FIXED_PUBLISH_TIME.to_string())
         .unwrap()
         .format()
         .unwrap();
     assert_eq!(publish.format().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_v1_publish_time_uses_now_when_in_session() {
+    // RAI-693: when MarketHoursCache says we're inside an active session,
+    // publish_time must be the request's wall-clock now, NOT the cached
+    // fetch_time (which is FIXED_PUBLISH_TIME and would look hours old).
+    let mh = always_in_session_market_hours().await;
+    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+
+    let before = Utc::now().timestamp();
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v1")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let after = Utc::now().timestamp();
+
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let publish_raw = Float::from(alloy::primitives::B256::from(responses[0].context[2]))
+        .format()
+        .unwrap();
+    // Rain Float formats large ints in scientific notation ("1.78e9");
+    // parse via f64 then round to the nearest integer second.
+    let publish_ts: i64 = publish_raw
+        .parse::<f64>()
+        .expect("publish_time decodes as numeric")
+        .round() as i64;
+
+    // publish_time should fall in the [before, after] interval the
+    // request straddled — i.e. the request's `now`, not the stale
+    // FIXED_PUBLISH_TIME from the fetch-time cache.
+    assert!(
+        publish_ts >= before && publish_ts <= after,
+        "in-session publish_time {publish_ts} should be in [{before}, {after}], not the cached fetch_time {FIXED_PUBLISH_TIME}"
+    );
 }
 
 #[tokio::test]

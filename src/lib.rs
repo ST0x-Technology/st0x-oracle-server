@@ -1,6 +1,7 @@
 pub mod alpaca;
 pub mod cache;
 pub mod config;
+pub mod market_hours;
 pub mod oracle;
 pub mod registry;
 pub mod sign;
@@ -22,7 +23,9 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::cache::QuoteCache;
+use crate::market_hours::MarketHoursCache;
 use crate::registry::{ResolvedPair, TokenRegistry};
+use chrono::Utc;
 
 sol! {
     struct IOV2 {
@@ -66,6 +69,10 @@ pub struct AppState {
     /// Every symbol declared in config.toml. /status compares this
     /// against the cache to surface the partial-serving set.
     configured_symbols: Vec<String>,
+    /// Authoritative market-hours source from Alpaca's calendar.
+    /// Determines whether `publish_time` is `now` (inside an active
+    /// session) or the most recent `session_close` (outside).
+    market_hours: Arc<MarketHoursCache>,
 }
 
 impl AppState {
@@ -74,12 +81,14 @@ impl AppState {
         registry: TokenRegistry,
         cache: Arc<QuoteCache>,
         configured_symbols: Vec<String>,
+        market_hours: Arc<MarketHoursCache>,
     ) -> Self {
         Self {
             signer,
             registry,
             cache,
             configured_symbols,
+            market_hours,
         }
     }
 
@@ -245,6 +254,13 @@ fn resolve_pair_for_order(
 /// The broker mark is a single fair-value number per symbol, so buy and
 /// sell directions both use it; `build_context` inverts via Rain Float
 /// when `pair.inverted` is true.
+///
+/// `publish_time` is chosen by `MarketHoursCache`: inside an active
+/// extended session window we sign `now`; outside we sign the most
+/// recent `session_close`. This is RAI-693: the broker mark has no
+/// per-symbol timestamp, so a naive `fetch_time` stamps an old close
+/// price with a fresh timestamp during weekends/holidays, which the
+/// strategy then accepts even though the mark is hours stale.
 async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
@@ -259,8 +275,9 @@ async fn build_response_from_quote(
         )));
     }
 
-    let publish_time: u64 = quote
-        .t
+    let now = Utc::now();
+    let publish_dt = state.market_hours.publish_time_for(now).await;
+    let publish_time: u64 = publish_dt
         .timestamp()
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
@@ -270,6 +287,7 @@ async fn build_response_from_quote(
         price = quote.price,
         inverted = pair.inverted,
         publish_time = publish_time,
+        in_session = (publish_dt == now),
         "Building signed context from cache"
     );
 

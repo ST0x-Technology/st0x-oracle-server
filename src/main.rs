@@ -2,6 +2,9 @@ use clap::Parser;
 use st0x_oracle_server::alpaca::AlpacaClient;
 use st0x_oracle_server::cache::{poll_once, spawn_poll_loop, QuoteCache};
 use st0x_oracle_server::config::Config;
+use st0x_oracle_server::market_hours::{
+    refresh_once, spawn_market_hours_refresh, MarketHoursCache,
+};
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::{create_app, AppState};
@@ -126,7 +129,28 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(config.poll_interval_secs),
     );
 
-    let state = AppState::new(signer, registry, cache, symbols);
+    // Prime market hours (Alpaca trading calendar). Failure here isn't
+    // fatal — `MarketHoursCache::publish_time_for` falls back to `now`
+    // when empty, which is the pre-RAI-693 behaviour. The hourly refresh
+    // task will keep trying.
+    let market_hours = Arc::new(MarketHoursCache::new());
+    match refresh_once(&market_hours, &alpaca).await {
+        Ok(()) => tracing::info!(
+            window_count = market_hours.window_count().await,
+            "Primed market hours from Alpaca calendar"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "Initial market hours fetch failed; publish_time will use `now` until refresh succeeds"
+        ),
+    }
+    spawn_market_hours_refresh(
+        market_hours.clone(),
+        alpaca.clone(),
+        Duration::from_secs(3600),
+    );
+
+    let state = AppState::new(signer, registry, cache, symbols, market_hours);
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
