@@ -39,6 +39,7 @@ const TOKENS: &[(&str, &str)] = &[
     ("SPYM", "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"),
     ("TSLA", "0x219A8d384a10BF19b9f24cB5cC53F79Dd0e5A03D"),
     ("TSM", "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"),
+    ("SPCX", "0x19F89aaEf8a93f38A974beca9776f09aB844887F"),
 ];
 
 fn order_tuple(input: &str, output: &str) -> (OrderV4, U256, U256, Address) {
