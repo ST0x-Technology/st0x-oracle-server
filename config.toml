@@ -72,3 +72,7 @@ symbol  = "TSLA"
 [[tokens]]
 address = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
 symbol  = "TSM"
+
+[[tokens]]
+address = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
+symbol  = "SPCX"
