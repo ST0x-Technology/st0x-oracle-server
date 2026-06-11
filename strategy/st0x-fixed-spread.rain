@@ -79,6 +79,15 @@ gui:
             Alpaca every 10 seconds.
           default: 30
           min: 1
+        - binding: future-timestamp-buffer
+          name: Future Timestamp Buffer (seconds)
+          description: >
+            Grace period (in seconds) added to block.timestamp when
+            checking that Alpaca publish_time is not in the future.
+            Allows minor clock skew between Alpaca, the signer, and
+            the chain without reverting.
+          default: 20
+          min: 0
       select-tokens:
         - key: output
           name: Token to Sell
@@ -95,6 +104,7 @@ gui:
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
 #max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
 #max-staleness !Maximum age in seconds between Alpaca publish_time and block.timestamp. Orders revert past this.
+#future-timestamp-buffer !Seconds added to block.timestamp for the future publish_time guard. Tolerates clock skew.
 
 
 #st0x-oracle-baseline
@@ -122,13 +132,16 @@ gui:
   oracle-publish-time: signed-context<0 2>(),
 
   /* Future-timestamp guard: publish_time must not be ahead of
-   * block.timestamp. Without this, a future publish_time would make
-   * `sub(now() oracle-publish-time)` negative, and a negative number
-   * is always less than max-staleness, so the staleness check below
-   * would silently pass. Catches clock skew on the signer side and
-   * outright bad data. */
+   * block.timestamp + future-timestamp-buffer. Without this, a future
+   * publish_time would make `sub(now() oracle-publish-time)` negative,
+   * and a negative number is always less than max-staleness, so the
+   * staleness check below would silently pass. Catches clock skew on
+   * the signer side and outright bad data. */
    :ensure(
-     less-than-or-equal-to(oracle-publish-time now())
+     less-than-or-equal-to(
+       oracle-publish-time
+       add(now() future-timestamp-buffer)
+     )
      "Publish time in future"
     ),
 
