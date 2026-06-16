@@ -22,13 +22,73 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// One trading day's extended-session boundaries, materialised to UTC
-/// from the HHMM strings the Alpaca calendar returns.
+/// One trading day's boundaries, materialised to UTC from the HHMM
+/// strings the Alpaca calendar returns.
+///
+/// `session_open` / `session_close` are the extended-hours bounds
+/// (typically 04:00 / 20:00 ET); `rth_open` / `rth_close` are the
+/// regular-trading-hours bounds (typically 09:30 / 16:00 ET) — used by
+/// v2's session classifier to differentiate RTH from pre-/after-hours.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionWindow {
     pub date: NaiveDate,
     pub session_open: DateTime<Utc>,
+    pub rth_open: DateTime<Utc>,
+    pub rth_close: DateTime<Utc>,
     pub session_close: DateTime<Utc>,
+}
+
+/// The market-session classification at a given instant. The bytes32
+/// ASCII encoding is what `/context/v2` signs at context slot 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Session {
+    Rth,
+    Premarket,
+    Afterhours,
+    OvernightClosed,
+    WeekendClosed,
+}
+
+impl Session {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rth => "rth",
+            Self::Premarket => "premarket",
+            Self::Afterhours => "afterhours",
+            Self::OvernightClosed => "overnight_closed",
+            Self::WeekendClosed => "weekend_closed",
+        }
+    }
+
+    /// Encode the session tag as Rain's `IntOrAString` bytes32 — the
+    /// same format the Rainlang parser produces for a `"…"` string
+    /// literal. Byte 0 carries the truthy high bit OR-ed with the
+    /// string length (`(len & 0x1f) | 0x80`), bytes 1..1+len carry the
+    /// ASCII data, bytes 1+len..32 are zero.
+    ///
+    /// This matches `LibIntOrAString::fromString` in
+    /// `rain.intorastring`, so a v2 strategy can compare
+    /// `signed-context<0 3>() == "rth"` and the equality holds. All
+    /// five session names fit comfortably (max length is 16, max slot
+    /// is 31 bytes of data + 1 length byte).
+    pub fn to_bytes32(self) -> [u8; 32] {
+        let bytes = self.as_str().as_bytes();
+        assert!(bytes.len() < 32, "session name must fit in 31 bytes");
+        let mut out = [0u8; 32];
+        out[0] = 0x80 | (bytes.len() as u8);
+        out[1..=bytes.len()].copy_from_slice(bytes);
+        out
+    }
+}
+
+/// The session-level info `/context/v2` exposes at slots 3-5: which
+/// session we're in, and the UTC bounds of *that current* session
+/// (not the next).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub session: Session,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
 }
 
 /// Rolling cache of session windows around today. Refreshed periodically
@@ -68,6 +128,74 @@ impl MarketHoursCache {
             .map(|w| w.session_close)
             .max()
             .unwrap_or(now)
+    }
+
+    /// Classify the current market session and return its UTC bounds.
+    ///
+    /// - Inside an active extended-session window we look at the cached
+    ///   `rth_open` / `rth_close` to split into `Premarket` / `Rth` /
+    ///   `Afterhours`. `start` / `end` are the bounds of the *current*
+    ///   sub-window — not the whole extended session and not the next
+    ///   open.
+    /// - Outside any active window we return either `OvernightClosed`
+    ///   (gap < 12 h between prev close and next open) or
+    ///   `WeekendClosed` (gap >= 12 h — folds Friday-night-through-Monday
+    ///   and multi-day holiday closes into the same bucket). `start` is
+    ///   the most recent past `session_close`; `end` is the next future
+    ///   `session_open`.
+    /// - With no cached windows we fall back to `OvernightClosed` with
+    ///   degenerate bounds (`start = end = now`) so callers always get
+    ///   *some* answer rather than blocking on calendar availability.
+    pub async fn session_info_for(&self, now: DateTime<Utc>) -> SessionInfo {
+        let windows = self.windows.read().await;
+
+        for w in windows.iter() {
+            if w.session_open <= now && now < w.session_close {
+                return if now < w.rth_open {
+                    SessionInfo {
+                        session: Session::Premarket,
+                        start: w.session_open,
+                        end: w.rth_open,
+                    }
+                } else if now < w.rth_close {
+                    SessionInfo {
+                        session: Session::Rth,
+                        start: w.rth_open,
+                        end: w.rth_close,
+                    }
+                } else {
+                    SessionInfo {
+                        session: Session::Afterhours,
+                        start: w.rth_close,
+                        end: w.session_close,
+                    }
+                };
+            }
+        }
+
+        let prev_close = windows
+            .iter()
+            .filter(|w| w.session_close <= now)
+            .map(|w| w.session_close)
+            .max();
+        let next_open = windows
+            .iter()
+            .filter(|w| w.session_open > now)
+            .map(|w| w.session_open)
+            .min();
+
+        let session = match (prev_close, next_open) {
+            (Some(prev), Some(next)) if (next - prev) >= ChronoDuration::hours(12) => {
+                Session::WeekendClosed
+            }
+            _ => Session::OvernightClosed,
+        };
+
+        SessionInfo {
+            session,
+            start: prev_close.unwrap_or(now),
+            end: next_open.unwrap_or(now),
+        }
     }
 
     /// Diagnostic for `/status`: how many windows we have cached.
@@ -148,19 +276,25 @@ mod tests {
     }
 
     fn fri_window() -> SessionWindow {
-        // 2026-05-29 (Fri): session 04:00-20:00 ET = 08:00-24:00 UTC during EDT (UTC-4).
+        // 2026-05-29 (Fri): session 04:00-20:00 ET = 08:00-24:00 UTC
+        // during EDT (UTC-4). RTH 09:30-16:00 ET = 13:30-20:00 UTC.
         SessionWindow {
             date: date(2026, 5, 29),
             session_open: utc(2026, 5, 29, 8, 0),
+            rth_open: Utc.with_ymd_and_hms(2026, 5, 29, 13, 30, 0).unwrap(),
+            rth_close: utc(2026, 5, 29, 20, 0),
             session_close: utc(2026, 5, 30, 0, 0),
         }
     }
 
     fn mon_window() -> SessionWindow {
-        // 2026-06-01 (Mon): session 04:00-20:00 ET = 08:00-24:00 UTC during EDT.
+        // 2026-06-01 (Mon): session 04:00-20:00 ET = 08:00-24:00 UTC
+        // during EDT. RTH 09:30-16:00 ET = 13:30-20:00 UTC.
         SessionWindow {
             date: date(2026, 6, 1),
             session_open: utc(2026, 6, 1, 8, 0),
+            rth_open: Utc.with_ymd_and_hms(2026, 6, 1, 13, 30, 0).unwrap(),
+            rth_close: utc(2026, 6, 1, 20, 0),
             session_close: utc(2026, 6, 2, 0, 0),
         }
     }
@@ -196,6 +330,8 @@ mod tests {
         let tue_window = SessionWindow {
             date: date(2026, 6, 2),
             session_open: utc(2026, 6, 2, 8, 0),
+            rth_open: Utc.with_ymd_and_hms(2026, 6, 2, 13, 30, 0).unwrap(),
+            rth_close: utc(2026, 6, 2, 20, 0),
             session_close: utc(2026, 6, 3, 0, 0),
         };
         c.set(vec![fri_window(), tue_window]).await;
@@ -257,5 +393,170 @@ mod tests {
         assert!(anchor_session_to_utc(date(2026, 5, 29), "abc").is_err());
         assert!(anchor_session_to_utc(date(2026, 5, 29), "2500").is_err());
         assert!(anchor_session_to_utc(date(2026, 5, 29), "04:00").is_err()); // wrong format
+    }
+
+    #[test]
+    fn session_bytes32_matches_rain_intorastring_format() {
+        // Rain's IntOrAString: byte 0 = (len & 0x1f) | 0x80; bytes
+        // 1..1+len = ASCII; bytes 1+len..32 = 0. This is what the
+        // Rainlang parser emits for a `"…"` string literal — so the
+        // bytes32 we sign at context slot 3 must match it byte-for-byte
+        // for `equal-to(signed-context<0 3>() "rth")` to hold on chain.
+        for sess in [
+            Session::Rth,
+            Session::Premarket,
+            Session::Afterhours,
+            Session::OvernightClosed,
+            Session::WeekendClosed,
+        ] {
+            let b = sess.to_bytes32();
+            let name = sess.as_str().as_bytes();
+            assert_eq!(
+                b[0],
+                0x80 | name.len() as u8,
+                "{}: byte 0 must be 0x80 | length",
+                sess.as_str()
+            );
+            assert_eq!(
+                &b[1..=name.len()],
+                name,
+                "{}: ASCII data must follow the length byte",
+                sess.as_str()
+            );
+            assert!(
+                b[1 + name.len()..].iter().all(|&x| x == 0),
+                "{}: tail must be zero-padded",
+                sess.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn session_bytes32_known_rth_value() {
+        // Spot-check the exact bytes for "rth" so the encoding is
+        // pinned against the format used by Pyth-pair-style strategies
+        // in rain.strategies (`0x92`-prefixed pair names = 0x80 | 18).
+        let b = Session::Rth.to_bytes32();
+        let mut expected = [0u8; 32];
+        expected[..4].copy_from_slice(&[0x83, b'r', b't', b'h']);
+        assert_eq!(b, expected);
+    }
+
+    #[test]
+    fn session_names_unique_and_fit() {
+        let names = [
+            Session::Rth.as_str(),
+            Session::Premarket.as_str(),
+            Session::Afterhours.as_str(),
+            Session::OvernightClosed.as_str(),
+            Session::WeekendClosed.as_str(),
+        ];
+        for n in &names {
+            assert!(n.len() <= 31, "{n} must fit in 31 data bytes");
+        }
+        let set: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(set.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn session_info_rth() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let now = utc(2026, 5, 29, 17, 0); // 13:00 ET
+        let info = c.session_info_for(now).await;
+        assert_eq!(info.session, Session::Rth);
+        assert_eq!(info.start, fri_window().rth_open);
+        assert_eq!(info.end, fri_window().rth_close);
+    }
+
+    #[tokio::test]
+    async fn session_info_premarket() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let now = utc(2026, 5, 29, 10, 0); // 06:00 ET
+        let info = c.session_info_for(now).await;
+        assert_eq!(info.session, Session::Premarket);
+        assert_eq!(info.start, fri_window().session_open);
+        assert_eq!(info.end, fri_window().rth_open);
+    }
+
+    #[tokio::test]
+    async fn session_info_afterhours() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let now = utc(2026, 5, 29, 22, 0); // 18:00 ET
+        let info = c.session_info_for(now).await;
+        assert_eq!(info.session, Session::Afterhours);
+        assert_eq!(info.start, fri_window().rth_close);
+        assert_eq!(info.end, fri_window().session_close);
+    }
+
+    #[tokio::test]
+    async fn session_info_overnight_closed_between_weekdays() {
+        let c = MarketHoursCache::new();
+        // Mon and Tue trading days, both EDT.
+        let tue_window = SessionWindow {
+            date: date(2026, 6, 2),
+            session_open: utc(2026, 6, 2, 8, 0),
+            rth_open: Utc.with_ymd_and_hms(2026, 6, 2, 13, 30, 0).unwrap(),
+            rth_close: utc(2026, 6, 2, 20, 0),
+            session_close: utc(2026, 6, 3, 0, 0),
+        };
+        c.set(vec![mon_window(), tue_window.clone()]).await;
+        // Tue 02:00 ET = Tue 06:00 UTC, between Mon's session_close
+        // (Tue 00:00 UTC) and Tue's session_open (Tue 08:00 UTC). Gap
+        // is 8 h - overnight, not weekend.
+        let now = utc(2026, 6, 2, 6, 0);
+        let info = c.session_info_for(now).await;
+        assert_eq!(info.session, Session::OvernightClosed);
+        assert_eq!(info.start, mon_window().session_close);
+        assert_eq!(info.end, tue_window.session_open);
+    }
+
+    #[tokio::test]
+    async fn session_info_weekend_closed() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window(), mon_window()]).await;
+        // Sat noon UTC - between Fri's session_close (Sat 00:00 UTC)
+        // and Mon's session_open (Mon 08:00 UTC). Gap is 56h, well
+        // over the 12h threshold - classified as weekend.
+        let now = utc(2026, 5, 30, 12, 0);
+        let info = c.session_info_for(now).await;
+        assert_eq!(info.session, Session::WeekendClosed);
+        assert_eq!(info.start, fri_window().session_close);
+        assert_eq!(info.end, mon_window().session_open);
+    }
+
+    #[tokio::test]
+    async fn session_info_holiday_long_close_classifies_as_weekend() {
+        // 3-day holiday weekend: Fri Mon trading days only (Tue or
+        // Wed simulating the holiday Mon being absent), with Tue back
+        // to normal. Gap from Fri close to Tue open is ~85h - bucket
+        // as `weekend_closed` per the 12h threshold.
+        let c = MarketHoursCache::new();
+        let tue_window = SessionWindow {
+            date: date(2026, 6, 2),
+            session_open: utc(2026, 6, 2, 8, 0),
+            rth_open: Utc.with_ymd_and_hms(2026, 6, 2, 13, 30, 0).unwrap(),
+            rth_close: utc(2026, 6, 2, 20, 0),
+            session_close: utc(2026, 6, 3, 0, 0),
+        };
+        c.set(vec![fri_window(), tue_window.clone()]).await;
+        let now = utc(2026, 6, 1, 14, 0); // Mon 10:00 ET, holiday
+        let info = c.session_info_for(now).await;
+        assert_eq!(info.session, Session::WeekendClosed);
+        assert_eq!(info.start, fri_window().session_close);
+        assert_eq!(info.end, tue_window.session_open);
+    }
+
+    #[tokio::test]
+    async fn session_info_empty_cache_returns_degenerate_overnight() {
+        let c = MarketHoursCache::new();
+        let now = utc(2026, 5, 29, 12, 0);
+        let info = c.session_info_for(now).await;
+        assert_eq!(info.session, Session::OvernightClosed);
+        // No data - degenerate bounds (start == end == now).
+        assert_eq!(info.start, now);
+        assert_eq!(info.end, now);
     }
 }

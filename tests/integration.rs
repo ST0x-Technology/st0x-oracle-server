@@ -120,6 +120,8 @@ async fn fixed_close_market_hours() -> Arc<MarketHoursCache> {
     let window = SessionWindow {
         date: NaiveDate::from_ymd_opt(2027, 1, 14).unwrap(),
         session_open: open,
+        rth_open: open + ChronoDuration::hours(5) + ChronoDuration::minutes(30), // 09:30 ET
+        rth_close: open + ChronoDuration::hours(12),                             // 16:00 ET
         session_close: close,
     };
     mh.set(vec![window]).await;
@@ -136,10 +138,123 @@ async fn always_in_session_market_hours() -> Arc<MarketHoursCache> {
     let window = SessionWindow {
         date: now.date_naive(),
         session_open: now - ChronoDuration::hours(8),
+        // Bracket `now` in the middle of the RTH sub-window too, so a v2
+        // session_info_for(now) classifies as Rth.
+        rth_open: now - ChronoDuration::hours(2),
+        rth_close: now + ChronoDuration::hours(2),
         session_close: now + ChronoDuration::hours(8),
     };
     mh.set(vec![window]).await;
     mh
+}
+
+/// Position the cached window so wall-clock `now` lands in pre-market:
+/// inside the extended session, before the RTH sub-window.
+async fn premarket_market_hours() -> Arc<MarketHoursCache> {
+    let mh = Arc::new(MarketHoursCache::new());
+    let now = Utc::now();
+    let window = SessionWindow {
+        date: now.date_naive(),
+        session_open: now - ChronoDuration::hours(1),
+        rth_open: now + ChronoDuration::hours(2),
+        rth_close: now + ChronoDuration::hours(8),
+        session_close: now + ChronoDuration::hours(12),
+    };
+    mh.set(vec![window]).await;
+    mh
+}
+
+/// After RTH closes but before the extended-session bell rings — `now`
+/// is inside the extended session, past `rth_close`.
+async fn afterhours_market_hours() -> Arc<MarketHoursCache> {
+    let mh = Arc::new(MarketHoursCache::new());
+    let now = Utc::now();
+    let window = SessionWindow {
+        date: now.date_naive(),
+        session_open: now - ChronoDuration::hours(12),
+        rth_open: now - ChronoDuration::hours(8),
+        rth_close: now - ChronoDuration::hours(1),
+        session_close: now + ChronoDuration::hours(2),
+    };
+    mh.set(vec![window]).await;
+    mh
+}
+
+/// Two adjacent weekday windows with `now` in the overnight gap between
+/// them. The gap is ~8 h (typical weekday overnight), below the 12 h
+/// threshold so the classifier returns `OvernightClosed`.
+async fn overnight_closed_market_hours() -> Arc<MarketHoursCache> {
+    let mh = Arc::new(MarketHoursCache::new());
+    let now = Utc::now();
+    let yesterday = SessionWindow {
+        date: (now - ChronoDuration::days(1)).date_naive(),
+        session_open: now - ChronoDuration::hours(20),
+        rth_open: now - ChronoDuration::hours(16),
+        rth_close: now - ChronoDuration::hours(10),
+        session_close: now - ChronoDuration::hours(2), // 2 h ago
+    };
+    let tomorrow = SessionWindow {
+        date: (now + ChronoDuration::days(1)).date_naive(),
+        session_open: now + ChronoDuration::hours(6), // 6 h ahead — 8 h overall gap, < 12 h
+        rth_open: now + ChronoDuration::hours(10),
+        rth_close: now + ChronoDuration::hours(16),
+        session_close: now + ChronoDuration::hours(20),
+    };
+    mh.set(vec![yesterday, tomorrow]).await;
+    mh
+}
+
+/// Two non-adjacent windows separated by a >= 12 h gap straddling
+/// `now`. Mimics Friday-night-through-Monday-morning. The classifier
+/// returns `WeekendClosed`.
+async fn weekend_closed_market_hours() -> Arc<MarketHoursCache> {
+    let mh = Arc::new(MarketHoursCache::new());
+    let now = Utc::now();
+    let friday = SessionWindow {
+        date: (now - ChronoDuration::days(2)).date_naive(),
+        session_open: now - ChronoDuration::hours(60),
+        rth_open: now - ChronoDuration::hours(56),
+        rth_close: now - ChronoDuration::hours(50),
+        session_close: now - ChronoDuration::hours(40), // 40 h ago
+    };
+    let monday = SessionWindow {
+        date: (now + ChronoDuration::days(2)).date_naive(),
+        session_open: now + ChronoDuration::hours(20), // 20 h ahead — 60 h overall gap
+        rth_open: now + ChronoDuration::hours(24),
+        rth_close: now + ChronoDuration::hours(30),
+        session_close: now + ChronoDuration::hours(36),
+    };
+    mh.set(vec![friday, monday]).await;
+    mh
+}
+
+/// Decode a session tag from slot 3 of the v2 context. The on-the-wire
+/// format is Rain's `IntOrAString`: byte 0 holds `(len & 0x1f) | 0x80`,
+/// the ASCII data lives in bytes `1..=len`.
+fn decode_session_tag(b: alloy::primitives::FixedBytes<32>) -> String {
+    let bytes: [u8; 32] = b.into();
+    let len = (bytes[0] & 0x1f) as usize;
+    String::from_utf8(bytes[1..=len].to_vec()).unwrap()
+}
+
+/// Send a single buy through `/context/v2` and return the decoded
+/// session tag from the response. Used by the phase-coverage tests.
+async fn v2_session_tag_for(app: axum::Router) -> String {
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v2")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    decode_session_tag(responses[0].context[3])
 }
 
 #[tokio::test]
@@ -356,6 +471,207 @@ async fn test_v1_publish_time_uses_now_when_in_session() {
         publish_ts >= before && publish_ts <= after,
         "in-session publish_time {publish_ts} should be in [{before}, {after}], not the cached fetch_time {FIXED_PUBLISH_TIME}"
     );
+}
+
+#[tokio::test]
+async fn test_v2_single_returns_v2_schema_with_session() {
+    // In-session market_hours -> /context/v2 should return a 6-element
+    // context with schema version 2, fresh publish_time, "rth" session
+    // tag, and the session bounds we put in the cache.
+    let mh = always_in_session_market_hours().await;
+    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v2")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(responses.len(), 1);
+    let resp = &responses[0];
+    assert_eq!(resp.context.len(), 6, "v2 must emit 6 context elements");
+
+    // schema_version
+    let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
+    assert_eq!(version.format().unwrap(), "2");
+
+    // price (broker mark)
+    let price = Float::from(alloy::primitives::B256::from(resp.context[1]));
+    assert_eq!(price.format().unwrap(), "100");
+
+    // session tag - Rain IntOrAString-encoded "rth": byte 0 = 0x83
+    // (length 3 OR-ed with the truthy high bit), bytes 1..4 = "rth".
+    let sess = resp.context[3].as_slice();
+    assert_eq!(sess[0], 0x83, "byte 0 must be 0x80 | 3");
+    assert_eq!(&sess[1..4], b"rth");
+    assert!(
+        sess[4..].iter().all(|&b| b == 0),
+        "session tag must be zero-padded after the data: {:?}",
+        sess
+    );
+
+    // session_start, session_end - non-zero and ordered
+    let start = Float::from(alloy::primitives::B256::from(resp.context[4]))
+        .format()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap() as i64;
+    let end = Float::from(alloy::primitives::B256::from(resp.context[5]))
+        .format()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap() as i64;
+    assert!(
+        start > 0 && end > start,
+        "session bounds: start={start} end={end}"
+    );
+}
+
+#[tokio::test]
+async fn test_v2_handler_signs_rth_when_now_inside_rth() {
+    let app = test_app_full(
+        &[(WCOIN, "COIN", Some(100.0))],
+        always_in_session_market_hours().await,
+    )
+    .await;
+    assert_eq!(v2_session_tag_for(app).await, "rth");
+}
+
+#[tokio::test]
+async fn test_v2_handler_signs_premarket_when_now_before_rth_open() {
+    let app = test_app_full(
+        &[(WCOIN, "COIN", Some(100.0))],
+        premarket_market_hours().await,
+    )
+    .await;
+    assert_eq!(v2_session_tag_for(app).await, "premarket");
+}
+
+#[tokio::test]
+async fn test_v2_handler_signs_afterhours_when_now_past_rth_close() {
+    let app = test_app_full(
+        &[(WCOIN, "COIN", Some(100.0))],
+        afterhours_market_hours().await,
+    )
+    .await;
+    assert_eq!(v2_session_tag_for(app).await, "afterhours");
+}
+
+#[tokio::test]
+async fn test_v2_handler_signs_overnight_closed_for_short_gap() {
+    let app = test_app_full(
+        &[(WCOIN, "COIN", Some(100.0))],
+        overnight_closed_market_hours().await,
+    )
+    .await;
+    assert_eq!(v2_session_tag_for(app).await, "overnight_closed");
+}
+
+#[tokio::test]
+async fn test_v2_handler_signs_weekend_closed_for_long_gap() {
+    let app = test_app_full(
+        &[(WCOIN, "COIN", Some(100.0))],
+        weekend_closed_market_hours().await,
+    )
+    .await;
+    assert_eq!(v2_session_tag_for(app).await, "weekend_closed");
+}
+
+#[tokio::test]
+async fn test_v2_session_tag_reflects_market_phase() {
+    // Out-of-session market_hours (fixed_close_market_hours pins us
+    // outside any active window) -> session tag should be a closed
+    // variant, not "rth".
+    let app = test_app_full(
+        &[(WCOIN, "COIN", Some(100.0))],
+        fixed_close_market_hours().await,
+    )
+    .await;
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v2")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let sess = responses[0].context[3].as_slice();
+    // Decode the IntOrAString format: length = byte 0 & 0x1f, ASCII
+    // data starts at byte 1. With only a single window in the cache
+    // and `now` after it, the cache returns OvernightClosed (no
+    // `next_open` to widen the gap).
+    let len = (sess[0] & 0x1f) as usize;
+    let name = std::str::from_utf8(&sess[1..=len]).unwrap();
+    assert_eq!(name, "overnight_closed");
+}
+
+#[tokio::test]
+async fn test_v2_batch_returns_length_matching_array_with_session() {
+    let mh = always_in_session_market_hours().await;
+    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v2")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_batch(&[
+                    (USDC, WCOIN),
+                    (WCOIN, USDC),
+                ])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(responses.len(), 2);
+    // Both legs must agree on the session snapshot.
+    assert_eq!(responses[0].context[3], responses[1].context[3]);
+    assert_eq!(responses[0].context[4], responses[1].context[4]);
+    assert_eq!(responses[0].context[5], responses[1].context[5]);
+    // Sell leg's price is inverted (1/100 = 0.01) per the build_context_v2
+    // contract — exercises the same inversion path as v1.
+    let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
+    assert_eq!(sell_price.format().unwrap(), "0.01");
+}
+
+#[tokio::test]
+async fn test_v2_empty_batch_returns_empty_array() {
+    let empty: Vec<(OrderV4, U256, U256, Address)> = Vec::new();
+    let body = Bytes::from(empty.abi_encode());
+    let app = test_app().await;
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v2")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert!(responses.is_empty());
 }
 
 #[tokio::test]

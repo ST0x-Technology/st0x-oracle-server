@@ -133,6 +133,10 @@ impl AlpacaClient {
 #[derive(Debug, Deserialize)]
 struct CalendarResponse {
     date: String,
+    /// "HH:MM" in ET — RTH open (usually "09:30").
+    open: String,
+    /// "HH:MM" in ET — RTH close (usually "16:00").
+    close: String,
     /// "HHMM" in ET — extended-session open (pre-market start, usually "0400").
     session_open: String,
     /// "HHMM" in ET — extended-session close (after-hours end, usually "2000").
@@ -142,9 +146,16 @@ struct CalendarResponse {
 fn calendar_row_to_window(r: CalendarResponse) -> anyhow::Result<SessionWindow> {
     let date = NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
         .map_err(|e| anyhow::anyhow!("invalid calendar date {:?}: {}", r.date, e))?;
+    // RTH `open` / `close` are emitted as "HH:MM"; the extended-session
+    // boundaries as "HHMM". `anchor_session_to_utc` wants 4-char "HHMM",
+    // so strip the colon for RTH before anchoring.
+    let rth_open_hhmm = r.open.replace(':', "");
+    let rth_close_hhmm = r.close.replace(':', "");
     Ok(SessionWindow {
         date,
         session_open: anchor_session_to_utc(date, &r.session_open)?,
+        rth_open: anchor_session_to_utc(date, &rth_open_hhmm)?,
+        rth_close: anchor_session_to_utc(date, &rth_close_hhmm)?,
         session_close: anchor_session_to_utc(date, &r.session_close)?,
     })
 }
