@@ -51,14 +51,16 @@ builder:
             Which market session this strategy will quote during. The
             v2 oracle signs the current session into the context;
             orders revert when the signed session does not match.
-          default: "rth"
+            Values are Rain IntOrAString-encoded bytes32 (same format
+            as Pyth pair presets in rain.strategies).
+          default: 0x8372746800000000000000000000000000000000000000000000000000000000
           presets:
             - name: Regular trading hours (09:30-16:00 ET)
-              value: "rth"
+              value: 0x8372746800000000000000000000000000000000000000000000000000000000
             - name: Pre-market (04:00-09:30 ET)
-              value: "premarket"
+              value: 0x897072656d61726b657400000000000000000000000000000000000000000000
             - name: After-hours (16:00-20:00 ET)
-              value: "afterhours"
+              value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
         - binding: min-price
           name: Minimum Price
           description: >
@@ -90,7 +92,7 @@ builder:
 
 #oracle-signer !The trusted signer address for the st0x oracle server.
 #oracle-schema-version !Expected oracle context schema version (= 2 for v2).
-#allowed-session !Required market-session tag. Rainlang parses the string literal into the same right-padded ASCII bytes32 the oracle signs.
+#allowed-session !Required market-session tag as Rain IntOrAString bytes32 (hex). Must match oracle context slot 3.
 
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
 #max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
@@ -124,9 +126,8 @@ oracle-session-start: signed-context<0 4>(),
 oracle-session-end: signed-context<0 5>(),
 
 /* Session guard. Strategy only operates in the deployer-chosen session.
- * The oracle signs the session as a right-padded ASCII bytes32 in slot
- * 3; the Rainlang parser produces the same bytes32 from the
- * `allowed-session` string literal on the binding side. */
+ * The oracle signs the session as Rain IntOrAString bytes32 in slot 3;
+ * bind `allowed-session` to the same hex encoding (see builder presets). */
 :ensure(
   equal-to(oracle-session allowed-session)
   "Not in allowed market session"
