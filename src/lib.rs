@@ -103,6 +103,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/", get(health))
         .route("/status", get(status))
         .route("/context/v1", post(post_signed_context_v1))
+        .route("/context/v2", post(post_signed_context_v2))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -189,6 +190,52 @@ async fn post_signed_context_v1(
             ))
         })?;
         let resp = build_response_from_quote(&state, pair, &quote).await?;
+        responses.push(resp);
+    }
+
+    Ok(Json(responses))
+}
+
+/// v2 handler — same request shape and snapshot-once batching as v1, but
+/// the signed context carries the market-session classification and
+/// current-session bounds in slots 3-5. v1 is unchanged. See
+/// `oracle::build_context_v2` for the on-the-wire layout.
+async fn post_signed_context_v2(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let requests = decode_request_body(&body)?;
+
+    if requests.is_empty() {
+        return Ok(Json(Vec::<oracle::OracleResponse>::new()));
+    }
+
+    let mut resolved: Vec<(OrderV4, ResolvedPair)> = Vec::with_capacity(requests.len());
+    for (order, input_io_index, output_io_index, _counterparty) in requests {
+        let pair = resolve_pair_for_order(&state, &order, input_io_index, output_io_index)?;
+        resolved.push((order, pair));
+    }
+
+    let needed_symbols: Vec<&str> = resolved.iter().map(|(_, p)| p.symbol.as_str()).collect();
+    let snapshot = state.cache.snapshot_many(&needed_symbols).await;
+
+    // Snapshot the session classification once for the whole batch so
+    // every signed context in this response agrees on which session
+    // we're in, even across a phase boundary mid-iteration.
+    let now = Utc::now();
+    let publish_dt = state.market_hours.publish_time_for(now).await;
+    let session_info = state.market_hours.session_info_for(now).await;
+
+    let mut responses = Vec::with_capacity(resolved.len());
+    for (_, pair) in &resolved {
+        let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
+            AppError::Unavailable(format!(
+                "No cached quote for {} yet. The poll loop has not succeeded since startup.",
+                pair.symbol
+            ))
+        })?;
+        let resp =
+            build_response_from_quote_v2(&state, pair, &quote, publish_dt, &session_info).await?;
         responses.push(resp);
     }
 
@@ -292,6 +339,68 @@ async fn build_response_from_quote(
     );
 
     let context = oracle::build_context(quote.price, publish_time, pair.inverted)?;
+    let (signature, signer) = state.signer.sign_context(&context).await?;
+
+    Ok(oracle::OracleResponse {
+        signer,
+        context,
+        signature,
+    })
+}
+
+/// v2 variant of `build_response_from_quote`. Same price + publish_time
+/// computation as v1, but folds the session classification into the
+/// signed context. The caller passes in a single `publish_dt` and
+/// `session_info` so every response in a batch agrees on the
+/// market-hours snapshot.
+async fn build_response_from_quote_v2(
+    state: &AppState,
+    pair: &ResolvedPair,
+    quote: &crate::alpaca::QuoteData,
+    publish_dt: chrono::DateTime<Utc>,
+    session_info: &crate::market_hours::SessionInfo,
+) -> Result<oracle::OracleResponse, AppError> {
+    if quote.price <= 0.0 {
+        return Err(AppError::BadRequest(format!(
+            "Zero or negative broker mark for {} (price={}). Market may be closed or data is bad.",
+            pair.symbol, quote.price
+        )));
+    }
+
+    let publish_time: u64 = publish_dt
+        .timestamp()
+        .try_into()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
+    let session_start: u64 = session_info
+        .start
+        .timestamp()
+        .try_into()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("session_start out of range")))?;
+    let session_end: u64 = session_info
+        .end
+        .timestamp()
+        .try_into()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
+
+    tracing::info!(
+        symbol = %pair.symbol,
+        price = quote.price,
+        inverted = pair.inverted,
+        publish_time = publish_time,
+        session = session_info.session.as_str(),
+        session_start = session_start,
+        session_end = session_end,
+        "Building v2 signed context from cache"
+    );
+
+    let context = oracle::build_context_v2(
+        quote.price,
+        publish_time,
+        session_info.session.to_bytes32(),
+        session_start,
+        session_end,
+        pair.inverted,
+    )?;
     let (signature, signer) = state.signer.sign_context(&context).await?;
 
     Ok(oracle::OracleResponse {
