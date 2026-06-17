@@ -86,7 +86,7 @@ builder:
             - name: After-hours (16:00-20:00 ET)
               value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
             - name: All active sessions (pre-market, RTH, after-hours)
-              value: 0x83616c6c0000000000000000000000000000000000000000000000000000000000
+              value: 0x83616c6c00000000000000000000000000000000000000000000000000000000
         - binding: baseline-multiplier
           name: Benchmark price multiplier
           description: |
@@ -126,7 +126,7 @@ builder:
           name: Token to Buy
           description: Select USDC as the token you want to receive
     base-st0x-dividends-sell:
-      name: Base st0x fixed spread v2 sell
+      name: Base st0x fixed spread v2 dividends sell
       description: Deploy a fixed-spread strategy with dividends multiplier on Base to sell tStock for USDC, gated on market session.
       deposits:
         - token: output
@@ -151,7 +151,7 @@ builder:
             - name: After-hours (16:00-20:00 ET)
               value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
             - name: All active sessions (pre-market, RTH, after-hours)
-              value: 0x83616c6c0000000000000000000000000000000000000000000000000000000000
+              value: 0x83616c6c00000000000000000000000000000000000000000000000000000000
         - binding: baseline-multiplier
           name: Benchmark price multiplier
           description: |
@@ -191,7 +191,7 @@ builder:
           name: Token to Buy
           description: Select USDC as the token you want to receive
     base-st0x-dividends-buy:
-      name: Base st0x fixed spread v2 buy
+      name: Base st0x fixed spread v2 dividends buy
       description: Deploy a fixed-spread strategy with dividends multiplier on Base to buy tStock with USDC, gated on market session.
       deposits:
         - token: output
@@ -216,7 +216,7 @@ builder:
             - name: After-hours (16:00-20:00 ET)
               value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
             - name: All active sessions (pre-market, RTH, after-hours)
-              value: 0x83616c6c0000000000000000000000000000000000000000000000000000000000
+              value: 0x83616c6c00000000000000000000000000000000000000000000000000000000
         - binding: baseline-multiplier
           name: Benchmark price multiplier
           description: |
@@ -303,7 +303,7 @@ builder:
       all-of(
         equal-to(
           allowed-session
-          0x83616c6c0000000000000000000000000000000000000000000000000000000000
+          0x83616c6c00000000000000000000000000000000000000000000000000000000
         )
         any-of(
           equal-to(oracle-session "rth")
