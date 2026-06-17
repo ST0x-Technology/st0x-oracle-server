@@ -10,7 +10,7 @@ orders:
       - token: output
 
 scenarios:
-  st0x-oracle-baseline-base-v2-sell:
+  st0x-oracle-baseline-v2:
     raindex: base
     rainlang: base
     runs: 1
@@ -19,8 +19,8 @@ scenarios:
       erc4626-words: 0x5cE811Ef462dfdFA823A8AA16333aaE4f69712fc
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
       oracle-schema-version: 2
-      baseline-fn: '''st0x-oracle-baseline-v2-sell'
-  st0x-oracle-baseline-base-v2-buy:
+      baseline-fn: '''st0x-oracle-baseline-v2'
+  st0x-oracle-baseline-dividends-sell:
     raindex: base
     rainlang: base
     runs: 1
@@ -29,15 +29,28 @@ scenarios:
       erc4626-words: 0x5cE811Ef462dfdFA823A8AA16333aaE4f69712fc
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
       oracle-schema-version: 2
-      baseline-fn: '''st0x-oracle-baseline-v2-buy'
+      baseline-fn: '''st0x-oracle-baseline-dividends-sell'
+  st0x-oracle-baseline-dividends-buy:
+    raindex: base
+    rainlang: base
+    runs: 1
+    bindings:
+      raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
+      erc4626-words: 0x5cE811Ef462dfdFA823A8AA16333aaE4f69712fc
+      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-schema-version: 2
+      baseline-fn: '''st0x-oracle-baseline-dividends-buy'
 
 deployments:
-  base-st0x-v2-sell:
+  base-st0x-baseline-v2:
     order: base
-    scenario: st0x-oracle-baseline-base-v2-sell
-  base-st0x-v2-buy:
+    scenario: st0x-oracle-baseline-v2
+  base-st0x-dividends-sell:
     order: base
-    scenario: st0x-oracle-baseline-base-v2-buy
+    scenario: st0x-oracle-baseline-dividends-sell
+  base-st0x-dividends-buy:
+    order: base
+    scenario: st0x-oracle-baseline-dividends-buy
 
 builder:
   name: St0x fixed spread limit v2
@@ -47,7 +60,7 @@ builder:
     multiplier, gated on market session via the v2 oracle endpoint,
     and adjusted for the on-chain ERC4626 wrap ratio.
   deployments:
-    base-st0x-v2-sell:
+    base-st0x-baseline-v2:
       name: Base st0x fixed spread v2 sell
       description: Deploy a fixed-spread strategy on Base to sell tStock for USDC, gated on market session.
       deposits:
@@ -107,9 +120,69 @@ builder:
         - key: input
           name: Token to Buy
           description: Select USDC as the token you want to receive
-    base-st0x-v2-buy:
+    base-st0x-dividends-sell:
+      name: Base st0x fixed spread v2 sell
+      description: Deploy a fixed-spread strategy with dividends multiplier on Base to sell tStock for USDC, gated on market session.
+      deposits:
+        - token: output
+      fields:
+        - binding: allowed-session
+          name: Market session
+          description: >
+            Which market session this strategy will quote during. The
+            v2 oracle signs the current session into the context;
+            orders revert when the signed session does not match.
+            Values are Rain IntOrAString-encoded bytes32 (same format
+            as Pyth pair presets in rain.strategies).
+          default: 0x8372746800000000000000000000000000000000000000000000000000000000
+          presets:
+            - name: Regular trading hours (09:30-16:00 ET)
+              value: 0x8372746800000000000000000000000000000000000000000000000000000000
+            - name: Pre-market (04:00-09:30 ET)
+              value: 0x897072656d61726b657400000000000000000000000000000000000000000000
+            - name: After-hours (16:00-20:00 ET)
+              value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
+        - binding: baseline-multiplier
+          name: Benchmark price multiplier
+          description: |
+            The multiplier to be applied to the benchmark when calculating the price the strategy will offer at
+          show-custom-field: true
+          default: 1.001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: min-price
+          name: Minimum Price
+          description: >
+            Floor price as a safety guard. If the oracle returns a price
+            below this, the order reverts. Protects against catastrophic
+            mispricings or broken oracle data. Set based on the asset -
+            e.g. 0.01 for penny stocks, 10 for blue chips.
+          default: 0.01
+          min: 0.000001
+        - binding: max-price
+          name: Maximum Price
+          description: >
+            Ceiling price as a safety guard. If the oracle returns a
+            price above this, the order reverts. Protects against
+            overflow or encoding errors. Set generously above the
+            asset's expected range.
+          default: 100000
+          min: 1
+      select-tokens:
+        - key: output
+          name: Token to Sell
+          description: Select the tStock you want to sell (e.g. wtCOIN)
+        - key: input
+          name: Token to Buy
+          description: Select USDC as the token you want to receive
+    base-st0x-dividends-buy:
       name: Base st0x fixed spread v2 buy
-      description: Deploy a fixed-spread strategy on Base to buy tStock with USDC, gated on market session.
+      description: Deploy a fixed-spread strategy with dividends multiplier on Base to buy tStock with USDC, gated on market session.
       deposits:
         - token: output
       fields:
@@ -250,12 +323,12 @@ builder:
   ),
   _: oracle-price;
 
-#st0x-oracle-baseline-v2-sell
+#st0x-oracle-baseline-dividends-sell
   oracle-price: call<'st0x-oracle-baseline-v2>(),
   wrap-ratio: erc4626-convert-to-assets(output-token() 1),
   _: mul(oracle-price wrap-ratio);
 
-#st0x-oracle-baseline-v2-buy
+#st0x-oracle-baseline-dividends-buy
   oracle-price: call<'st0x-oracle-baseline-v2>(),
   wrap-ratio: erc4626-convert-to-shares(input-token() 1),
   _: mul(oracle-price wrap-ratio);
