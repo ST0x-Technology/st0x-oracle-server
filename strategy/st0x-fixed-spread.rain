@@ -50,10 +50,7 @@ builder:
   deployments:
     base-st0x-sell:
       name: Base st0x fixed spread sell
-      description: >
-        Sell tStock for USDC at oracle price x wrap ratio x spread.
-        The oracle signs the IO ratio; wrap ratio comes from
-        erc4626-convert-to-assets on the tStock being sold.
+      description: Deploy a fixed-spread strategy on Base to sell tStock for USDC.
       deposits:
         - token: output
       fields:
@@ -116,10 +113,7 @@ builder:
           description: Select USDC as the token you want to receive
     base-st0x-buy:
       name: Base st0x fixed spread buy
-      description: >
-        Buy tStock with USDC at oracle price x wrap ratio x spread.
-        Wrap ratio comes from erc4626-convert-to-shares on the tStock
-        being bought.
+      description: Deploy a fixed-spread strategy on Base to buy tStock with USDC.
       deposits:
         - token: output
       fields:

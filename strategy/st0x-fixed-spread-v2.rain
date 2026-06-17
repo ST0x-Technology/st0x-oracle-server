@@ -49,9 +49,7 @@ builder:
   deployments:
     base-st0x-v2-sell:
       name: Base st0x fixed spread v2 sell
-      description: >
-        Sell tStock for USDC at oracle price x wrap ratio x spread,
-        restricted to a specific market session.
+      description: Deploy a fixed-spread strategy on Base to sell tStock for USDC, gated on market session.
       deposits:
         - token: output
       fields:
@@ -111,9 +109,7 @@ builder:
           description: Select USDC as the token you want to receive
     base-st0x-v2-buy:
       name: Base st0x fixed spread v2 buy
-      description: >
-        Buy tStock with USDC at oracle price x wrap ratio x spread,
-        restricted to a specific market session.
+      description: Deploy a fixed-spread strategy on Base to buy tStock with USDC, gated on market session.
       deposits:
         - token: output
       fields:
