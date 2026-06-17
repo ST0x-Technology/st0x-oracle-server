@@ -299,13 +299,13 @@ builder:
    * after-hours. Otherwise require an exact match to the chosen
    * session. Overnight/weekend closed sessions always revert. */
   :ensure(
-    any-of(
-      all-of(
+    any(
+      every(
         equal-to(
           allowed-session
           0x83616c6c00000000000000000000000000000000000000000000000000000000
         )
-        any-of(
+        any(
           equal-to(oracle-session "rth")
           equal-to(oracle-session "premarket")
           equal-to(oracle-session "afterhours")
