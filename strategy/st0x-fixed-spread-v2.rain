@@ -72,6 +72,9 @@ builder:
             Which market session this strategy will quote during. The
             v2 oracle signs the current session into the context;
             orders revert when the signed session does not match.
+            Choose a single session or all active sessions (pre-market,
+            regular hours, and after-hours). Overnight and weekend
+            closed sessions always revert.
             Values are Rain IntOrAString-encoded bytes32 (same format
             as Pyth pair presets in rain.strategies).
           default: 0x8372746800000000000000000000000000000000000000000000000000000000
@@ -82,6 +85,8 @@ builder:
               value: 0x897072656d61726b657400000000000000000000000000000000000000000000
             - name: After-hours (16:00-20:00 ET)
               value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
+            - name: All active sessions (pre-market, RTH, after-hours)
+              value: 0x83616c6c0000000000000000000000000000000000000000000000000000000000
         - binding: baseline-multiplier
           name: Benchmark price multiplier
           description: |
@@ -132,6 +137,9 @@ builder:
             Which market session this strategy will quote during. The
             v2 oracle signs the current session into the context;
             orders revert when the signed session does not match.
+            Choose a single session or all active sessions (pre-market,
+            regular hours, and after-hours). Overnight and weekend
+            closed sessions always revert.
             Values are Rain IntOrAString-encoded bytes32 (same format
             as Pyth pair presets in rain.strategies).
           default: 0x8372746800000000000000000000000000000000000000000000000000000000
@@ -142,6 +150,8 @@ builder:
               value: 0x897072656d61726b657400000000000000000000000000000000000000000000
             - name: After-hours (16:00-20:00 ET)
               value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
+            - name: All active sessions (pre-market, RTH, after-hours)
+              value: 0x83616c6c0000000000000000000000000000000000000000000000000000000000
         - binding: baseline-multiplier
           name: Benchmark price multiplier
           description: |
@@ -192,6 +202,9 @@ builder:
             Which market session this strategy will quote during. The
             v2 oracle signs the current session into the context;
             orders revert when the signed session does not match.
+            Choose a single session or all active sessions (pre-market,
+            regular hours, and after-hours). Overnight and weekend
+            closed sessions always revert.
             Values are Rain IntOrAString-encoded bytes32 (same format
             as Pyth pair presets in rain.strategies).
           default: 0x8372746800000000000000000000000000000000000000000000000000000000
@@ -202,6 +215,8 @@ builder:
               value: 0x897072656d61726b657400000000000000000000000000000000000000000000
             - name: After-hours (16:00-20:00 ET)
               value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
+            - name: All active sessions (pre-market, RTH, after-hours)
+              value: 0x83616c6c0000000000000000000000000000000000000000000000000000000000
         - binding: baseline-multiplier
           name: Benchmark price multiplier
           description: |
@@ -248,7 +263,7 @@ builder:
 #oracle-signer !The trusted signer address for the st0x oracle server.
 #baseline-multiplier !WAD multiplier to apply to the baseline (e.g. 1.001).
 #oracle-schema-version !Expected oracle context schema version (= 2 for v2).
-#allowed-session !Required market-session tag as Rain IntOrAString bytes32 (hex). Must match oracle context slot 3.
+#allowed-session !Market-session filter as Rain IntOrAString bytes32 (hex). Use rth/premarket/afterhours presets for a single session, or the all preset for pre+RTH+post.
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
 #max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
 
@@ -279,11 +294,25 @@ builder:
   oracle-session-start: signed-context<0 4>(),
   oracle-session-end: signed-context<0 5>(),
 
-  /* Session guard. Strategy only operates in the deployer-chosen session.
-   * The oracle signs the session as Rain IntOrAString bytes32 in slot 3;
-   * bind `allowed-session` to the same hex encoding (see builder presets). */
+  /* Session guard. When `allowed-session` is the deployer-only "all"
+   * sentinel (IntOrAString "all"), accept pre-market, RTH, or
+   * after-hours. Otherwise require an exact match to the chosen
+   * session. Overnight/weekend closed sessions always revert. */
   :ensure(
-    equal-to(oracle-session allowed-session)
+    any-of(
+      all-of(
+        equal-to(
+          allowed-session
+          0x83616c6c0000000000000000000000000000000000000000000000000000000000
+        )
+        any-of(
+          equal-to(oracle-session "rth")
+          equal-to(oracle-session "premarket")
+          equal-to(oracle-session "afterhours")
+        )
+      )
+      equal-to(oracle-session allowed-session)
+    )
     "Not in allowed market session"
   ),
 
