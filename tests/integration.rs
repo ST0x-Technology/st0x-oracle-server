@@ -7,6 +7,7 @@ use rain_math_float::Float;
 use st0x_oracle_server::alpaca::QuoteData;
 use st0x_oracle_server::cache::QuoteCache;
 use st0x_oracle_server::market_hours::{MarketHoursCache, SessionWindow};
+use st0x_oracle_server::metrics::MetricsHandle;
 use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
@@ -105,7 +106,15 @@ async fn test_app_full(
     }
 
     let configured_symbols: Vec<String> = entries.iter().map(|(_, s, _)| s.to_string()).collect();
-    let state = AppState::new(signer, registry, cache, configured_symbols, market_hours);
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        cache,
+        configured_symbols,
+        market_hours,
+        metrics,
+    );
     create_app(state)
 }
 

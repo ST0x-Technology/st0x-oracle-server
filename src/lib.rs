@@ -2,6 +2,7 @@ pub mod alpaca;
 pub mod cache;
 pub mod config;
 pub mod market_hours;
+pub mod metrics;
 pub mod oracle;
 pub mod registry;
 pub mod sign;
@@ -24,6 +25,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::cache::QuoteCache;
 use crate::market_hours::MarketHoursCache;
+use crate::metrics::MetricsHandle;
 use crate::registry::{ResolvedPair, TokenRegistry};
 use chrono::Utc;
 
@@ -75,6 +77,8 @@ pub struct AppState {
     /// in-session, last `session_close` out-of-session). The sign path
     /// itself just signs `QuoteData.t` straight through.
     market_hours: Arc<MarketHoursCache>,
+    /// Prometheus exposition format renderer for `/metrics`.
+    metrics: MetricsHandle,
 }
 
 impl AppState {
@@ -84,6 +88,7 @@ impl AppState {
         cache: Arc<QuoteCache>,
         configured_symbols: Vec<String>,
         market_hours: Arc<MarketHoursCache>,
+        metrics: MetricsHandle,
     ) -> Self {
         Self {
             signer,
@@ -91,6 +96,7 @@ impl AppState {
             cache,
             configured_symbols,
             market_hours,
+            metrics,
         }
     }
 
@@ -104,6 +110,7 @@ pub fn create_app(state: AppState) -> Router {
     Router::new()
         .route("/", get(health))
         .route("/status", get(status))
+        .route("/metrics", get(metrics))
         .route("/context/v1", post(post_signed_context_v1))
         .route("/context/v2", post(post_signed_context_v2))
         .route("/context/v3", post(post_signed_context_v3))
@@ -114,6 +121,10 @@ pub fn create_app(state: AppState) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn metrics(State(state): State<Arc<AppState>>) -> String {
+    state.metrics.render()
 }
 
 #[derive(Serialize)]
@@ -130,6 +141,11 @@ struct StatusResponse {
 /// returns 200; consumers gate on the contents of `missing_symbols`.
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let missing = state.cache.missing(&state.configured_symbols).await;
+    // Side-effect: refresh the two coverage gauges every /status hit
+    // so dashboards don't need a dedicated background tick. /status is
+    // already on the obs scrape path, so this is free.
+    ::metrics::gauge!("oracle_configured_symbols").set(state.configured_symbols.len() as f64);
+    ::metrics::gauge!("oracle_missing_symbols").set(missing.len() as f64);
     Json(StatusResponse {
         signer: format!("{:?}", state.signer.address()),
         configured_symbols: state.configured_symbols.clone(),

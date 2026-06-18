@@ -5,6 +5,7 @@ use st0x_oracle_server::config::Config;
 use st0x_oracle_server::market_hours::{
     refresh_once, spawn_market_hours_refresh, MarketHoursCache,
 };
+use st0x_oracle_server::metrics::MetricsHandle;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::{create_app, AppState};
@@ -55,6 +56,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Install the Prometheus recorder before anything else records a
+    // metric — `metrics::counter!` / `gauge!` against the global facade
+    // would otherwise no-op. Matches the bebop / pricing pattern.
+    let metrics = MetricsHandle::install()?;
 
     let config = Config::load(&cli.config)?;
     tracing::info!(
@@ -154,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(config.poll_interval_secs),
     );
 
-    let state = AppState::new(signer, registry, cache, symbols, market_hours);
+    let state = AppState::new(signer, registry, cache, symbols, market_hours, metrics);
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
