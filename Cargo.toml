@@ -12,7 +12,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 alloy = { version = "1.0", features = ["signers", "signer-local", "sol-types"] }
-rain-math-float = { path = "lib/rain.math.float/crates/float" }
+rain-math-float = "0.1.1-alpha.2"
 hex = "0.4"
 thiserror = "2"
 tracing = "0.1"
@@ -21,14 +21,23 @@ tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 toml = "0.8"
-chrono = { version = "0.4", default-features = false, features = ["std", "serde", "now"] }
+chrono = { version = "0.4", default-features = false, features = [
+  "std",
+  "serde",
+  "now",
+] }
 chrono-tz = { version = "0.10", default-features = false }
 base64 = "0.22"
+# Prometheus metrics surface. Same crates + versions as
+# st0x.bebop / st0x.pricing so the obs droplet's scrape config
+# and Grafana templates work uniformly across services.
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
+# rain-math-float's transitive `wasm-bindgen-utils v0.0.11` needs
+# `wasm-bindgen::convert::TryFromJsValue::Error`, which was removed in
+# newer wasm-bindgen. =0.2.100 is the floor that works. Matches the pin
+# in st0x.bebop / st0x.pricing.
 wasm-bindgen = "=0.2.100"
-
-[patch."https://github.com/rainlanguage/rain.wasm"]
-wasm-bindgen-utils = { path = "lib/rain.wasm" }
-wasm-bindgen-utils-macros = { path = "lib/rain.wasm/macros" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
