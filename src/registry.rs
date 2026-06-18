@@ -3,33 +3,56 @@ use alloy::primitives::Address;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-/// Maps on-chain token addresses to Alpaca ticker symbols.
+/// Maps on-chain token addresses to st0x.pricing asset symbols.
 ///
 /// The "base" token is always the tStock (e.g. wtCOIN), and the
 /// "quote" token is always USDC.
 #[derive(Debug, Clone)]
 pub struct TokenRegistry {
-    /// token address (lowercased) → Alpaca symbol
+    /// token address → pricing symbol
     tokens: HashMap<Address, String>,
     /// USDC address on Base
     pub quote_token: Address,
 }
 
+/// Which rate from a pricing-service `Quote` this request needs.
+///
+/// The pricing service publishes both rates independently (the model
+/// applies its own per-direction spread); we don't synthesize one from
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceDirection {
+    /// Input is USDC (quote), output is tStock (base) — i.e. the user
+    /// gives USDC to receive shares. Pick `rate_quote_to_base`.
+    QuoteToBase,
+    /// Input is tStock (base), output is USDC (quote) — i.e. the user
+    /// gives shares to receive USDC. Pick `rate_base_to_quote`.
+    BaseToQuote,
+}
+
+impl PriceDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QuoteToBase => "quote_to_base",
+            Self::BaseToQuote => "base_to_quote",
+        }
+    }
+}
+
 /// A resolved token pair from the registry.
 #[derive(Debug, Clone)]
 pub struct ResolvedPair {
-    /// Alpaca ticker symbol (e.g. "COIN")
+    /// Pricing-service asset symbol (e.g. "COIN").
     pub symbol: String,
-    /// Whether the price should be inverted for this order direction.
-    /// - false: input is quote (USDC), output is base (tStock) → price as-is (USDC per share)
-    /// - true: input is base (tStock), output is quote (USDC) → inverted (shares per USDC)
-    pub inverted: bool,
+    /// Which of the two rates in the live `Quote` to sign for this
+    /// request. Determined by which side of the swap is USDC.
+    pub direction: PriceDirection,
 }
 
 impl TokenRegistry {
     /// Build a registry from env-style config.
     ///
-    /// `entries` is a list of (token_address, alpaca_symbol) pairs.
+    /// `entries` is a list of (token_address, pricing_symbol) pairs.
     /// `quote_token` is the USDC address.
     pub fn new(entries: Vec<(String, String)>, quote_token: &str) -> anyhow::Result<Self> {
         let quote = Address::from_str(quote_token)
@@ -57,31 +80,31 @@ impl TokenRegistry {
         Self::new(pairs, quote_token)
     }
 
-    /// Resolve an input/output token pair to an Alpaca symbol and direction.
+    /// Resolve an input/output token pair to a pricing symbol + direction.
     pub fn resolve(
         &self,
         input_token: Address,
         output_token: Address,
     ) -> anyhow::Result<ResolvedPair> {
-        // Case 1: input=USDC, output=tStock → price as-is (how many USDC per share)
+        // Case 1: input=USDC, output=tStock → user gives quote, receives base.
         if input_token == self.quote_token {
             let symbol = self.tokens.get(&output_token).ok_or_else(|| {
                 anyhow::anyhow!("Unknown tStock token: {} (not in registry)", output_token)
             })?;
             return Ok(ResolvedPair {
                 symbol: symbol.clone(),
-                inverted: false,
+                direction: PriceDirection::QuoteToBase,
             });
         }
 
-        // Case 2: input=tStock, output=USDC → inverted (how many shares per USDC)
+        // Case 2: input=tStock, output=USDC → user gives base, receives quote.
         if output_token == self.quote_token {
             let symbol = self.tokens.get(&input_token).ok_or_else(|| {
                 anyhow::anyhow!("Unknown tStock token: {} (not in registry)", input_token)
             })?;
             return Ok(ResolvedPair {
                 symbol: symbol.clone(),
-                inverted: true,
+                direction: PriceDirection::BaseToQuote,
             });
         }
 
@@ -122,7 +145,7 @@ mod tests {
         let coin = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
         let pair = reg.resolve(usdc, coin).unwrap();
         assert_eq!(pair.symbol, "COIN");
-        assert!(!pair.inverted);
+        assert_eq!(pair.direction, PriceDirection::QuoteToBase);
     }
 
     #[test]
@@ -132,7 +155,7 @@ mod tests {
         let rklb = Address::from_str("0x2222222222222222222222222222222222222222").unwrap();
         let pair = reg.resolve(rklb, usdc).unwrap();
         assert_eq!(pair.symbol, "RKLB");
-        assert!(pair.inverted);
+        assert_eq!(pair.direction, PriceDirection::BaseToQuote);
     }
 
     #[test]

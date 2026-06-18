@@ -28,6 +28,16 @@ chrono = { version = "0.4", default-features = false, features = [
 ] }
 chrono-tz = { version = "0.10", default-features = false }
 base64 = "0.22"
+# Live pricing client. Subscribes to st0x.pricing over WebSocket and
+# stashes the latest `Quote` per asset. Wire types come from the
+# st0x-pricing-types crate; the consumer-side glue is ~150 lines of
+# auto-reconnecting WS plumbing in src/pricing_client.rs. Same
+# crates + versions as st0x.bebop / st0x.pricing.
+st0x-pricing-types = { git = "https://github.com/ST0x-Technology/st0x.pricing-types", tag = "v0.4.0" }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+ciborium = "0.2"
+futures-util = "0.3"
+http = "1"
 # Prometheus metrics surface. Same crates + versions as
 # st0x.bebop / st0x.pricing so the obs droplet's scrape config
 # and Grafana templates work uniformly across services.
