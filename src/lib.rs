@@ -1,9 +1,9 @@
 pub mod alpaca;
-pub mod cache;
 pub mod config;
 pub mod market_hours;
 pub mod metrics;
 pub mod oracle;
+pub mod pricing_client;
 pub mod registry;
 pub mod sign;
 
@@ -23,11 +23,12 @@ use sign::Signer;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::cache::QuoteCache;
 use crate::market_hours::MarketHoursCache;
 use crate::metrics::MetricsHandle;
-use crate::registry::{ResolvedPair, TokenRegistry};
+use crate::pricing_client::LiveClient;
+use crate::registry::{PriceDirection, ResolvedPair, TokenRegistry};
 use chrono::Utc;
+use st0x_pricing_types::Quote;
 
 sol! {
     struct IOV2 {
@@ -67,9 +68,12 @@ type OracleRequestTuple = (
 pub struct AppState {
     signer: Signer,
     registry: TokenRegistry,
-    cache: Arc<QuoteCache>,
+    /// Live WS subscription to st0x.pricing. Background-tasked, holds
+    /// the latest `Quote` per symbol in an RwLock<HashMap>. Replaces
+    /// the Alpaca polling cache (pre-RAI-360).
+    pricing: LiveClient,
     /// Every symbol declared in config.toml. /status compares this
-    /// against the cache to surface the partial-serving set.
+    /// against the pricing cache to surface the partial-serving set.
     configured_symbols: Vec<String>,
     /// Authoritative market-hours source from Alpaca's calendar.
     /// Determines whether `publish_time` is `now` (inside an active
@@ -83,7 +87,7 @@ impl AppState {
     pub fn new(
         signer: Signer,
         registry: TokenRegistry,
-        cache: Arc<QuoteCache>,
+        pricing: LiveClient,
         configured_symbols: Vec<String>,
         market_hours: Arc<MarketHoursCache>,
         metrics: MetricsHandle,
@@ -91,7 +95,7 @@ impl AppState {
         Self {
             signer,
             registry,
-            cache,
+            pricing,
             configured_symbols,
             market_hours,
             metrics,
@@ -137,7 +141,7 @@ struct StatusResponse {
 /// missing broker position is visible without parsing logs. Always
 /// returns 200; consumers gate on the contents of `missing_symbols`.
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
-    let missing = state.cache.missing(&state.configured_symbols).await;
+    let missing = state.pricing.missing(&state.configured_symbols).await;
     // Side-effect: refresh the two coverage gauges every /status hit
     // so dashboards don't need a dedicated background tick. /status is
     // already on the obs scrape path, so this is free.
@@ -196,13 +200,13 @@ async fn post_signed_context_v1(
     }
 
     let needed_symbols: Vec<&str> = resolved.iter().map(|(_, p)| p.symbol.as_str()).collect();
-    let snapshot = state.cache.snapshot_many(&needed_symbols).await;
+    let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
 
     let mut responses = Vec::with_capacity(resolved.len());
     for (_, pair) in &resolved {
         let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
             AppError::Unavailable(format!(
-                "No cached quote for {} yet. The poll loop has not succeeded since startup.",
+                "No live quote for {} yet. The pricing WS has not delivered a frame since startup.",
                 pair.symbol
             ))
         })?;
@@ -237,29 +241,26 @@ impl SessionSchema {
 
     fn build_context(
         self,
-        price: f64,
+        price_bytes: [u8; 32],
         publish_time: u64,
         session_bytes: [u8; 32],
         session_start: u64,
         session_end: u64,
-        inverted: bool,
     ) -> Result<Vec<alloy::primitives::FixedBytes<32>>, anyhow::Error> {
         match self {
             Self::V2 => oracle::build_context_v2(
-                price,
+                price_bytes,
                 publish_time,
                 session_bytes,
                 session_start,
                 session_end,
-                inverted,
             ),
             Self::V3 => oracle::build_context_v3(
-                price,
+                price_bytes,
                 publish_time,
                 session_bytes,
                 session_start,
                 session_end,
-                inverted,
             ),
         }
     }
@@ -314,7 +315,7 @@ async fn post_signed_context_session(
     }
 
     let needed_symbols: Vec<&str> = resolved.iter().map(|(_, p)| p.symbol.as_str()).collect();
-    let snapshot = state.cache.snapshot_many(&needed_symbols).await;
+    let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
 
     // Snapshot the session classification once for the whole batch so
     // every signed context in this response agrees on which session
@@ -327,7 +328,7 @@ async fn post_signed_context_session(
     for (_, pair) in &resolved {
         let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
             AppError::Unavailable(format!(
-                "No cached quote for {} yet. The poll loop has not succeeded since startup.",
+                "No live quote for {} yet. The pricing WS has not delivered a frame since startup.",
                 pair.symbol
             ))
         })?;
@@ -388,7 +389,7 @@ fn resolve_pair_for_order(
 
     tracing::info!(
         symbol = %pair.symbol,
-        inverted = pair.inverted,
+        direction = pair.direction.as_str(),
         input = %input_token,
         output = %output_token,
         "Oracle request"
@@ -397,35 +398,37 @@ fn resolve_pair_for_order(
     Ok(pair)
 }
 
+/// Pick the rate slot from a live pricing-service `Quote` that matches
+/// this request's swap direction. The pricing service emits both rates
+/// independently (each already incorporating the model's per-direction
+/// spread); the oracle never derives one from the other.
+fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> [u8; 32] {
+    match direction {
+        PriceDirection::QuoteToBase => quote.rate_quote_to_base.0,
+        PriceDirection::BaseToQuote => quote.rate_base_to_quote.0,
+    }
+}
+
 /// Build a signed response from a pre-resolved pair and a snapshotted
-/// mark. All marks for a single batch must come from one snapshot so
-/// concurrent poller updates can't mix prices/publish_times across
-/// elements of the same response.
+/// `Quote`. All `Quote`s for one batch must come from a single
+/// `LiveClient::snapshot_many` so a concurrent WS push can't mix prices
+/// across elements of the same response.
 ///
-/// The broker mark is a single fair-value number per symbol, so buy and
-/// sell directions both use it; `build_context` inverts via Rain Float
-/// when `pair.inverted` is true.
+/// The pricing service publishes both swap directions independently,
+/// already including its spread; the oracle just picks the rate that
+/// matches the request's direction and signs the 32-byte Rain Float
+/// straight through — no inversion, no f64 round-trip, no extra spread.
 ///
 /// `publish_time` is chosen by `MarketHoursCache`: inside an active
 /// extended session window we sign `now`; outside we sign the most
-/// recent `session_close`. This is RAI-693: the broker mark has no
-/// per-symbol timestamp, so a naive `fetch_time` stamps an old close
-/// price with a fresh timestamp during weekends/holidays, which the
-/// strategy then accepts even though the mark is hours stale.
+/// recent `session_close`. This is RAI-693: pricing-service quotes are
+/// pushed continuously even when the underlying market is closed, so a
+/// naive `now` would label an off-hours quote with a fresh timestamp.
 async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
-    quote: &crate::alpaca::QuoteData,
+    quote: &Quote,
 ) -> Result<oracle::OracleResponse, AppError> {
-    // The fetch path already drops non-positive marks, so this is a
-    // belt-and-braces guard for any future code path that bypasses it.
-    if quote.price <= 0.0 {
-        return Err(AppError::BadRequest(format!(
-            "Zero or negative broker mark for {} (price={}). Market may be closed or data is bad.",
-            pair.symbol, quote.price
-        )));
-    }
-
     let now = Utc::now();
     let publish_dt = state.market_hours.publish_time_for(now).await;
     let publish_time: u64 = publish_dt
@@ -433,16 +436,18 @@ async fn build_response_from_quote(
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
 
+    let price_bytes = pick_rate_bytes(quote, pair.direction);
+
     tracing::info!(
         symbol = %pair.symbol,
-        price = quote.price,
-        inverted = pair.inverted,
+        direction = pair.direction.as_str(),
         publish_time = publish_time,
         in_session = (publish_dt == now),
-        "Building signed context from cache"
+        source_ts_unix_ms = quote.source_ts_unix_ms,
+        "Building signed context from live pricing quote"
     );
 
-    let context = oracle::build_context(quote.price, publish_time, pair.inverted)?;
+    let context = oracle::build_context(price_bytes, publish_time)?;
     let (signature, signer) = state.signer.sign_context(&context).await?;
 
     Ok(oracle::OracleResponse {
@@ -460,18 +465,11 @@ async fn build_response_from_quote(
 async fn build_response_from_quote_session(
     state: &AppState,
     pair: &ResolvedPair,
-    quote: &crate::alpaca::QuoteData,
+    quote: &Quote,
     publish_dt: chrono::DateTime<Utc>,
     session_info: &crate::market_hours::SessionInfo,
     schema: SessionSchema,
 ) -> Result<oracle::OracleResponse, AppError> {
-    if quote.price <= 0.0 {
-        return Err(AppError::BadRequest(format!(
-            "Zero or negative broker mark for {} (price={}). Market may be closed or data is bad.",
-            pair.symbol, quote.price
-        )));
-    }
-
     let publish_time: u64 = publish_dt
         .timestamp()
         .try_into()
@@ -487,25 +485,26 @@ async fn build_response_from_quote_session(
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
 
+    let price_bytes = pick_rate_bytes(quote, pair.direction);
+
     tracing::info!(
         symbol = %pair.symbol,
-        price = quote.price,
-        inverted = pair.inverted,
+        direction = pair.direction.as_str(),
         schema = schema.tag(),
         publish_time = publish_time,
         session = session_info.session.as_str(),
         session_start = session_start,
         session_end = session_end,
-        "Building session signed context from cache"
+        source_ts_unix_ms = quote.source_ts_unix_ms,
+        "Building session signed context from live pricing quote"
     );
 
     let context = schema.build_context(
-        quote.price,
+        price_bytes,
         publish_time,
         schema.encode_session(session_info.session),
         session_start,
         session_end,
-        pair.inverted,
     )?;
     let (signature, signer) = state.signer.sign_context(&context).await?;
 

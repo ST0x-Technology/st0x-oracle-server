@@ -29,10 +29,13 @@ In addition the oracle needs:
 - **Signer ETH private key.** The address that Raindex strategies declare as the
   oracle signer. Same key value as the current Fly deployment — copy from
   `fly secrets list` / your password vault.
-- **Alpaca Broker API credentials.** Key id + secret + brokerage account id
-  whose positions back the oracle. Same values as the Fly deployment for now. PR
-  2 swaps Alpaca polling for an st0x-pricing WebSocket — after that lands, only
-  the calendar endpoint needs Alpaca creds and the broker account id goes away.
+- **st0x.pricing API key.** Whatever value sits in `PRICING_API_KEYS` on the
+  pricing droplet for the `oracle` consumer (format `pricing_oracle_<32-hex>`).
+  The Tailscale ACL must also grant `tag:st0x-oracle-server` reach into
+  `tag:st0x-pricing:8080` — see the `st0x.pricing/DEPLOY.md` ACL section.
+- **Alpaca Broker API credentials.** Key id + secret only; the brokerage account
+  id is no longer needed. Used solely for the trading-calendar endpoint that
+  powers `MarketHoursCache` (RAI-693).
 
 ---
 
@@ -93,9 +96,9 @@ rm /tmp/tailscale-authkey
 ```bash
 cat > /tmp/st0x-oracle-server-env <<'EOF'
 SIGNER_PRIVATE_KEY=0x...
+PRICING_API_KEY=pricing_oracle_...
 ALPACA_API_KEY_ID=...
 ALPACA_API_SECRET_KEY=...
-ALPACA_BROKER_ACCOUNT_ID=...
 RUST_LOG=st0x_oracle_server=info,warn
 EOF
 
@@ -200,6 +203,12 @@ ssh root@st0x-oracle-server journalctl -u st0x-oracle-server -f
 3. Update `SIGNER_PRIVATE_KEY` in `secrets/st0x-oracle-server-env.age`.
 4. `deploy-service st0x-oracle-server`.
 
+### Rotate the pricing API key
+
+Replace `PRICING_API_KEY` in `secrets/st0x-oracle-server-env.age` and redeploy.
+The matching value on `st0x-pricing` lives in its `PRICING_API_KEYS` env file
+under the `oracle=` entry — rotate both together.
+
 ### Rotate Alpaca creds
 
 Replace `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` in
@@ -229,8 +238,8 @@ DigitalOcean droplet (NixOS) — Tailscale node `st0x-oracle-server`
   │    ├─ EnvironmentFile = /run/agenix/st0x-oracle-server-env
   │    ├─ ExecStart = .../st0x-oracle-server --config config/st0x-oracle-server.toml
   │    └─ Restart = always
-  ├─ Outbound: Alpaca broker API (positions + calendar) — PR 2 replaces
-  │            the positions polling with an st0x-pricing WS connection
+  ├─ Outbound: st0x-pricing WS (Tailscale, MagicDNS) + Alpaca calendar
+  │            endpoint (public broker-api.alpaca.markets, calendar only)
   ├─ Inbound: HTTP /context/v[12] + /status + /metrics on tailnet only
   │           (parity window); public ingress is a later cutover PR
   ├─ /mnt/data/st0x-oracle-server/logs/*.log (logrotate weekly, 14 retained)
