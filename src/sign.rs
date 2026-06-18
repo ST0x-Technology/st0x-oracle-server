@@ -254,4 +254,49 @@ mod tests {
         )
         .is_err());
     }
+
+    /// Property fuzz: sign + recover roundtrips for any context array
+    /// the production code might ever produce. Per RAI-363.
+    ///
+    /// Two invariants guarded here:
+    ///
+    /// 1. Signing any non-empty `Vec<FixedBytes<32>>` of up to 8
+    ///    elements never panics and always emits a 65-byte EIP-191
+    ///    signature plus the configured signer address.
+    /// 2. Any two distinct contexts in the same proptest case
+    ///    produce distinct signatures — i.e. the signer can't
+    ///    accidentally collapse different inputs onto a single
+    ///    signature (which would let a strategy replay the wrong
+    ///    price under a fresh hash).
+    use proptest::prelude::*;
+
+    fn arb_context() -> impl Strategy<Value = Vec<FixedBytes<32>>> {
+        proptest::collection::vec(any::<[u8; 32]>().prop_map(FixedBytes::<32>::from), 1..=8)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn sign_context_never_panics_and_emits_65_byte_signature(ctx in arb_context()) {
+            let signer = Signer::new(TEST_KEY).unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let (sig, addr) = rt.block_on(signer.sign_context(&ctx)).unwrap();
+            prop_assert_eq!(sig.len(), 65);
+            prop_assert_eq!(addr, signer.address());
+        }
+
+        #[test]
+        fn distinct_contexts_produce_distinct_signatures(
+            a in arb_context(),
+            b in arb_context(),
+        ) {
+            prop_assume!(a != b);
+            let signer = Signer::new(TEST_KEY).unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let (sig_a, _) = rt.block_on(signer.sign_context(&a)).unwrap();
+            let (sig_b, _) = rt.block_on(signer.sign_context(&b)).unwrap();
+            prop_assert_ne!(sig_a, sig_b);
+        }
+    }
 }

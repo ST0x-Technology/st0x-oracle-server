@@ -165,6 +165,14 @@ fn encode_cbor<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, ClientError> {
     Ok(buf)
 }
 
+/// Pure decoder for an inbound `ServerFrame`. Exposed for fuzzing
+/// (RAI-363): the on-wire loop uses this and discards `Err` results,
+/// so any input that panics here is a real bug. Property tests at
+/// the bottom of this file exercise it against arbitrary byte strings.
+pub fn decode_server_frame(bytes: &[u8]) -> Result<ServerFrame, ClientError> {
+    ciborium::from_reader(bytes).map_err(|e| ClientError::Cbor(e.to_string()))
+}
+
 async fn connect_and_run(
     cfg: &LiveClientConfig,
     cache: &Arc<RwLock<HashMap<Symbol, Quote>>>,
@@ -195,7 +203,7 @@ async fn connect_and_run(
     while let Some(msg) = socket.next().await {
         match msg {
             Ok(WsMessage::Binary(b)) => {
-                let frame: ServerFrame = match ciborium::from_reader(&b[..]) {
+                let frame = match decode_server_frame(&b[..]) {
                     Ok(f) => f,
                     Err(e) => {
                         tracing::warn!(error = %e, "Bad pricing WS frame; ignoring");
@@ -242,4 +250,24 @@ async fn connect_and_run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The WS receive loop runs `decode_server_frame` on every
+        /// inbound binary frame and silently drops the result on
+        /// `Err`. Any panic here would crash the subscriber task and
+        /// stall the pricing cache until the next reconnect — bad
+        /// enough that we exercise it against arbitrary bytes.
+        #[test]
+        fn wire_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let _ = decode_server_frame(&bytes);
+        }
+    }
 }
