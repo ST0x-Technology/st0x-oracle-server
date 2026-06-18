@@ -52,3 +52,12 @@ wasm-bindgen = "=0.2.100"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+# Second binary: side-by-side observer that probes the legacy Fly
+# oracle and the new DO oracle in lockstep and emits per-symbol drift
+# metrics. Used during the parity window before public-ingress cutover
+# (RAI-361). Source lives at src/bin/diff_observer.rs; comparison
+# logic at src/diff_observer/.
+[[bin]]
+name = "st0x-oracle-diff-observer"
+path = "src/bin/diff_observer.rs"

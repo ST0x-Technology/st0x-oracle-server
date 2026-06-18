@@ -1,5 +1,6 @@
 pub mod alpaca;
 pub mod config;
+pub mod diff_observer;
 pub mod market_hours;
 pub mod metrics;
 pub mod oracle;

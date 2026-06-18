@@ -1,0 +1,104 @@
+# Parity-window diff observer (RAI-361). Runs as its own systemd unit
+# alongside st0x-oracle-server on the DO droplet during the cutover
+# window. Probes both the legacy Fly URL and the new DO URL with the
+# same request and emits per-symbol drift metrics. Secrets are an
+# empty set — the observer talks to two open `/context/v1` endpoints,
+# no API keys required.
+
+# `/metrics` port. Distinct from st0x-oracle-server (3000) so both
+# units can run on the same droplet without conflict.
+port = 3001
+
+# Seconds between probe rounds. Each round hits both oracles once per
+# (symbol, direction) pair, so total request volume is
+# `2 * len(symbols) * (60 / probe_interval_secs)` per minute per side.
+probe_interval_secs = 30
+
+# Cutover endpoints. The Fly URL is the production oracle Raindex
+# consumers currently call; the DO URL is the new tailnet-only
+# deployment we're standing up. Both must speak the same
+# `/context/v1` ABI shape.
+fly_oracle_base_url = "https://st0x-oracle.fly.dev"
+do_oracle_base_url = "http://localhost:3000"
+
+# USDC on Base. Implicit quote token for every probe pair.
+quote_token = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+# Token registry — same shape as the oracle's own config, but each
+# entry names the base tStock token + the matching pricing symbol.
+# Synced with config/st0x-oracle-server.toml.
+[[symbols]]
+symbol = "NVDA"
+base_token = "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"
+
+[[symbols]]
+symbol = "AMZN"
+base_token = "0x997baE3EC193a249596d3708C3fAB7C501Bb8a53"
+
+[[symbols]]
+symbol = "TSLA"
+base_token = "0x219A8d384a10BF19b9f24cB5cC53F79Dd0e5A03D"
+
+[[symbols]]
+symbol = "MSTR"
+base_token = "0xFF05E1bD696900dc6A52CA35Ca61Bb1024eDa8e2"
+
+[[symbols]]
+symbol = "IAU"
+base_token = "0x1E46d7eFef64A833AFB1CD49299a7AD5B439f4d8"
+
+[[symbols]]
+symbol = "COIN"
+base_token = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"
+
+[[symbols]]
+symbol = "SPYM"
+base_token = "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"
+
+[[symbols]]
+symbol = "SIVR"
+base_token = "0xEB7F3E4093C9d68253b6104FbbfF561F3eC0442F"
+
+[[symbols]]
+symbol = "CRCL"
+base_token = "0x8AFba81DEc38DE0A18E2Df5E1967a7493651eebf"
+
+[[symbols]]
+symbol = "BMNR"
+base_token = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
+
+[[symbols]]
+symbol = "PPLT"
+base_token = "0x82f5BAEE1076334357a34A19E04f7c282D51cE47"
+
+[[symbols]]
+symbol = "QQQM"
+base_token = "0x823FF7Bbde2869aAe73A6CD53e7f614442836757"
+
+[[symbols]]
+symbol = "VWO"
+base_token = "0x23ec6886b49D7ab123E9ee8e474D2fa7AB6Cbc2d"
+
+[[symbols]]
+symbol = "ARKK"
+base_token = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"
+
+[[symbols]]
+symbol = "SGOV"
+base_token = "0x78c31580c97101694C70022c83D570150c11e935"
+
+[[symbols]]
+symbol = "SPCX"
+base_token = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
+
+[[symbols]]
+symbol = "CEG"
+base_token = "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"
+
+[[symbols]]
+symbol = "DRAM"
+base_token = "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"
+
+[[symbols]]
+symbol = "TSM"
+base_token = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"

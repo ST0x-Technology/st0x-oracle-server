@@ -254,6 +254,16 @@ in
       owner = "root";
       group = "st0x";
     };
+    # Diff observer (RAI-361). No upstream creds — both oracle URLs it
+    # probes are open — but the systemd unit's EnvironmentFile= still
+    # wants a file. Single-line `RUST_LOG=…` blob; gets removed when
+    # the observer service is disabled (services.nix).
+    "st0x-oracle-diff-observer-env" = {
+      file = ./secrets/st0x-oracle-diff-observer-env.age;
+      mode = "0440";
+      owner = "root";
+      group = "st0x";
+    };
   };
 
   users.groups.st0x = { };

@@ -69,10 +69,11 @@ volume, reserved IP.
 
 ## Step 4 — Create runtime secrets (initial encryption)
 
-`os.nix` references both `.age` files via `age.secrets`, so they must exist
-before `bootstrap-nixos` can build the NixOS closure. Encrypt now to the team's
-operator keys (`roles.ssh`); after bootstrap pins the host key we re-encrypt to
-`roles.host-secrets` (Step 6).
+`os.nix` references three `.age` files via `age.secrets` — tailscale auth key,
+the oracle service env, and the diff-observer service env — so all three must
+exist before `bootstrap-nixos` can build the NixOS closure. Encrypt now to the
+team's operator keys (`roles.ssh`); after bootstrap pins the host key we
+re-encrypt to `roles.host-secrets` (Step 6).
 
 ### `secrets/tailscale-authkey.age`
 
@@ -112,6 +113,22 @@ git add secrets/*.age
 git commit -m "chore(deploy): initial runtime secrets"
 ```
 
+### `secrets/st0x-oracle-diff-observer-env.age`
+
+The observer talks to two open `/context/v1` endpoints (Fly + DO) — no upstream
+creds — but its systemd unit still wants an `EnvironmentFile=`, so we ship a
+one-line blob with just the log level:
+
+```bash
+echo 'RUST_LOG=st0x_oracle_diff_observer=info,warn' > /tmp/st0x-oracle-diff-observer-env
+
+nix eval --raw --file ./keys.nix roles.ssh \
+  --apply 'builtins.concatStringsSep "\n"' \
+  | rage -e -R /dev/stdin -o secrets/st0x-oracle-diff-observer-env.age /tmp/st0x-oracle-diff-observer-env
+
+rm /tmp/st0x-oracle-diff-observer-env
+```
+
 ⚠️ Host can't decrypt these yet — its key is still `PLACEHOLDER`. That's fine
 for the build (only file presence matters); we re-encrypt in Step 6.
 
@@ -139,7 +156,7 @@ git push
 re-encrypt both runtime secrets so the droplet can decrypt them at boot.
 
 ```bash
-for s in tailscale-authkey st0x-oracle-server-env; do
+for s in tailscale-authkey st0x-oracle-server-env st0x-oracle-diff-observer-env; do
   rage -d -i ~/.ssh/id_ed25519 secrets/$s.age > /tmp/$s
   nix eval --raw --file ./keys.nix roles.host-secrets \
     --apply 'builtins.concatStringsSep "\n"' \
@@ -164,6 +181,7 @@ but a misconfigured oracle signs wrong prices, so still split the first deploy:
 caffeinate -i nix develop -c deploy-nixos       # system config only
 # verify tailnet join + /metrics scrape, then:
 caffeinate -i nix develop -c deploy-service st0x-oracle-server
+caffeinate -i nix develop -c deploy-service st0x-oracle-diff-observer
 ```
 
 ## Step 8 — Verify
@@ -172,12 +190,20 @@ caffeinate -i nix develop -c deploy-service st0x-oracle-server
 # From any tailscale node:
 curl -s http://st0x-oracle-server:3000/status | jq
 curl -s http://st0x-oracle-server:3000/metrics | head -40
+curl -s http://st0x-oracle-server:3001/metrics | head -40
 ssh root@st0x-oracle-server journalctl -u st0x-oracle-server -f
+ssh root@st0x-oracle-server journalctl -u st0x-oracle-diff-observer -f
 ```
 
-The obs droplet's Prometheus scrape config (st0x.observability, PR 4) reads
-`/metrics` on the tailnet hostname; Loki picks up journald via Alloy with no
-extra config.
+The obs droplet's Prometheus scrape config (st0x.observability, PR 4) reads both
+`/metrics` endpoints (3000 for the oracle, 3001 for the observer) on the tailnet
+hostname; Loki picks up journald via Alloy with no extra config.
+
+Once the diff observer has surfaced a green parity window (no
+`oracle_diff_basis_points` drift outside the alert envelope for the chosen
+period), Raindex consumers can be flipped to the new public URL and the
+observer + the Fly deployment can be retired. To stop rolling out the observer,
+flip `services.nix → st0x-oracle-diff-observer.enabled = false` and redeploy.
 
 ---
 
