@@ -144,9 +144,9 @@ builder:
           0x83616c6c00000000000000000000000000000000000000000000000000000000
         )
         any(
-          equal-to(oracle-session "rth")
-          equal-to(oracle-session "premarket")
-          equal-to(oracle-session "afterhours")
+          equal-to(oracle-session 0x8372746800000000000000000000000000000000000000000000000000000000)
+          equal-to(oracle-session 0x897072656d61726b657400000000000000000000000000000000000000000000)
+          equal-to(oracle-session 0x8a6166746572686f757273000000000000000000000000000000000000000000)
         )
       )
       equal-to(oracle-session allowed-session)
