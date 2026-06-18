@@ -1,11 +1,8 @@
-version: 6
+version: 5
 networks:
   base:
     rpcs:
-      - https://mainnet.base.org
-      - https://base.drpc.org
       - https://base-rpc.publicnode.com
-      - https://developer-access-mainnet.base.org
     chain-id: 8453
     network-id: 8453
     currency: ETH
@@ -13,7 +10,7 @@ subgraphs:
   base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/2026-02-05-c4ef/gn
 metaboards:
   base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/metadata-base/2025-07-06-594f/gn
-raindexes:
+orderbooks:
   base:
     address: 0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D
     network: base
@@ -24,17 +21,7 @@ rainlangs:
   base:
     address: 0x22508460712C350e914b49155982d3A92D923b10
     network: base
+local-db-remotes:
+  raindex: https://raindex-bootstrap-db.lon1.digitaloceanspaces.com/manifest.yaml
 using-tokens-from:
   - https://raw.githubusercontent.com/ST0x-Technology/st0x.registry/d4fcef4984ec669baff06851a9af865f3a2f9fc9/token-lists/base.json
-local-db-remotes:
-  raindex: https://raindex-bootstrap-db.lon1.digitaloceanspaces.com/local-db-manifests/1779881382550/manifest.yaml
-local-db-sync:
-  base:
-    batch-size: 50
-    max-concurrent-batches: 1
-    retry-attempts: 3
-    retry-delay-ms: 1000
-    rate-limit-delay-ms: 5000
-    finality-depth: 4
-    bootstrap-block-threshold: 300
-    sync-interval-ms: 5000

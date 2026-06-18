@@ -1,8 +1,8 @@
-version: 6
+version: 5
 
 orders:
   base:
-    raindex: base
+    orderbook: base
     oracle-url: https://st0x-oracle-server.fly.dev/context/v1
     inputs:
       - token: input
@@ -11,7 +11,7 @@ orders:
 
 scenarios:
   st0x-oracle-baseline-base:
-    raindex: base
+    orderbook: base
     rainlang: base
     runs: 1
     bindings:
@@ -26,7 +26,7 @@ deployments:
     scenario: st0x-oracle-baseline-base
 
 
-builder:
+gui:
   name: St0x fixed spread limit
   description: https://raw.githubusercontent.com/rainlanguage/rain.strategies/e25bc4876b5ffb8bb28097b0ca66de291c75ff56/src/fixed-spread.md
   short-description:  >

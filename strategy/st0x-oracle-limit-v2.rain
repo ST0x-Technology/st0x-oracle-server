@@ -1,8 +1,8 @@
-version: 6
+version: 5
 
 orders:
   base:
-    raindex: base
+    orderbook: base
     oracle-url: https://st0x-oracle-server.fly.dev/context/v2
     inputs:
       - token: token1
@@ -11,7 +11,7 @@ orders:
 
 scenarios:
   base:
-    raindex: base
+    orderbook: base
     rainlang: base
     runs: 1
     bindings:
@@ -24,7 +24,15 @@ deployments:
     order: base
     scenario: base
 
-builder:
+tokens:
+  usdc:
+    network: base
+    address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+    decimals: 6
+    label: USDC
+    symbol: USDC
+
+gui:
   name: st0x Oracle Limit v2
   description: >
     A limit order for st0x tokenized equities that uses the st0x oracle
