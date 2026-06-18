@@ -1,18 +1,21 @@
 # st0x-oracle-server runtime config. Secrets (SIGNER_PRIVATE_KEY,
-# ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY) are supplied via environment
-# variables — only non-secret operational settings live here.
+# PRICING_API_KEY, ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY) are
+# supplied via environment variables — only non-secret operational
+# settings live here.
 
 port = 3000
 
-# How often the background poller fetches fresh quotes from Alpaca for
-# every configured symbol. Requests to /context/v1 always serve from this
-# cache — they never hit Alpaca synchronously.
-poll_interval_secs = 10
+# Live pricing source. Resolves via Tailscale MagicDNS to the
+# st0x-pricing droplet. The consumer name must match the
+# `pricing_<consumer>_<32-hex>` API key supplied via PRICING_API_KEY.
+[pricing]
+ws_url = "ws://st0x-pricing:8080/ws"
+consumer = "oracle"
 
 # Token registry: maps on-chain Base token addresses (st0x wrapped
-# equities) to Alpaca tickers. USDC is the implicit quote token and is
-# hardcoded in main.rs because it's a chain invariant.
-# Synced with ST0x Base Token List v1.2.0 (2026-05-26).
+# equities) to pricing-service asset symbols. USDC is the implicit
+# quote token and is hardcoded in main.rs because it's a chain
+# invariant. Synced with ST0x Base Token List v1.2.0 (2026-05-26).
 
 [[tokens]]
 address = "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"
