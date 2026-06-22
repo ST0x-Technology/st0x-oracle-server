@@ -51,16 +51,14 @@ builder:
             Which market session this strategy will quote during. The
             v2 oracle signs the current session into the context;
             orders revert when the signed session does not match.
-            Values are Rain IntOrAString-encoded bytes32 (same format
-            as Pyth pair presets in rain.strategies).
-          default: 0x8372746800000000000000000000000000000000000000000000000000000000
+          default: '"rth"'
           presets:
             - name: Regular trading hours (09:30-16:00 ET)
-              value: 0x8372746800000000000000000000000000000000000000000000000000000000
+              value: '"rth"'
             - name: Pre-market (04:00-09:30 ET)
-              value: 0x897072656d61726b657400000000000000000000000000000000000000000000
+              value: '"premarket"'
             - name: After-hours (16:00-20:00 ET)
-              value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
+              value: '"afterhours"'
         - binding: min-price
           name: Minimum Price
           description: >
@@ -92,7 +90,7 @@ builder:
 
 #oracle-signer !The trusted signer address for the st0x oracle server.
 #oracle-schema-version !Expected oracle context schema version (= 2 for v2).
-#allowed-session !Required market-session tag as Rain IntOrAString bytes32 (hex). Must match oracle context slot 3.
+#allowed-session !Required market-session tag (Rain string literal). One of "rth", "premarket", "afterhours". Must match oracle context slot 3.
 
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
 #max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
@@ -117,8 +115,9 @@ oracle-version: signed-context<0 0>(),
 /* Read oracle price from signed context column 0, row 1. */
 oracle-price: signed-context<0 1>(),
 
-/* Read the market session this quote was signed during (bytes32 ASCII,
- * right-padded). Used by the session guard below. */
+/* Read the market session this quote was signed during (Rain
+ * IntOrAString V3 bytes32; matches what `"…"` literals parse to).
+ * Used by the session guard below. */
 oracle-session: signed-context<0 3>(),
 
 /* Read the UTC start and end of that current session. */
@@ -126,8 +125,10 @@ oracle-session-start: signed-context<0 4>(),
 oracle-session-end: signed-context<0 5>(),
 
 /* Session guard. Strategy only operates in the deployer-chosen session.
- * The oracle signs the session as Rain IntOrAString bytes32 in slot 3;
- * bind `allowed-session` to the same hex encoding (see builder presets). */
+ * The oracle signs the session as Rain IntOrAString V3 bytes32 in
+ * slot 3, matching the on-the-wire bytes32 a Rainlang `"…"` string
+ * literal parses to — so the user-bound `allowed-session` is just
+ * `"rth"` / `"premarket"` / `"afterhours"`. */
 :ensure(
   equal-to(oracle-session allowed-session)
   "Not in allowed market session"

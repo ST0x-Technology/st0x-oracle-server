@@ -46,18 +46,16 @@ builder:
             Choose a single session or all active sessions (pre-market,
             regular hours, and after-hours). Overnight and weekend
             closed sessions always revert.
-            Values are Rain IntOrAString-encoded bytes32 (same format
-            as Pyth pair presets in rain.strategies).
-          default: 0x8372746800000000000000000000000000000000000000000000000000000000
+          default: '"rth"'
           presets:
             - name: Regular trading hours (09:30-16:00 ET)
-              value: 0x8372746800000000000000000000000000000000000000000000000000000000
+              value: '"rth"'
             - name: Pre-market (04:00-09:30 ET)
-              value: 0x897072656d61726b657400000000000000000000000000000000000000000000
+              value: '"premarket"'
             - name: After-hours (16:00-20:00 ET)
-              value: 0x8a6166746572686f757273000000000000000000000000000000000000000000
+              value: '"afterhours"'
             - name: All active sessions (pre-market, RTH, after-hours)
-              value: 0x83616c6c00000000000000000000000000000000000000000000000000000000
+              value: '"all"'
         - binding: baseline-multiplier
           name: Benchmark price multiplier
           description: |
@@ -101,7 +99,7 @@ builder:
 #oracle-signer !The trusted signer address for the st0x oracle server.
 #baseline-multiplier !WAD multiplier to apply to the baseline (e.g. 1.001).
 #oracle-schema-version !Expected oracle context schema version (= 2 for v2).
-#allowed-session !Market-session filter as Rain IntOrAString bytes32 (hex). Use rth/premarket/afterhours presets for a single session, or the all preset for pre+RTH+post.
+#allowed-session !Market-session filter (Rain string literal). Use the "rth", "premarket", or "afterhours" presets for a single session, or "all" for pre+RTH+post.
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
 #max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
 
@@ -133,16 +131,13 @@ builder:
   oracle-session-end: signed-context<0 5>(),
 
   /* Session guard. When `allowed-session` is the deployer-only "all"
-   * sentinel (IntOrAString "all"), accept pre-market, RTH, or
-   * after-hours. Otherwise require an exact match to the chosen
-   * session. Overnight/weekend closed sessions always revert. */
+   * sentinel, accept pre-market, RTH, or after-hours. Otherwise
+   * require an exact match to the chosen session. Overnight/weekend
+   * closed sessions always revert. */
   :ensure(
     any(
       every(
-        equal-to(
-          allowed-session
-          0x83616c6c00000000000000000000000000000000000000000000000000000000
-        )
+        equal-to(allowed-session "all")
         any(
           equal-to(oracle-session "rth")
           equal-to(oracle-session "premarket")

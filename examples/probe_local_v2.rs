@@ -69,13 +69,15 @@ fn order_tuple(input: &str, output: &str) -> (OrderV4, U256, U256, Address) {
     (order, U256::from(0u64), U256::from(0u64), Address::ZERO)
 }
 
-/// Decode a session tag from Rain's `IntOrAString` bytes32 — byte 0 is
-/// `(len & 0x1f) | 0x80`, ASCII data lives in bytes `1..=len`. Same
-/// format the Rainlang parser emits for a `"…"` string literal.
+/// Decode a session tag from Rain's `IntOrAString` V3 bytes32 — byte
+/// 31 is `(len & 0x1f) | 0xe0`, ASCII data lives in bytes
+/// `(31-len)..31`. Same format the Rainlang parser emits for a
+/// `"…"` string literal via `LibIntOrAString::fromStringV3`.
 fn decode_session_tag(b: alloy::primitives::B256) -> String {
     let bytes = b.as_slice();
-    let len = (bytes[0] & 0x1f) as usize;
-    String::from_utf8(bytes[1..=len].to_vec()).unwrap_or_else(|_| "<non-utf8>".to_string())
+    let len = (bytes[31] & 0x1f) as usize;
+    String::from_utf8(bytes[31 - len..31].to_vec())
+        .unwrap_or_else(|_| "<non-utf8>".to_string())
 }
 
 #[tokio::main]

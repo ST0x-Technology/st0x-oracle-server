@@ -60,23 +60,35 @@ impl Session {
         }
     }
 
-    /// Encode the session tag as Rain's `IntOrAString` bytes32 — the
-    /// same format the Rainlang parser produces for a `"…"` string
-    /// literal. Byte 0 carries the truthy high bit OR-ed with the
-    /// string length (`(len & 0x1f) | 0x80`), bytes 1..1+len carry the
-    /// ASCII data, bytes 1+len..32 are zero.
+    /// Encode the session tag as Rain `IntOrAString` V3 bytes32 — the
+    /// exact byte layout the Rainlang parser produces for a `"…"`
+    /// string literal via `LibIntOrAString::fromStringV3`. **Byte 31**
+    /// carries the truthy high bits OR-ed with the string length
+    /// (`(len & 0x1f) | 0xe0`), bytes `(31-len)..31` carry the ASCII
+    /// data, bytes `0..(31-len)` are zero.
     ///
-    /// This matches `LibIntOrAString::fromString` in
-    /// `rain.intorastring`, so a v2 strategy can compare
-    /// `signed-context<0 3>() == "rth"` and the equality holds. All
-    /// five session names fit comfortably (max length is 16, max slot
-    /// is 31 bytes of data + 1 length byte).
+    /// V2 strategies can therefore compare
+    /// `equal-to(signed-context<0 3>() "rth")` directly — both sides
+    /// resolve to the same V3 bytes32 and the equality holds
+    /// byte-for-byte.
+    ///
+    /// All five session names fit comfortably (max length is 16; the
+    /// slot has 31 bytes of data + 1 length byte).
+    ///
+    /// Historical note: this used to be a V1-style layout (length at
+    /// byte 0, truthy bits `0x80`). The mismatch with Rainlang's V3
+    /// string-literal parser broke `equal-to(oracle-session "rth")`
+    /// in v2 strategies (deployed orders revert "Not in allowed
+    /// market session" even when the live broker is in RTH). See
+    /// issue #28 for the on-chain proof and the migration that
+    /// stripped inline hex constants from the strategy files.
     pub fn to_bytes32(self) -> [u8; 32] {
         let bytes = self.as_str().as_bytes();
         assert!(bytes.len() < 32, "session name must fit in 31 bytes");
         let mut out = [0u8; 32];
-        out[0] = 0x80 | (bytes.len() as u8);
-        out[1..=bytes.len()].copy_from_slice(bytes);
+        let len = bytes.len();
+        out[31 - len..31].copy_from_slice(bytes);
+        out[31] = 0xe0 | (len as u8);
         out
     }
 }
@@ -396,12 +408,14 @@ mod tests {
     }
 
     #[test]
-    fn session_bytes32_matches_rain_intorastring_format() {
-        // Rain's IntOrAString: byte 0 = (len & 0x1f) | 0x80; bytes
-        // 1..1+len = ASCII; bytes 1+len..32 = 0. This is what the
-        // Rainlang parser emits for a `"…"` string literal — so the
-        // bytes32 we sign at context slot 3 must match it byte-for-byte
-        // for `equal-to(signed-context<0 3>() "rth")` to hold on chain.
+    fn session_bytes32_matches_rain_intorastring_v3_format() {
+        // Rain `IntOrAString` V3: byte 31 = (len & 0x1f) | 0xe0; bytes
+        // (31-len)..31 = ASCII; bytes 0..(31-len) = 0. This is what
+        // `LibIntOrAString::fromStringV3` produces — and what the
+        // Rainlang parser emits for a `"…"` string literal. So the
+        // bytes32 we sign at context slot 3 must match it
+        // byte-for-byte for `equal-to(signed-context<0 3>() "rth")`
+        // to hold on chain.
         for sess in [
             Session::Rth,
             Session::Premarket,
@@ -411,21 +425,22 @@ mod tests {
         ] {
             let b = sess.to_bytes32();
             let name = sess.as_str().as_bytes();
+            let len = name.len();
             assert_eq!(
-                b[0],
-                0x80 | name.len() as u8,
-                "{}: byte 0 must be 0x80 | length",
+                b[31],
+                0xe0 | len as u8,
+                "{}: byte 31 must be 0xe0 | length",
                 sess.as_str()
             );
             assert_eq!(
-                &b[1..=name.len()],
+                &b[31 - len..31],
                 name,
-                "{}: ASCII data must follow the length byte",
+                "{}: ASCII data must end immediately before the length byte",
                 sess.as_str()
             );
             assert!(
-                b[1 + name.len()..].iter().all(|&x| x == 0),
-                "{}: tail must be zero-padded",
+                b[..31 - len].iter().all(|&x| x == 0),
+                "{}: head must be zero-padded",
                 sess.as_str()
             );
         }
@@ -433,12 +448,31 @@ mod tests {
 
     #[test]
     fn session_bytes32_known_rth_value() {
-        // Spot-check the exact bytes for "rth" so the encoding is
-        // pinned against the format used by Pyth-pair-style strategies
-        // in rain.strategies (`0x92`-prefixed pair names = 0x80 | 18).
+        // Spot-check the exact bytes for "rth" so the V3 encoding is
+        // pinned. Matches what `Float::from_str("\"rth\"")` produces
+        // when the Rainlang parser handles the string literal `"rth"`.
         let b = Session::Rth.to_bytes32();
         let mut expected = [0u8; 32];
-        expected[..4].copy_from_slice(&[0x83, b'r', b't', b'h']);
+        expected[28] = b'r';
+        expected[29] = b't';
+        expected[30] = b'h';
+        expected[31] = 0xe3; // 0xe0 | 3
+        assert_eq!(b, expected);
+    }
+
+    #[test]
+    fn session_bytes32_known_weekend_closed_value() {
+        // Empirical anchor: this exact 32-byte value was confirmed
+        // on-chain to equal Rainlang's `"weekend_closed"` literal via
+        // a successful quote2 call against a self-signed context (see
+        // PR description). If this assertion ever changes, somebody
+        // touched the encoder — re-prove the on-chain compare before
+        // shipping.
+        let b = Session::WeekendClosed.to_bytes32();
+        let expected: [u8; 32] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'w', b'e', b'e', b'k', b'e',
+            b'n', b'd', b'_', b'c', b'l', b'o', b's', b'e', b'd', 0xee,
+        ];
         assert_eq!(b, expected);
     }
 

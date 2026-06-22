@@ -94,15 +94,17 @@ pub fn build_context(
 /// - `context[1]`: price (Rain Float; mark for buys, 1/mark for sells)
 /// - `context[2]`: publish_time (Rain Float, Unix seconds — same rule
 ///   as v1: `now` in-session, `last_session_close` out-of-session)
-/// - `context[3]`: session tag (right-padded ASCII bytes32; one of
-///   `rth`, `premarket`, `afterhours`, `overnight_closed`,
-///   `weekend_closed`)
+/// - `context[3]`: session tag (Rain `IntOrAString` V3 bytes32 — byte
+///   31 = `(len & 0x1f) | 0xe0`, ASCII in bytes `(31-len)..31`, head
+///   zero-padded; one of `rth`, `premarket`, `afterhours`,
+///   `overnight_closed`, `weekend_closed`)
 /// - `context[4]`: start of the CURRENT session (Rain Float, Unix sec)
 /// - `context[5]`: end of the CURRENT session (Rain Float, Unix sec)
 ///
-/// Strategies compare `context[3]` against the same right-padded ASCII
-/// literal via `equal-to`, e.g.:
-/// `equal-to(signed-context<0 3>() <ASCII-padded-bytes32>)`.
+/// Strategies compare `context[3]` against a Rainlang string literal
+/// directly — `equal-to(signed-context<0 3>() "rth")` — and the
+/// equality holds byte-for-byte because the Rainlang parser produces
+/// the same V3 IntOrAString shape for the literal.
 pub fn build_context_v2(
     price: f64,
     publish_time: u64,
@@ -217,8 +219,10 @@ mod tests {
 
     #[test]
     fn test_build_context_v2_layout_and_session_encoding() {
-        // "rth" right-padded into a bytes32 == session slot we'd
-        // compare against in the strategy.
+        // Synthetic bytes32 — `build_context_v2` is encoding-agnostic;
+        // the V3 vs old-V1 layout choice happens in
+        // `market_hours::Session::to_bytes32` and is exercised there.
+        // Here we just confirm slot 3 passes through unchanged.
         let mut sess = [0u8; 32];
         sess[..3].copy_from_slice(b"rth");
 
