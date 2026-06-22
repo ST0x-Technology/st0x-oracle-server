@@ -229,12 +229,12 @@ async fn weekend_closed_market_hours() -> Arc<MarketHoursCache> {
 }
 
 /// Decode a session tag from slot 3 of the v2 context. The on-the-wire
-/// format is Rain's `IntOrAString`: byte 0 holds `(len & 0x1f) | 0x80`,
-/// the ASCII data lives in bytes `1..=len`.
+/// format is Rain's `IntOrAString` V3: byte 31 holds `(len & 0x1f) | 0xe0`,
+/// the ASCII data lives in bytes `(31-len)..31`, head is zero-padded.
 fn decode_session_tag(b: alloy::primitives::FixedBytes<32>) -> String {
     let bytes: [u8; 32] = b.into();
-    let len = (bytes[0] & 0x1f) as usize;
-    String::from_utf8(bytes[1..=len].to_vec()).unwrap()
+    let len = (bytes[31] & 0x1f) as usize;
+    String::from_utf8(bytes[31 - len..31].to_vec()).unwrap()
 }
 
 /// Send a single buy through `/context/v2` and return the decoded
@@ -508,14 +508,14 @@ async fn test_v2_single_returns_v2_schema_with_session() {
     let price = Float::from(alloy::primitives::B256::from(resp.context[1]));
     assert_eq!(price.format().unwrap(), "100");
 
-    // session tag - Rain IntOrAString-encoded "rth": byte 0 = 0x83
-    // (length 3 OR-ed with the truthy high bit), bytes 1..4 = "rth".
+    // session tag — Rain IntOrAString V3 encoding of "rth":
+    // byte 31 = 0xe3 (0xe0 | 3), bytes 28..31 = "rth", head zero-padded.
     let sess = resp.context[3].as_slice();
-    assert_eq!(sess[0], 0x83, "byte 0 must be 0x80 | 3");
-    assert_eq!(&sess[1..4], b"rth");
+    assert_eq!(sess[31], 0xe3, "byte 31 must be 0xe0 | 3");
+    assert_eq!(&sess[28..31], b"rth");
     assert!(
-        sess[4..].iter().all(|&b| b == 0),
-        "session tag must be zero-padded after the data: {:?}",
+        sess[..28].iter().all(|&b| b == 0),
+        "session tag must be zero-padded before the data: {:?}",
         sess
     );
 
@@ -611,12 +611,12 @@ async fn test_v2_session_tag_reflects_market_phase() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
     let sess = responses[0].context[3].as_slice();
-    // Decode the IntOrAString format: length = byte 0 & 0x1f, ASCII
-    // data starts at byte 1. With only a single window in the cache
-    // and `now` after it, the cache returns OvernightClosed (no
+    // Decode the IntOrAString V3 format: length = byte 31 & 0x1f,
+    // ASCII data ends at byte 31. With only a single window in the
+    // cache and `now` after it, the cache returns OvernightClosed (no
     // `next_open` to widen the gap).
-    let len = (sess[0] & 0x1f) as usize;
-    let name = std::str::from_utf8(&sess[1..=len]).unwrap();
+    let len = (sess[31] & 0x1f) as usize;
+    let name = std::str::from_utf8(&sess[31 - len..31]).unwrap();
     assert_eq!(name, "overnight_closed");
 }
 
