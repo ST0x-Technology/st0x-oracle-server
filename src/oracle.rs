@@ -11,7 +11,19 @@ pub const SCHEMA_VERSION: u64 = 1;
 /// with three additional fields describing the current market session:
 /// a bytes32 ASCII tag plus the UTC `start` and `end` of that session.
 /// v1 stays unchanged and is still served on `/context/v1`.
+///
+/// `/context/v2` signs slot 3 as `Session::to_bytes32_v1` (byte-0
+/// length, `0x80 | len`) to match the hex presets baked into live v2
+/// strategies.
 pub const SCHEMA_VERSION_V2: u64 = 2;
+
+/// Schema version emitted by `/context/v3`. Same six-element layout
+/// as v2; the only difference is slot 3 is signed with
+/// `Session::to_bytes32_v3` (byte-31 length, `0xe0 | len`) so that v3
+/// strategies can compare against Rainlang `"…"` string literals
+/// directly (the parser produces the same V3 bytes via
+/// `LibIntOrAString::fromStringV3`).
+pub const SCHEMA_VERSION_V3: u64 = 3;
 
 /// Oracle response matching Rain's SignedContextV1 format.
 /// The JSON array shape of this struct is what upstream
@@ -87,25 +99,27 @@ pub fn build_context(
     Ok(vec![version_bytes, price_bytes, publish_bytes])
 }
 
-/// Build the v2 signed-context array. Extends v1's `[version, price,
-/// publish_time]` with three session fields. The full layout is:
+/// Build a session-aware signed-context array. Layout:
 ///
-/// - `context[0]`: schema version (= 2, Rain Float)
+/// - `context[0]`: schema version (Rain Float)
 /// - `context[1]`: price (Rain Float; mark for buys, 1/mark for sells)
-/// - `context[2]`: publish_time (Rain Float, Unix seconds — same rule
-///   as v1: `now` in-session, `last_session_close` out-of-session)
-/// - `context[3]`: session tag (Rain `IntOrAString` V3 bytes32 — byte
-///   31 = `(len & 0x1f) | 0xe0`, ASCII in bytes `(31-len)..31`, head
-///   zero-padded; one of `rth`, `premarket`, `afterhours`,
-///   `overnight_closed`, `weekend_closed`)
+/// - `context[2]`: publish_time (Rain Float, Unix seconds — `now`
+///   in-session, `last_session_close` out-of-session per RAI-693)
+/// - `context[3]`: session tag (Rain IntOrAString bytes32 in whatever
+///   layout the caller supplies — `to_bytes32_v1` for `/context/v2`,
+///   `to_bytes32_v3` for `/context/v3`)
 /// - `context[4]`: start of the CURRENT session (Rain Float, Unix sec)
 /// - `context[5]`: end of the CURRENT session (Rain Float, Unix sec)
 ///
-/// Strategies compare `context[3]` against a Rainlang string literal
-/// directly — `equal-to(signed-context<0 3>() "rth")` — and the
-/// equality holds byte-for-byte because the Rainlang parser produces
-/// the same V3 IntOrAString shape for the literal.
-pub fn build_context_v2(
+/// Both `/context/v2` and `/context/v3` use this shared body. They
+/// differ only in:
+/// - `schema_version` (slot 0): `SCHEMA_VERSION_V2` vs
+///   `SCHEMA_VERSION_V3`
+/// - `session_bytes` (slot 3): V1 byte-0 vs V3 byte-31 IntOrAString
+///   layout — chosen by the caller via `Session::to_bytes32_v1` /
+///   `to_bytes32_v3`
+pub fn build_session_context(
+    schema_version: u64,
     price: f64,
     publish_time: u64,
     session_bytes: [u8; 32],
@@ -130,8 +144,8 @@ pub fn build_context_v2(
         price_float
     };
 
-    let version_float = Float::parse(SCHEMA_VERSION_V2.to_string())
-        .map_err(|e| anyhow::anyhow!("Failed to parse v2 schema version: {:?}", e))?;
+    let version_float = Float::parse(schema_version.to_string())
+        .map_err(|e| anyhow::anyhow!("Failed to parse schema version: {:?}", e))?;
     let publish_float = Float::parse(publish_time.to_string())
         .map_err(|e| anyhow::anyhow!("Failed to parse publish_time as Rain float: {:?}", e))?;
     let start_float = Float::parse(session_start.to_string())
@@ -154,6 +168,48 @@ pub fn build_context_v2(
         start_bytes,
         end_bytes,
     ])
+}
+
+/// Thin wrapper that pins schema_version = 2 for `/context/v2`.
+/// Caller supplies `session_bytes` from `Session::to_bytes32_v1`.
+pub fn build_context_v2(
+    price: f64,
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    inverted: bool,
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    build_session_context(
+        SCHEMA_VERSION_V2,
+        price,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        inverted,
+    )
+}
+
+/// Thin wrapper that pins schema_version = 3 for `/context/v3`.
+/// Caller supplies `session_bytes` from `Session::to_bytes32_v3`.
+pub fn build_context_v3(
+    price: f64,
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    inverted: bool,
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    build_session_context(
+        SCHEMA_VERSION_V3,
+        price,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        inverted,
+    )
 }
 
 /// Format an f64 price as a string suitable for Float::parse.

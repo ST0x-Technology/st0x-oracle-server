@@ -1,16 +1,18 @@
-//! Smoke probe for `/context/v2`. Same orderbook request shape as
-//! `probe_local`, but decodes the 6-element v2 context and verifies:
+//! Smoke probe for `/context/v3`. Same orderbook request shape as
+//! `probe_local_v2`, but decodes the 6-element v3 context (schema
+//! version 3, session slot 3 as V3 IntOrAString — what Rainlang `"…"`
+//! string literals parse to). Verifies:
 //!
-//! - schema_version (slot 0) == 2
+//! - schema_version (slot 0) == 3
 //! - oracle buy price (slot 1) is within 1% of the broker mark
 //! - sell leg returns 1/mark in Rain Float precision
-//! - publish_time (slot 2), session (slot 3), session_start (slot 4),
-//!   session_end (slot 5) all decode cleanly
+//! - publish_time (slot 2), session (slot 3, V3 byte-31 layout),
+//!   session_start (slot 4), session_end (slot 5) all decode cleanly
 //!
 //! Usage:
-//!   cargo run --example probe_local_v2 -- SPYM
+//!   cargo run --example probe_local_v3 -- SPYM
 //!
-//! `ORACLE_URL=https://st0x-oracle-server.fly.dev/context/v2 cargo run ...`
+//! `ORACLE_URL=https://st0x-oracle-server.fly.dev/context/v3 cargo run ...`
 //! points the probe at prod.
 
 use alloy::primitives::{Address, FixedBytes, U256};
@@ -21,10 +23,10 @@ use st0x_oracle_server::{EvaluableV4, OrderV4, IOV2};
 use std::str::FromStr;
 
 /// Probed URL. Override with
-/// `ORACLE_URL=https://st0x-oracle-server.fly.dev/context/v2` to compare
+/// `ORACLE_URL=https://st0x-oracle-server.fly.dev/context/v3` to compare
 /// prod against the broker.
 fn oracle_url() -> String {
-    std::env::var("ORACLE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000/context/v2".to_string())
+    std::env::var("ORACLE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000/context/v3".to_string())
 }
 const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
@@ -69,14 +71,14 @@ fn order_tuple(input: &str, output: &str) -> (OrderV4, U256, U256, Address) {
     (order, U256::from(0u64), U256::from(0u64), Address::ZERO)
 }
 
-/// Decode a session tag from Rain's `IntOrAString` V1 bytes32 — byte
-/// 0 is `(len & 0x1f) | 0x80`, ASCII data lives in bytes `1..=len`.
-/// Format `/context/v2` emits (matches the hex presets in live v2
-/// strategies). For the `/context/v3` shape, see `probe_local_v3.rs`.
+/// Decode a session tag from Rain's `IntOrAString` V3 bytes32 — byte
+/// 31 is `(len & 0x1f) | 0xe0`, ASCII data lives in bytes
+/// `(31-len)..31`. Same shape the Rainlang parser emits for a `"…"`
+/// string literal via `LibIntOrAString::fromStringV3`.
 fn decode_session_tag(b: alloy::primitives::B256) -> String {
     let bytes = b.as_slice();
-    let len = (bytes[0] & 0x1f) as usize;
-    String::from_utf8(bytes[1..=len].to_vec()).unwrap_or_else(|_| "<non-utf8>".to_string())
+    let len = (bytes[31] & 0x1f) as usize;
+    String::from_utf8(bytes[31 - len..31].to_vec()).unwrap_or_else(|_| "<non-utf8>".to_string())
 }
 
 #[tokio::main]
@@ -119,14 +121,14 @@ async fn main() -> anyhow::Result<()> {
     let resp = &buy_resp[0];
     anyhow::ensure!(
         resp.context.len() == 6,
-        "expected v2 context length 6, got {}",
+        "expected v3 context length 6, got {}",
         resp.context.len()
     );
 
     let version = Float::from(alloy::primitives::B256::from(resp.context[0]))
         .format()
         .unwrap();
-    anyhow::ensure!(version == "2", "expected schema version 2, got {version}");
+    anyhow::ensure!(version == "3", "expected schema version 3, got {version}");
 
     let buy_price = Float::from(alloy::primitives::B256::from(resp.context[1]))
         .format()
@@ -145,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
         .format()
         .unwrap();
 
-    println!("=== {symbol} via v2 oracle ===");
+    println!("=== {symbol} via v3 oracle ===");
     println!("  schema version            : {version}");
     println!("  buy  (USDC -> {symbol}) price : {buy_price}");
     println!("  sell ({symbol} -> USDC) price : {sell_price}");
