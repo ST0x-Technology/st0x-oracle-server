@@ -104,6 +104,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/status", get(status))
         .route("/context/v1", post(post_signed_context_v1))
         .route("/context/v2", post(post_signed_context_v2))
+        .route("/context/v3", post(post_signed_context_v3))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -196,14 +197,94 @@ async fn post_signed_context_v1(
     Ok(Json(responses))
 }
 
-/// v2 handler — same request shape and snapshot-once batching as v1, but
-/// the signed context carries the market-session classification and
-/// current-session bounds in slots 3-5. v1 is unchanged. See
-/// `oracle::build_context_v2` for the on-the-wire layout.
+/// Pick which signed-context shape an endpoint emits. The two
+/// shapes share everything except the schema-version constant in
+/// slot 0 and the IntOrAString layout in slot 3:
+///
+/// - `V2` → `SCHEMA_VERSION_V2 = 2` + `Session::to_bytes32_v1`
+///   (byte-0 length). What live v2 strategies are bound to.
+/// - `V3` → `SCHEMA_VERSION_V3 = 3` + `Session::to_bytes32_v3`
+///   (byte-31 length). Matches Rainlang `"…"` string literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSchema {
+    V2,
+    V3,
+}
+
+impl SessionSchema {
+    fn encode_session(self, session: crate::market_hours::Session) -> [u8; 32] {
+        match self {
+            Self::V2 => session.to_bytes32_v1(),
+            Self::V3 => session.to_bytes32_v3(),
+        }
+    }
+
+    fn build_context(
+        self,
+        price: f64,
+        publish_time: u64,
+        session_bytes: [u8; 32],
+        session_start: u64,
+        session_end: u64,
+        inverted: bool,
+    ) -> Result<Vec<alloy::primitives::FixedBytes<32>>, anyhow::Error> {
+        match self {
+            Self::V2 => oracle::build_context_v2(
+                price,
+                publish_time,
+                session_bytes,
+                session_start,
+                session_end,
+                inverted,
+            ),
+            Self::V3 => oracle::build_context_v3(
+                price,
+                publish_time,
+                session_bytes,
+                session_start,
+                session_end,
+                inverted,
+            ),
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::V2 => "v2",
+            Self::V3 => "v3",
+        }
+    }
+}
+
+/// v2 handler — `/context/v2` endpoint. See [`SessionSchema`] for
+/// what makes v2 different from v3.
 async fn post_signed_context_v2(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
+    post_signed_context_session(state, body, SessionSchema::V2).await
+}
+
+/// v3 handler — `/context/v3` endpoint. Same request shape and
+/// snapshot-once batching as v2; the only difference from the
+/// caller's perspective is slot 3 carries V3 IntOrAString (matches
+/// Rainlang `"…"` literals) and slot 0 carries schema version 3.
+async fn post_signed_context_v3(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    post_signed_context_session(state, body, SessionSchema::V3).await
+}
+
+/// Shared body for `/context/v2` and `/context/v3`. Same orderbook
+/// request decoding, same cache snapshot-once batching, same
+/// market-hours snapshot-once-per-batch. The `schema` arg picks
+/// which schema-version constant and IntOrAString layout we emit.
+async fn post_signed_context_session(
+    state: Arc<AppState>,
+    body: Bytes,
+    schema: SessionSchema,
+) -> Result<axum::Json<Vec<oracle::OracleResponse>>, AppError> {
     let requests = decode_request_body(&body)?;
 
     if requests.is_empty() {
@@ -234,8 +315,15 @@ async fn post_signed_context_v2(
                 pair.symbol
             ))
         })?;
-        let resp =
-            build_response_from_quote_v2(&state, pair, &quote, publish_dt, &session_info).await?;
+        let resp = build_response_from_quote_session(
+            &state,
+            pair,
+            &quote,
+            publish_dt,
+            &session_info,
+            schema,
+        )
+        .await?;
         responses.push(resp);
     }
 
@@ -348,17 +436,18 @@ async fn build_response_from_quote(
     })
 }
 
-/// v2 variant of `build_response_from_quote`. Same price + publish_time
-/// computation as v1, but folds the session classification into the
-/// signed context. The caller passes in a single `publish_dt` and
-/// `session_info` so every response in a batch agrees on the
-/// market-hours snapshot.
-async fn build_response_from_quote_v2(
+/// Shared response builder for `/context/v2` and `/context/v3`.
+/// Same price + publish_time + session-bounds logic as the v2-only
+/// helper this replaces; the `schema` arg picks which IntOrAString
+/// layout slot 3 uses and which schema-version constant slot 0
+/// carries.
+async fn build_response_from_quote_session(
     state: &AppState,
     pair: &ResolvedPair,
     quote: &crate::alpaca::QuoteData,
     publish_dt: chrono::DateTime<Utc>,
     session_info: &crate::market_hours::SessionInfo,
+    schema: SessionSchema,
 ) -> Result<oracle::OracleResponse, AppError> {
     if quote.price <= 0.0 {
         return Err(AppError::BadRequest(format!(
@@ -386,17 +475,18 @@ async fn build_response_from_quote_v2(
         symbol = %pair.symbol,
         price = quote.price,
         inverted = pair.inverted,
+        schema = schema.tag(),
         publish_time = publish_time,
         session = session_info.session.as_str(),
         session_start = session_start,
         session_end = session_end,
-        "Building v2 signed context from cache"
+        "Building session signed context from cache"
     );
 
-    let context = oracle::build_context_v2(
+    let context = schema.build_context(
         quote.price,
         publish_time,
-        session_info.session.to_bytes32(),
+        schema.encode_session(session_info.session),
         session_start,
         session_end,
         pair.inverted,

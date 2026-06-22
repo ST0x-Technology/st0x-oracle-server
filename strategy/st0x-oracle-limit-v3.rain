@@ -3,7 +3,7 @@ version: 6
 orders:
   base:
     raindex: base
-    oracle-url: https://st0x-oracle-server.fly.dev/context/v2
+    oracle-url: https://st0x-oracle-server.fly.dev/context/v3
     inputs:
       - token: token1
     outputs:
@@ -17,7 +17,7 @@ scenarios:
     bindings:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
-      oracle-schema-version: 2
+      oracle-schema-version: 3
 
 deployments:
   base:
@@ -25,10 +25,10 @@ deployments:
     scenario: base
 
 builder:
-  name: st0x Oracle Limit v2
+  name: st0x Oracle Limit v3
   description: >
     A limit order for st0x tokenized equities that uses the st0x oracle
-    server's v2 endpoint. The signed context includes the current market
+    server's v3 endpoint. The signed context includes the current market
     session (regular trading hours, pre-market, after-hours, or closed)
     and the UTC bounds of that session, alongside the price. The order
     quotes only when the signed session matches the configured one and
@@ -49,7 +49,7 @@ builder:
           name: Market session
           description: >
             Which market session this strategy will quote during. The
-            v2 oracle signs the current session into the context;
+            v3 oracle signs the current session into the context;
             orders revert when the signed session does not match.
           default: '"rth"'
           presets:
@@ -89,7 +89,7 @@ builder:
 #raindex-subparser !The subparser to use.
 
 #oracle-signer !The trusted signer address for the st0x oracle server.
-#oracle-schema-version !Expected oracle context schema version (= 2 for v2).
+#oracle-schema-version !Expected oracle context schema version (= 3 for v3).
 #allowed-session !Required market-session tag (Rain string literal). One of "rth", "premarket", "afterhours". Must match oracle context slot 3.
 
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
@@ -104,7 +104,7 @@ using-words-from raindex-subparser
   "Untrusted oracle signer"
 ),
 
-/* Schema version guard. If the server ever changes the v2 layout this
+/* Schema version guard. If the server ever changes the v3 layout this
  * order must revert instead of misreading slots. */
 oracle-version: signed-context<0 0>(),
 :ensure(

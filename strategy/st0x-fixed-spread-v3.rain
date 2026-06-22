@@ -3,36 +3,36 @@ version: 6
 orders:
   base:
     raindex: base
-    oracle-url: https://st0x-oracle-server.fly.dev/context/v2
+    oracle-url: https://st0x-oracle-server.fly.dev/context/v3
     inputs:
       - token: input
     outputs:
       - token: output
 
 scenarios:
-  st0x-oracle-baseline-v2:
+  st0x-oracle-baseline-v3:
     raindex: base
     rainlang: base
     runs: 1
     bindings:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
-      oracle-schema-version: 2
+      oracle-schema-version: 3
 
 deployments:
-  base-st0x-baseline-v2:
+  base-st0x-baseline-v3:
     order: base
-    scenario: st0x-oracle-baseline-v2
+    scenario: st0x-oracle-baseline-v3
 
 builder:
-  name: St0x fixed spread limit v2
+  name: St0x fixed spread limit v3
   description: https://raw.githubusercontent.com/rainlanguage/rain.strategies/e25bc4876b5ffb8bb28097b0ca66de291c75ff56/src/fixed-spread.md
   short-description: >
     A strategy where the ratio tracks a benchmark price with a fixed
-    multiplier, gated on market session via the v2 oracle endpoint.
+    multiplier, gated on market session via the v3 oracle endpoint.
   deployments:
-    base-st0x-baseline-v2:
-      name: Base st0x fixed spread v2
+    base-st0x-baseline-v3:
+      name: Base st0x fixed spread v3
       description: Deploy a fixed-spread strategy on Base.
       deposits:
         - token: output
@@ -41,7 +41,7 @@ builder:
           name: Market session
           description: >
             Which market session this strategy will quote during. The
-            v2 oracle signs the current session into the context;
+            v3 oracle signs the current session into the context;
             orders revert when the signed session does not match.
             Choose a single session or all active sessions (pre-market,
             regular hours, and after-hours). Overnight and weekend
@@ -98,13 +98,13 @@ builder:
 #raindex-subparser !Raindex subparser.
 #oracle-signer !The trusted signer address for the st0x oracle server.
 #baseline-multiplier !WAD multiplier to apply to the baseline (e.g. 1.001).
-#oracle-schema-version !Expected oracle context schema version (= 2 for v2).
+#oracle-schema-version !Expected oracle context schema version (= 3 for v3).
 #allowed-session !Market-session filter (Rain string literal). Use the "rth", "premarket", or "afterhours" presets for a single session, or "all" for pre+RTH+post.
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
 #max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
 
 
-#st0x-oracle-baseline-v2
+#st0x-oracle-baseline-v3
   /* Verify the signed context comes from the trusted st0x oracle signer */
   :ensure(
     equal-to(signer<0>() oracle-signer)
@@ -112,7 +112,7 @@ builder:
   ),
 
   /* Schema version guard
-  * If the server ever changes the v2 layout, live orders must
+  * If the server ever changes the v3 layout, live orders must
   * revert instead of misreading slots. */
   oracle-version: signed-context<0 0>(),
   :ensure(
@@ -188,7 +188,7 @@ builder:
 #calculate-io
 using-words-from raindex-subparser
 offer-amount: max-positive-value(),
-io: mul(call<'st0x-oracle-baseline-v2>() baseline-multiplier);
+io: mul(call<'st0x-oracle-baseline-v3>() baseline-multiplier);
 
 #handle-io
 :;
