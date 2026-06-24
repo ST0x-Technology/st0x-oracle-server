@@ -1,0 +1,11 @@
+# Edit via `nix develop -c tf-edit-vars` — the helper decrypts the
+# .age file, opens $EDITOR, and re-encrypts on exit. Never commit the
+# plaintext `terraform.tfvars`.
+
+do_token = "REPLACE_WITH_DO_API_TOKEN"
+
+# Optional overrides; defaults from variables.tf shown commented out:
+# ssh_key_name   = "st0x-op"
+# region         = "nyc3"
+# droplet_size   = "s-1vcpu-1gb"
+# volume_size_gb = 5
