@@ -18,12 +18,16 @@ variable "region" {
 
 # Oracle server: single WebSocket to st0x-pricing (post-RAI-360), one
 # REST poll loop to Alpaca's broker /calendar endpoint, and an axum
-# HTTP server signing per-request SignedContextV1 frames. Cheap; 1 GB
-# is comfortable.
+# HTTP server signing per-request SignedContextV1 frames. Runtime is
+# cheap (1 GB would be plenty) but `nixos-anywhere` builds the system
+# closure on the target droplet, and Rust + alloy + raindex bindings
+# OOM at 1 GB during the first install. 4 GB is the smallest size
+# bebop / pricing both use; matching it keeps bootstrap reliable.
+# Can be sized down post-install if you want to save ~$15/mo.
 variable "droplet_size" {
   description = "Droplet size slug"
   type        = string
-  default     = "s-1vcpu-1gb"
+  default     = "s-2vcpu-4gb"
 }
 
 variable "volume_size_gb" {
