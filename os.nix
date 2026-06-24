@@ -69,7 +69,16 @@ in
     hostName = "st0x-oracle-server";
     firewall = {
       enable = true;
-      allowedTCPPorts = [ ];
+      # Bootstrap chicken-and-egg: secrets at install time are encrypted
+      # to roles.ssh (operator keys). The new host's SSH key doesn't yet
+      # exist on disk so agenix can't decrypt anything on first boot —
+      # which means tailscale-authkey never gets read, tailscaled never
+      # starts, and the droplet has no tailnet ingress. Leaving port 22
+      # open publicly during bootstrap lets the operator SSH in over
+      # the public IP to commit the new host key + push a tf-rekey'd
+      # set of secrets. Close it (remove `22` from this list) in the
+      # follow-up deploy once tailscale is up. See DEPLOY.md.
+      allowedTCPPorts = [ 22 ];
       trustedInterfaces = [ "tailscale0" ];
     };
   };
