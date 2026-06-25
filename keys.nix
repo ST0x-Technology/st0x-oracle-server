@@ -7,7 +7,7 @@ rec {
   # `host` is a placeholder until the first `nix run .#bootstrap-nixos`.
   keys = {
     st0x-op = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPZ56nOYbGDd0ZfbqxeY7AbvaQGQrHnlC80ccpRGpCoj";
-    host = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMJVv9ZOMFYnLiLWTfrMmIvI1ivBk6int++ARy9B0b44";
+    host = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKsOOJ7HWyxx/i1PA0eVoavt0qGolFSijmkh8c9O2XVG";
     ci = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPTd2zKSwHgWegi290EiK5nYp1Wp4+x2fDYqFxbd0WLN";
     arda = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAyTREGZCOzMsl7N9dp1saN/t7DCs7YesusVUKApMJ78";
     alastair = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJArH3PA+bFIon0JkCVQGs9aWr45lnVjiiTLLO9BPItn";
