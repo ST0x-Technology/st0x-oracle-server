@@ -1095,13 +1095,13 @@ async fn test_v1_batch_returns_length_matching_array() {
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
-    // First (buy): rate_quote_to_base — both slots seeded with the same
-    // 100 in our test harness, so we expect to see 100 here.
+    // First (buy): picks `rate_base_to_quote` — both slots seeded with
+    // the same 100 in our test harness, so we expect to see 100 here.
     let buy_price = Float::from(alloy::primitives::B256::from(responses[0].context[1]));
     assert_eq!(buy_price.format().unwrap(), "100");
 
-    // Second (sell): rate_base_to_quote — also 100 in the harness.
-    // The direction-picking proof is in
+    // Second (sell): picks `rate_quote_to_base` — also 100 in the
+    // harness. The direction-picking proof is in
     // `test_v1_picks_per_direction_rate_without_inversion`; this test
     // exercises batching coherence + array length.
     let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
@@ -1118,7 +1118,9 @@ async fn test_v1_picks_per_direction_rate_without_inversion() {
     // exact slot we put in.
     let app = test_app_asymmetric("50", "0.03").await;
 
-    // Buy: input=USDC (quote), output=tStock (base) → rate_quote_to_base = 50.
+    // Buy (Raindex `ratio = USDC_in / WCOIN_out = rate_base_to_quote`):
+    // input=USDC (quote), output=tStock (base) → picks the slot we
+    // seeded with `base_to_quote = "0.03"`.
     let buy_resp = app
         .clone()
         .oneshot(
@@ -1134,10 +1136,12 @@ async fn test_v1_picks_per_direction_rate_without_inversion() {
     let bytes = buy_resp.into_body().collect().await.unwrap().to_bytes();
     let buy: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
     let buy_price = Float::from(alloy::primitives::B256::from(buy[0].context[1]));
-    assert_eq!(buy_price.format().unwrap(), "50");
+    assert_eq!(buy_price.format().unwrap(), "0.03");
 
-    // Sell: input=tStock (base), output=USDC (quote) → rate_base_to_quote = 0.03.
-    // If the oracle were still doing 1/x it would emit ~0.02, not 0.03.
+    // Sell (Raindex `ratio = WCOIN_in / USDC_out = rate_quote_to_base`):
+    // input=tStock (base), output=USDC (quote) → picks the slot we
+    // seeded with `quote_to_base = "50"`. If the oracle were still doing
+    // 1/x it would emit ~0.02 (= 1/50), not 50.
     let sell_resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -1152,5 +1156,5 @@ async fn test_v1_picks_per_direction_rate_without_inversion() {
     let bytes = sell_resp.into_body().collect().await.unwrap().to_bytes();
     let sell: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
     let sell_price = Float::from(alloy::primitives::B256::from(sell[0].context[1]));
-    assert_eq!(sell_price.format().unwrap(), "0.03");
+    assert_eq!(sell_price.format().unwrap(), "50");
 }
