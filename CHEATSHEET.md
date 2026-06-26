@@ -8,18 +8,17 @@ For incident response, see `RUNBOOK.md`. For first-time provisioning, see
 
 ## Where things live
 
-| Thing             | Path / URL                                                |
-| ----------------- | --------------------------------------------------------- |
-| HTTP API          | `http://st0x-oracle-server:3000` (tailnet, parity-window) |
-| Metrics           | `http://st0x-oracle-server:3000/metrics`                  |
-| Status            | `http://st0x-oracle-server:3000/status`                   |
-| Diff observer     | `http://st0x-oracle-server:3001/metrics`                  |
-| Grafana dashboard | `http://st0x-obs:3000` → `st0x — oracle + parity window`  |
-| Service unit      | `systemctl status st0x-oracle-server`                     |
-| Config            | `config/st0x-oracle-server.toml` (in-repo)                |
-| Secrets           | `secrets/*.age` (ragenix)                                 |
-| Logs (host)       | `journalctl -u st0x-oracle-server`                        |
-| Logs (Loki)       | `{service="st0x-oracle-server"}` in Grafana Explore       |
+| Thing             | Path / URL                                          |
+| ----------------- | --------------------------------------------------- |
+| HTTP API          | `http://st0x-oracle-server:3000` (tailnet)          |
+| Metrics           | `http://st0x-oracle-server:3000/metrics`            |
+| Status            | `http://st0x-oracle-server:3000/status`             |
+| Grafana dashboard | `http://st0x-obs:3000` → `st0x — oracle`            |
+| Service unit      | `systemctl status st0x-oracle-server`               |
+| Config            | `config/st0x-oracle-server.toml` (in-repo)          |
+| Secrets           | `secrets/*.age` (ragenix)                           |
+| Logs (host)       | `journalctl -u st0x-oracle-server`                  |
+| Logs (Loki)       | `{service="st0x-oracle-server"}` in Grafana Explore |
 
 ## Quick HTTP probes
 
@@ -66,8 +65,8 @@ nix eval --raw --file ./keys.nix roles.host-secrets \
   | rage -e -R /dev/stdin -o secrets/st0x-oracle-server-env.age /tmp/env
 rm /tmp/env
 
-# Same shape for the observer's env + tailscale auth key. Commit
-# all changed `secrets/*.age` files; redeploy.
+# Same shape for the tailscale auth key. Commit all changed
+# `secrets/*.age` files; redeploy.
 ```
 
 ## Tail logs
@@ -75,9 +74,6 @@ rm /tmp/env
 ```bash
 # Live oracle logs:
 ssh root@st0x-oracle-server journalctl -u st0x-oracle-server -f
-
-# Live diff observer logs:
-ssh root@st0x-oracle-server journalctl -u st0x-oracle-diff-observer -f
 
 # Rotated file logs (logrotate, weekly, 14 kept):
 ssh root@st0x-oracle-server ls /mnt/data/st0x-oracle-server/logs/
@@ -106,13 +102,13 @@ nix flake check --impure
 # Symbols seen + missing, signer address:
 curl -s http://st0x-oracle-server:3000/status | jq
 
-# Recent v1 / v2 request volume:
+# Recent v1 / v2 / v3 request volume:
 curl -s http://st0x-oracle-server:3000/metrics \
   | grep -E '^oracle_context_request_total'
 
-# Diff observer's current drift per pair:
-curl -s http://st0x-oracle-server:3001/metrics \
-  | grep -E '^oracle_diff_basis_points'
+# Cache freshness (seconds since the most recent quote refreshed):
+curl -s http://st0x-oracle-server:3000/metrics \
+  | grep -E '^oracle_cache_freshness_seconds'
 ```
 
 ## Manual rebuild via the binary directly (no redeploy)
