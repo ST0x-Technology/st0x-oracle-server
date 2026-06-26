@@ -59,10 +59,9 @@ in
     efiInstallAsRemovable = true;
   };
 
-  # Currently closed to public — the parity-window deploy mirrors bebop /
-  # pricing exactly. Public ingress (so Raindex consumers can hit the
-  # new oracle URL) will be added in the cutover PR after the diff
-  # window proves parity. Until then, ops + the diff observer reach
+  # Currently closed to public — mirrors bebop / pricing. Public ingress
+  # (so Raindex consumers can hit the new oracle URL) will be added in a
+  # cutover PR with Caddy + Let's Encrypt + DNS. Until then, ops reach
   # this droplet over the tailnet only.
   networking = {
     useDHCP = lib.mkForce false;
