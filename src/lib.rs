@@ -145,11 +145,15 @@ struct StatusResponse {
 /// returns 200; consumers gate on the contents of `missing_symbols`.
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let missing = state.pricing.missing(&state.configured_symbols).await;
-    // Side-effect: refresh the two coverage gauges every /status hit
+    // Side-effect: refresh coverage + freshness gauges every /status hit
     // so dashboards don't need a dedicated background tick. /status is
     // already on the obs scrape path, so this is free.
     ::metrics::gauge!("oracle_configured_symbols").set(state.configured_symbols.len() as f64);
     ::metrics::gauge!("oracle_missing_symbols").set(missing.len() as f64);
+    if let Some(newest_ms) = state.pricing.newest_source_ts_ms().await {
+        let age_secs = (Utc::now().timestamp_millis() - newest_ms) as f64 / 1000.0;
+        ::metrics::gauge!("oracle_cache_freshness_seconds").set(age_secs);
+    }
     Json(StatusResponse {
         signer: format!("{:?}", state.signer.address()),
         configured_symbols: state.configured_symbols.clone(),
@@ -185,6 +189,15 @@ async fn post_signed_context_v1(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
+    let result = post_signed_context_v1_inner(state, body).await;
+    record_request_outcome("v1", &result);
+    result
+}
+
+async fn post_signed_context_v1_inner(
+    state: Arc<AppState>,
+    body: Bytes,
+) -> Result<axum::Json<Vec<oracle::OracleResponse>>, AppError> {
     let requests = decode_request_body(&body)?;
 
     if requests.is_empty() {
@@ -282,7 +295,9 @@ async fn post_signed_context_v2(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    post_signed_context_session(state, body, SessionSchema::V2).await
+    let result = post_signed_context_session(state, body, SessionSchema::V2).await;
+    record_request_outcome("v2", &result);
+    result
 }
 
 /// v3 handler — `/context/v3` endpoint. Same request shape and
@@ -293,7 +308,31 @@ async fn post_signed_context_v3(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    post_signed_context_session(state, body, SessionSchema::V3).await
+    let result = post_signed_context_session(state, body, SessionSchema::V3).await;
+    record_request_outcome("v3", &result);
+    result
+}
+
+/// Record a `/context/v{N}` request's outcome on the `oracle_context_request_total`
+/// counter. `outcome` labels split into `ok` (signed responses returned),
+/// `empty` (no requests in the body — Raindex's quote crate posts an empty
+/// batch when an order's IO list is empty), and `error` (any `AppError`).
+/// Keep the labels stable — the obs dashboard joins on these.
+fn record_request_outcome(
+    endpoint: &'static str,
+    result: &Result<axum::Json<Vec<oracle::OracleResponse>>, AppError>,
+) {
+    let outcome = match result {
+        Ok(json) if json.0.is_empty() => "empty",
+        Ok(_) => "ok",
+        Err(_) => "error",
+    };
+    ::metrics::counter!(
+        "oracle_context_request_total",
+        "endpoint" => endpoint,
+        "outcome" => outcome,
+    )
+    .increment(1);
 }
 
 /// v4 handler — `/context/v4` endpoint. Same request shape and
