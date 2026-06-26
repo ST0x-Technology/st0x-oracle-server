@@ -69,63 +69,6 @@ ssh root@st0x-obs curl -s http://st0x-pricing:8080/status
 
 ---
 
-## Alert: `OracleParityDriftSustained` (critical, parity window only)
-
-**Symptom.** Diff observer reports |drift| > 50 bps for a particular
-`(symbol, direction)` for ≥ 10 min. Public-ingress cutover is now blocked —
-investigate before flipping Raindex consumers.
-
-**Diagnose.**
-
-```bash
-# 1. Which (symbol, direction) is drifting?
-ssh root@st0x-oracle-server journalctl -u st0x-oracle-diff-observer --since '15m ago' -g 'basis_points'
-
-# 2. Probe both URLs by hand with the same body:
-# (replace COIN's address with the affected token; USDC is the implicit other side)
-nix develop -c cargo run --release --example probe_local -- --base-url https://st0x-oracle.fly.dev
-nix develop -c cargo run --release --example probe_local -- --base-url http://st0x-oracle-server:3000
-
-# 3. Check pricing-service for the same symbol — drift on the DO side
-#    almost always traces back to a pricing-side change.
-ssh root@st0x-obs curl -s 'http://st0x-pricing:8080/snapshot' | jq '.prices[] | select(.asset == "COIN")'
-```
-
-**Fix.**
-
-- Drift traces to a pricing-side spread change → expected. Confirm with the
-  pricing maintainer that the new spread is intentional and stay-side. If yes,
-  retire the alert (the cutover is still safe; legacy Fly oracle is the stale
-  one).
-- Drift traces to an oracle-side regression (recent deploy, code change touched
-  signing, etc.) → revert the last `deploy-service st0x-oracle-server`.
-- Drift is real and persistent on both sides → escalate. Don't cutover.
-
----
-
-## Alert: `OracleParityProbeFailing` (warning, parity window only)
-
-**Symptom.** Observer can't reach one or both `/context/v1` endpoints for 15 min
-straight. The drift gauge is unreliable until both sides respond.
-
-**Diagnose.**
-
-```bash
-ssh root@st0x-oracle-server journalctl -u st0x-oracle-diff-observer --since '20m ago' -p err
-# Manual probe:
-ssh root@st0x-oracle-server curl -sS -X POST https://st0x-oracle.fly.dev/context/v1 -H 'content-type: application/octet-stream' --data-binary @/tmp/test-body
-ssh root@st0x-oracle-server curl -sS -X POST http://localhost:3000/context/v1 -H 'content-type: application/octet-stream' --data-binary @/tmp/test-body
-```
-
-**Fix.**
-
-- Fly side unreachable → Fly outage; usually heals itself in minutes.
-- DO side unreachable → see `OracleDown` runbook above.
-- Both sides unreachable → the observer's NIC / tailnet binding is broken;
-  restart `systemctl restart st0x-oracle-diff-observer`.
-
----
-
 ## Manual ops
 
 ### Restart the oracle (no code change)
@@ -145,18 +88,6 @@ ssh root@st0x-oracle-server systemctl restart st0x-oracle-server
 
 ### Stop alerting during a planned cutover
 
-Silence the parity-window alerts via Alertmanager UI
+Silence the oracle alerts via Alertmanager UI
 (`http://st0x-obs:9093/#/silences`) before flipping the public DNS record. Set
 TTL = the expected cutover window + a small buffer.
-
-### Retire the diff observer
-
-When the parity window is signed off:
-
-1. In `st0x-oracle-server`'s `services.nix`, flip
-   `st0x-oracle-diff-observer.enabled = false`.
-2. Commit + PR + deploy. The systemd unit goes away; the obs scrape job's `up`
-   flips to 0 (which is now the wanted state, so silence the resulting alert
-   until the next deploy of the obs droplet drops the scrape job entirely).
-3. Open a follow-up obs-repo PR removing the `st0x-oracle-diff-observer` scrape
-   job + alerts.

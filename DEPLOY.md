@@ -7,11 +7,9 @@ and
 [`st0x.pricing`](https://github.com/ST0x-Technology/st0x.pricing/blob/master/DEPLOY.md)
 flows — same toolchain, same templates.
 
-**Cutover note:** until the parity window proves the new droplet serves the same
-prices as the Fly deployment, this droplet is **Tailnet-only** — no public
-ingress. Raindex consumers continue to hit the Fly URL; the diff observer (PR 3)
-reaches both over the tailnet. The public-ingress cutover is a separate later
-PR.
+**Cutover note:** this droplet is **Tailnet-only** — no public ingress yet.
+Raindex consumers continue to hit the Fly URL. The public-ingress cutover (open
+443, Caddy reverse proxy, DNS, TLS) is a separate later PR.
 
 ---
 
@@ -240,8 +238,8 @@ DigitalOcean droplet (NixOS) — Tailscale node `st0x-oracle-server`
   │    └─ Restart = always
   ├─ Outbound: st0x-pricing WS (Tailscale, MagicDNS) + Alpaca calendar
   │            endpoint (public broker-api.alpaca.markets, calendar only)
-  ├─ Inbound: HTTP /context/v[12] + /status + /metrics on tailnet only
-  │           (parity window); public ingress is a later cutover PR
+  ├─ Inbound: HTTP /context/v[123] + /status + /metrics on tailnet only
+  │           (public ingress is a later cutover PR)
   ├─ /mnt/data/st0x-oracle-server/logs/*.log (logrotate weekly, 14 retained)
   └─ Alloy → http://st0x-obs:3100/loki/api/v1/push (journald shipping)
 ```
