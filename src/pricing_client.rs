@@ -110,6 +110,20 @@ impl LiveClient {
         out
     }
 
+    /// Newest `source_ts_unix_ms` across all cached quotes. `None` if
+    /// the cache is empty (no `Price` frame received yet). Used by the
+    /// `oracle_cache_freshness_seconds` gauge: dashboard wants seconds
+    /// since the most-recently-refreshed quote, so the caller does
+    /// `now_ms - newest_source_ts` and divides by 1000.
+    pub async fn newest_source_ts_ms(&self) -> Option<i64> {
+        self.cache
+            .read()
+            .await
+            .values()
+            .map(|q| q.source_ts_unix_ms)
+            .max()
+    }
+
     /// Returns the set of subscribed symbols not yet seen on the wire.
     /// Used by /status so an operator can spot a half-warm cache without
     /// parsing logs.
@@ -133,6 +147,11 @@ async fn run_loop(cfg: LiveClientConfig, cache: Arc<RwLock<HashMap<Symbol, Quote
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Pricing WS session error; backoff {:?}", backoff);
+                ::metrics::counter!(
+                    "oracle_upstream_failure_total",
+                    "kind" => "pricing_ws",
+                )
+                .increment(1);
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, cfg.max_backoff);
             }
@@ -199,6 +218,11 @@ async fn connect_and_run(
                     }
                     ServerFrame::Error(e) => {
                         tracing::warn!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
+                        ::metrics::counter!(
+                            "oracle_upstream_failure_total",
+                            "kind" => "pricing_error_frame",
+                        )
+                        .increment(1);
                     }
                     ServerFrame::Ping(p) => {
                         let pong = ClientFrame::Pong(PongFrame {
