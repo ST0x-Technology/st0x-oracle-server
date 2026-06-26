@@ -402,10 +402,24 @@ fn resolve_pair_for_order(
 /// this request's swap direction. The pricing service emits both rates
 /// independently (each already incorporating the model's per-direction
 /// spread); the oracle never derives one from the other.
+///
+/// Raindex's `ratio` for an order is `input_amount / output_amount`
+/// (units of inputToken received per outputToken paid). Pricing-service
+/// rate naming is "Y per X" — `rate_base_to_quote` is *quote per base*
+/// and `rate_quote_to_base` is *base per quote*. So a `QuoteToBase`
+/// order (input=quote, output=base) needs `quote / base = rate_base_to_quote`,
+/// and a `BaseToQuote` order (input=base, output=quote) needs
+/// `base / quote = rate_quote_to_base`. Names look reversed at first
+/// glance — they refer to which side of the *order* is which, not which
+/// conversion direction.
+///
+/// Mismatching these silently flips the price by ~4 orders of magnitude;
+/// the parity-window diff observer caught this against the legacy Fly
+/// oracle on first probe (RAI-361).
 fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> [u8; 32] {
     match direction {
-        PriceDirection::QuoteToBase => quote.rate_quote_to_base.0,
-        PriceDirection::BaseToQuote => quote.rate_base_to_quote.0,
+        PriceDirection::QuoteToBase => quote.rate_base_to_quote.0,
+        PriceDirection::BaseToQuote => quote.rate_quote_to_base.0,
     }
 }
 
