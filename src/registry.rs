@@ -22,11 +22,15 @@ pub struct TokenRegistry {
 /// the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceDirection {
-    /// Input is USDC (quote), output is tStock (base) — i.e. the user
-    /// gives USDC to receive shares. Pick `rate_quote_to_base`.
+    /// Input is USDC (quote), output is tStock (base) — i.e. the order's
+    /// `validInputs[0] = USDC`, `validOutputs[0] = tStock`. Raindex
+    /// `ratio = input / output = quote / base`, so this picks
+    /// `rate_base_to_quote` (pricing-service convention: quote per base).
     QuoteToBase,
-    /// Input is tStock (base), output is USDC (quote) — i.e. the user
-    /// gives shares to receive USDC. Pick `rate_base_to_quote`.
+    /// Input is tStock (base), output is USDC (quote) — i.e. the order's
+    /// `validInputs[0] = tStock`, `validOutputs[0] = USDC`. Raindex
+    /// `ratio = input / output = base / quote`, so this picks
+    /// `rate_quote_to_base` (pricing-service convention: base per quote).
     BaseToQuote,
 }
 
