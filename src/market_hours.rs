@@ -277,6 +277,11 @@ pub fn spawn_market_hours_refresh(
             ticker.tick().await;
             if let Err(e) = refresh_once(&cache, &alpaca).await {
                 tracing::warn!(error = %e, "Market hours refresh failed; keeping previous cache");
+                ::metrics::counter!(
+                    "oracle_upstream_failure_total",
+                    "kind" => "alpaca_calendar",
+                )
+                .increment(1);
             }
         }
     });

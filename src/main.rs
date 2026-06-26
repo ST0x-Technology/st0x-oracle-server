@@ -1,11 +1,11 @@
 use clap::Parser;
 use st0x_oracle_server::alpaca::AlpacaClient;
-use st0x_oracle_server::cache::{poll_once, spawn_poll_loop, QuoteCache};
 use st0x_oracle_server::config::Config;
 use st0x_oracle_server::market_hours::{
     refresh_once, spawn_market_hours_refresh, MarketHoursCache,
 };
 use st0x_oracle_server::metrics::MetricsHandle;
+use st0x_oracle_server::pricing_client::{LiveClient, LiveClientConfig};
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::{create_app, AppState};
@@ -22,31 +22,30 @@ const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 #[command(name = "st0x-oracle-server")]
 #[command(about = "Signed context oracle server for st0x tokenized equities")]
 struct Cli {
-    /// Path to config.toml. Contains port, poll interval and token
-    /// registry — i.e. everything except secrets.
+    /// Path to config.toml. Contains port, pricing connection, and the
+    /// token registry — everything except secrets.
     #[arg(long, default_value = "config.toml", env = "CONFIG_PATH")]
     config: PathBuf,
 
-    /// Private key for EIP-191 signing (hex, with or without 0x prefix)
+    /// Private key for EIP-191 signing (hex, with or without 0x prefix).
     #[arg(long, env = "SIGNER_PRIVATE_KEY")]
     signer_private_key: String,
 
-    /// Alpaca Broker API key (used as HTTP Basic auth username).
-    /// We read reference prices from the issuer's brokerage positions,
-    /// so these are Broker API creds, not Market Data creds.
+    /// API key for the st0x.pricing WebSocket. Format
+    /// `pricing_<consumer>_<32 hex>`; consumer name must match the
+    /// `[pricing].consumer` value in config.toml.
+    #[arg(long, env = "PRICING_API_KEY")]
+    pricing_api_key: String,
+
+    /// Alpaca Broker API key id. Used only for the trading calendar
+    /// endpoint — the oracle no longer polls Alpaca for reference
+    /// prices (live quotes come from st0x.pricing).
     #[arg(long, env = "ALPACA_API_KEY_ID")]
     alpaca_api_key_id: String,
 
-    /// Alpaca Broker API secret (HTTP Basic auth password).
+    /// Alpaca Broker API secret.
     #[arg(long, env = "ALPACA_API_SECRET_KEY")]
     alpaca_api_secret_key: String,
-
-    /// Alpaca brokerage account ID whose positions back the oracle.
-    /// Must be the issuer's account that holds every symbol listed in
-    /// config.toml — startup will fail loud if any registered symbol
-    /// has no current position.
-    #[arg(long, env = "ALPACA_BROKER_ACCOUNT_ID")]
-    alpaca_broker_account_id: String,
 }
 
 #[tokio::main]
@@ -66,17 +65,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         config = %cli.config.display(),
         port = config.port,
-        poll_interval_secs = config.poll_interval_secs,
+        pricing_ws_url = %config.pricing.ws_url,
+        pricing_consumer = %config.pricing.consumer,
         token_count = config.tokens.len(),
         "Loaded config"
     );
 
     let signer = Signer::new(&cli.signer_private_key)?;
-    let alpaca = AlpacaClient::new(
-        &cli.alpaca_api_key_id,
-        &cli.alpaca_api_secret_key,
-        &cli.alpaca_broker_account_id,
-    );
+    let alpaca = AlpacaClient::new(&cli.alpaca_api_key_id, &cli.alpaca_api_secret_key);
 
     let registry = TokenRegistry::from_config(&config.tokens, USDC_BASE)?;
 
@@ -92,47 +88,23 @@ async fn main() -> anyhow::Result<()> {
             .join(", ")
     );
 
-    // Prime the cache synchronously before opening the socket so the
-    // first /context/v1 request doesn't race the poll loop. Missing
-    // symbols are logged loudly but no longer fatal: the server starts
-    // in a partial-serving state where healthy symbols quote normally
-    // and missing symbols return 503 at request time. /status exposes
-    // the missing set so monitoring can pick up the partial state. We
-    // chose this over the old hard-bail because the bail took the whole
-    // oracle down on the next Fly restart whenever any single position
-    // went to 0 — and the "alert" was the outage itself.
-    let cache = Arc::new(QuoteCache::new());
+    // Spawn the pricing WS subscriber. Connect / subscribe / cache is
+    // entirely background; we open the HTTP socket immediately and let
+    // the first /context/v1 request either find a warm quote or return
+    // 503 with a clear "no live quote yet" detail. The reconnect loop
+    // owns retry logic, so we don't gate startup on a successful
+    // connect — that would block boot on a transient pricing-service
+    // outage.
     let symbols = config.symbols();
-    tracing::info!("Priming quote cache with {} symbols...", symbols.len());
-    poll_once(&cache, &alpaca, &symbols).await;
-    let missing = cache.missing(&symbols).await;
-    if missing.is_empty() {
-        tracing::info!("Cache primed for all {} symbols", symbols.len());
-    } else {
-        for sym in &missing {
-            tracing::error!(
-                symbol = %sym,
-                "No broker position for configured symbol after initial poll. \
-                 /context/v1 will return 503 for requests resolving to this symbol \
-                 until the issuer acquires inventory or the symbol is removed from \
-                 config.toml. See /status for the current missing-symbol set."
-            );
-        }
-        tracing::warn!(
-            missing_count = missing.len(),
-            primed_count = symbols.len() - missing.len(),
-            total = symbols.len(),
-            "Starting in degraded mode. Healthy symbols quote normally; missing \
-             symbols return 503 at request time and appear in /status."
-        );
-    }
-
-    // Start background poller.
-    spawn_poll_loop(
-        cache.clone(),
-        alpaca.clone(),
+    let pricing = LiveClient::spawn(LiveClientConfig::new(
+        config.pricing.ws_url.clone(),
+        cli.pricing_api_key.clone(),
+        config.pricing.consumer.clone(),
         symbols.clone(),
-        Duration::from_secs(config.poll_interval_secs),
+    ));
+    tracing::info!(
+        symbol_count = symbols.len(),
+        "Spawned pricing WS subscriber (live quotes warm asynchronously)"
     );
 
     // Prime market hours (Alpaca trading calendar). Failure here isn't
@@ -156,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(3600),
     );
 
-    let state = AppState::new(signer, registry, cache, symbols, market_hours, metrics);
+    let state = AppState::new(signer, registry, pricing, symbols, market_hours, metrics);
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
