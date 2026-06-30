@@ -305,7 +305,7 @@ builder:
     "After session end"
   ),
 
-  dia-baseline: dia-price(dia-id oracle-price-timeout),
+  dia-baseline _: dia-price(dia-id oracle-price-timeout),
 
   /*
    * SAFETY GUARDS
@@ -373,7 +373,7 @@ builder:
     "After session end"
   ),
 
-  dia-baseline: dia-price(dia-id oracle-price-timeout),
+  dia-baseline _: dia-price(dia-id oracle-price-timeout),
 
   /* Guard: zero ratio */
   :ensure(
