@@ -19,7 +19,7 @@ scenarios:
       erc4626-words: 0x5cE811Ef462dfdFA823A8AA16333aaE4f69712fc
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
       oracle-schema-version: 3
-      baseline-fn: 'st0x-oracle-baseline-v3
+      baseline-fn: '''st0x-oracle-baseline-v3'
   st0x-oracle-baseline-dividends-sell:
     raindex: base
     rainlang: base
@@ -29,7 +29,7 @@ scenarios:
       erc4626-words: 0x5cE811Ef462dfdFA823A8AA16333aaE4f69712fc
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
       oracle-schema-version: 3
-      baseline-fn: 'st0x-oracle-baseline-dividends-sell
+      baseline-fn: '''st0x-oracle-baseline-dividends-sell'
   st0x-oracle-baseline-dividends-buy:
     raindex: base
     rainlang: base
@@ -39,7 +39,7 @@ scenarios:
       erc4626-words: 0x5cE811Ef462dfdFA823A8AA16333aaE4f69712fc
       oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
       oracle-schema-version: 3
-      baseline-fn: 'st0x-oracle-baseline-dividends-buy
+      baseline-fn: '''st0x-oracle-baseline-dividends-buy'
 
 deployments:
   base-st0x-baseline-v3:
