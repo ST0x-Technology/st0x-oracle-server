@@ -306,18 +306,10 @@ builder:
   ),
   _: 1;
 
-#dia-price-baseline
-price _: dia-price(dia-id oracle-price-timeout),
-_: price;
-
-#dia-price-baseline-inv
-price _: dia-price(dia-id oracle-price-timeout),
-_: inv(price);
-
 #st0x-dia-baseline-v3
   _: call<'st0x-session-guard-v3>(),
 
-  dia-baseline: call<'dia-price-baseline'>(),
+  dia-baseline: dia-price(dia-id oracle-price-timeout),
 
   /*
    * SAFETY GUARDS
@@ -347,7 +339,7 @@ _: inv(price);
 #st0x-dia-baseline-inv-v3
   _: call<'st0x-session-guard-v3>(),
 
-  dia-baseline: call<'dia-price-baseline'>(),
+  dia-baseline: dia-price(dia-id oracle-price-timeout),
 
   /* Guard: zero ratio */
   :ensure(
