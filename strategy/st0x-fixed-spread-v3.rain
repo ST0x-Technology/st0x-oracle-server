@@ -345,11 +345,19 @@ builder:
 #st0x-oracle-baseline-dividends-sell
   oracle-price: call<'st0x-oracle-baseline-v3>(),
   wrap-ratio: erc4626-convert-to-assets(output-token() 1),
+  :ensure(
+    greater-than(wrap-ratio 0)
+    "ERC4626 wrap ratio is zero"
+  ),
   _: mul(oracle-price wrap-ratio);
 
 #st0x-oracle-baseline-dividends-buy
   oracle-price: call<'st0x-oracle-baseline-v3>(),
   wrap-ratio: erc4626-convert-to-shares(input-token() 1),
+  :ensure(
+    greater-than(wrap-ratio 0)
+    "ERC4626 wrap ratio is zero"
+  ),
   _: mul(oracle-price wrap-ratio);
 
 #calculate-io
