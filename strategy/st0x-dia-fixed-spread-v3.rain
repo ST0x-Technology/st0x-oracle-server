@@ -252,7 +252,7 @@ builder:
 #max-price !Maximum acceptable DIA price. Orders revert above this. Catches overflow or encoding errors.
 
 
-#st0x-session-guard-v3
+#st0x-dia-baseline-v3
   /* Verify the signed context comes from the trusted st0x oracle signer */
   :ensure(
     equal-to(signer<0>() oracle-signer)
@@ -304,10 +304,6 @@ builder:
     less-than-or-equal-to(now() oracle-session-end)
     "After session end"
   ),
-  _: 1;
-
-#st0x-dia-baseline-v3
-  _: call<'st0x-session-guard-v3>(),
 
   dia-baseline: dia-price(dia-id oracle-price-timeout),
 
@@ -337,7 +333,45 @@ builder:
   _: dia-baseline;
 
 #st0x-dia-baseline-inv-v3
-  _: call<'st0x-session-guard-v3>(),
+  /* Verify the signed context comes from the trusted st0x oracle signer */
+  :ensure(
+    equal-to(signer<0>() oracle-signer)
+    "Untrusted oracle signer"
+  ),
+
+  oracle-version: signed-context<0 0>(),
+  :ensure(
+    equal-to(oracle-version oracle-schema-version)
+    "Oracle schema version mismatch"
+  ),
+
+  oracle-session: signed-context<0 3>(),
+  oracle-session-start: signed-context<0 4>(),
+  oracle-session-end: signed-context<0 5>(),
+
+  :ensure(
+    any(
+      every(
+        equal-to(allowed-session "all")
+        any(
+          equal-to(oracle-session "rth")
+          equal-to(oracle-session "premarket")
+          equal-to(oracle-session "afterhours")
+        )
+      )
+      equal-to(oracle-session allowed-session)
+    )
+    "Not in allowed market session"
+  ),
+
+  :ensure(
+    greater-than-or-equal-to(now() oracle-session-start)
+    "Before session start"
+  ),
+  :ensure(
+    less-than-or-equal-to(now() oracle-session-end)
+    "After session end"
+  ),
 
   dia-baseline: dia-price(dia-id oracle-price-timeout),
 
