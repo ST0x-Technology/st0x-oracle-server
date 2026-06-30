@@ -1,0 +1,380 @@
+version: 6
+
+orders:
+  base:
+    raindex: base
+    oracle-url: https://st0x-oracle-server.fly.dev/context/v3
+    inputs:
+      - token: input
+    outputs:
+      - token: output
+
+scenarios:
+  st0x-dia-baseline-v3:
+    raindex: base
+    rainlang: base
+    runs: 1
+    bindings:
+      raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
+      subparser-0: 0xb4bf51998aB1f1b733C9df4a06e131182dBDf447
+      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-schema-version: 3
+      baseline-fn: '''st0x-dia-baseline-v3'
+  st0x-dia-baseline-inv-v3:
+    raindex: base
+    rainlang: base
+    runs: 1
+    bindings:
+      raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
+      subparser-0: 0xb4bf51998aB1f1b733C9df4a06e131182dBDf447
+      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-schema-version: 3
+      baseline-fn: '''st0x-dia-baseline-inv-v3'
+
+deployments:
+  base-st0x-dia-v3:
+    order: base
+    scenario: st0x-dia-baseline-v3
+  base-st0x-dia-inv-v3:
+    order: base
+    scenario: st0x-dia-baseline-inv-v3
+
+builder:
+  name: St0x DIA fixed spread limit v3
+  description: https://raw.githubusercontent.com/rainlanguage/rain.strategies/e25bc4876b5ffb8bb28097b0ca66de291c75ff56/src/fixed-spread.md
+  short-description: >
+    A strategy where the ratio tracks a DIA benchmark price with a fixed
+    multiplier, gated on market session via the v3 oracle endpoint.
+  deployments:
+    base-st0x-dia-v3:
+      name: Base st0x DIA fixed spread v3
+      description: Deploy a DIA fixed-spread strategy on Base to sell shares.
+      deposits:
+        - token: output
+      fields:
+        - binding: allowed-session
+          name: Market session
+          description: >
+            Which market session this strategy will quote during. The
+            v3 oracle signs the current session into the context;
+            orders revert when the signed session does not match.
+            Choose a single session or all active sessions (pre-market,
+            regular hours, and after-hours). Overnight and weekend
+            closed sessions always revert.
+          default: '"rth"'
+          presets:
+            - name: Regular trading hours (09:30-16:00 ET)
+              value: '"rth"'
+            - name: Pre-market (04:00-09:30 ET)
+              value: '"premarket"'
+            - name: After-hours (16:00-20:00 ET)
+              value: '"afterhours"'
+            - name: All active sessions (pre-market, RTH, after-hours)
+              value: '"all"'
+        - binding: dia-id
+          name: Dia price feed pair
+          description: |
+            The Dia price feed pair to use for the auction.
+            This is used to determine the baseline and initial IO ratios for the auction.
+            For example, if you are selling WETH and buying USDC then you would use the WETH/USD price feed.
+          show-custom-field: false
+          presets:
+            - name: AMZN
+              value: '"AMZN"'
+            - name: TSLA
+              value: '"TSLA"'
+            - name: NVDA
+              value: '"NVDA"'
+            - name: COIN
+              value: '"COIN"'
+            - name: MSTR
+              value: '"MSTR"'
+        - binding: baseline-multiplier
+          name: Benchmark price multiplier
+          description: |
+            The multiplier to be applied to the benchmark when calculating the price the strategy will offer at
+          show-custom-field: true
+          default: 1.001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: oracle-price-timeout
+          name: Oracle Price Timeout
+          description: |
+            How fresh (recent) the DIA price is allowed to be, in seconds.
+          show-custom-field: true
+          default: 300
+          presets:
+            - name: 5 minutes (300)
+              value: 300
+            - name: 1 hour (3600)
+              value: 3600
+            - name: 8 hour (28800)
+              value: 28800
+            - name: 3 days (259200)
+              value: 259200
+        - binding: min-price
+          name: Minimum Price
+          description: >
+            Floor price as a safety guard. If the DIA oracle returns a price
+            below this, the order reverts. Protects against catastrophic
+            mispricings or broken oracle data. Set based on the asset -
+            e.g. 0.01 for penny stocks, 10 for blue chips.
+          default: 0.01
+          min: 0.000001
+        - binding: max-price
+          name: Maximum Price
+          description: >
+            Ceiling price as a safety guard. If the DIA oracle returns a
+            price above this, the order reverts. Protects against
+            overflow or encoding errors. Set generously above the
+            asset's expected range.
+          default: 100000
+          min: 1
+      select-tokens:
+        - key: output
+          name: Token to Sell
+          description: Select the tStock you want to sell (e.g. wtCOIN)
+        - key: input
+          name: Token to Buy
+          description: Select USDC as the token you want to receive
+    base-st0x-dia-inv-v3:
+      name: Base st0x DIA fixed spread v3 (buy)
+      description: Deploy a DIA fixed-spread strategy on Base to buy shares.
+      deposits:
+        - token: output
+      fields:
+        - binding: allowed-session
+          name: Market session
+          description: >
+            Which market session this strategy will quote during. The
+            v3 oracle signs the current session into the context;
+            orders revert when the signed session does not match.
+            Choose a single session or all active sessions (pre-market,
+            regular hours, and after-hours). Overnight and weekend
+            closed sessions always revert.
+          default: '"rth"'
+          presets:
+            - name: Regular trading hours (09:30-16:00 ET)
+              value: '"rth"'
+            - name: Pre-market (04:00-09:30 ET)
+              value: '"premarket"'
+            - name: After-hours (16:00-20:00 ET)
+              value: '"afterhours"'
+            - name: All active sessions (pre-market, RTH, after-hours)
+              value: '"all"'
+        - binding: dia-id
+          name: Dia price feed pair
+          description: |
+            The Dia price feed pair to use for the auction.
+            This is used to determine the baseline and initial IO ratios for the auction.
+            For example, if you are buying shares and selling USDC then you would use the share/USD price feed.
+          show-custom-field: false
+          presets:
+            - name: AMZN
+              value: '"AMZN"'
+            - name: TSLA
+              value: '"TSLA"'
+            - name: NVDA
+              value: '"NVDA"'
+            - name: COIN
+              value: '"COIN"'
+            - name: MSTR
+              value: '"MSTR"'
+        - binding: baseline-multiplier
+          name: Benchmark price multiplier
+          description: |
+            The multiplier to be applied to the benchmark when calculating the price the strategy will offer at
+          show-custom-field: true
+          default: 1.001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: oracle-price-timeout
+          name: Oracle Price Timeout
+          description: |
+            How fresh (recent) the DIA price is allowed to be, in seconds.
+          show-custom-field: true
+          default: 300
+          presets:
+            - name: 5 minutes (300)
+              value: 300
+            - name: 1 hour (3600)
+              value: 3600
+            - name: 8 hour (28800)
+              value: 28800
+            - name: 3 days (259200)
+              value: 259200
+        - binding: min-price
+          name: Minimum Price
+          description: >
+            Floor price as a safety guard. If the DIA oracle returns a price
+            below this, the order reverts. Protects against catastrophic
+            mispricings or broken oracle data. Set based on the asset -
+            e.g. 0.01 for penny stocks, 10 for blue chips.
+          default: 0.01
+          min: 0.000001
+        - binding: max-price
+          name: Maximum Price
+          description: >
+            Ceiling price as a safety guard. If the DIA oracle returns a
+            price above this, the order reverts. Protects against
+            overflow or encoding errors. Set generously above the
+            asset's expected range.
+          default: 100000
+          min: 1
+      select-tokens:
+        - key: output
+          name: Token to Sell
+          description: Select USDC as the token you want to sell
+        - key: input
+          name: Token to Buy
+          description: Select the tStock you want to buy (e.g. wtCOIN)
+---
+#raindex-subparser !Raindex subparser.
+#subparser-0 !Subparser 0 (DIA price feeds).
+#oracle-signer !The trusted signer address for the st0x oracle server.
+#baseline-fn !Function that returns the benchmark IO (e.g. st0x-dia-baseline-v3).
+#baseline-multiplier !WAD multiplier to apply to the baseline (e.g. 1.001).
+#oracle-schema-version !Expected oracle context schema version (= 3 for v3).
+#allowed-session !Market-session filter (Rain string literal). Use the "rth", "premarket", or "afterhours" presets for a single session, or "all" for pre+RTH+post.
+#dia-id !The dia id to use for the price feed.
+#oracle-price-timeout !Fetch price no older than for dia oracle in seconds.
+#min-price !Minimum acceptable DIA price. Orders revert below this. Catches catastrophic mispricings.
+#max-price !Maximum acceptable DIA price. Orders revert above this. Catches overflow or encoding errors.
+
+
+#st0x-session-guard-v3
+  /* Verify the signed context comes from the trusted st0x oracle signer */
+  :ensure(
+    equal-to(signer<0>() oracle-signer)
+    "Untrusted oracle signer"
+  ),
+
+  /* Schema version guard
+  * If the server ever changes the v3 layout, live orders must
+  * revert instead of misreading slots. */
+  oracle-version: signed-context<0 0>(),
+  :ensure(
+    equal-to(oracle-version oracle-schema-version)
+    "Oracle schema version mismatch"
+  ),
+
+  /* Read the market session this quote was signed during. */
+  oracle-session: signed-context<0 3>(),
+
+  /* Read the UTC start and end of that current session. */
+  oracle-session-start: signed-context<0 4>(),
+  oracle-session-end: signed-context<0 5>(),
+
+  /* Session guard. When `allowed-session` is the deployer-only "all"
+   * sentinel, accept pre-market, RTH, or after-hours. Otherwise
+   * require an exact match to the chosen session. Overnight/weekend
+   * closed sessions always revert. */
+  :ensure(
+    any(
+      every(
+        equal-to(allowed-session "all")
+        any(
+          equal-to(oracle-session "rth")
+          equal-to(oracle-session "premarket")
+          equal-to(oracle-session "afterhours")
+        )
+      )
+      equal-to(oracle-session allowed-session)
+    )
+    "Not in allowed market session"
+  ),
+
+  /* Chain-time bounds: block.timestamp must fall inside the session
+   * window the oracle stamped. */
+  :ensure(
+    greater-than-or-equal-to(now() oracle-session-start)
+    "Before session start"
+  ),
+  :ensure(
+    less-than-or-equal-to(now() oracle-session-end)
+    "After session end"
+  ),
+  _: 1;
+
+#dia-price-baseline
+price _: dia-price(dia-id oracle-price-timeout),
+_: price;
+
+#dia-price-baseline-inv
+price _: dia-price(dia-id oracle-price-timeout),
+_: inv(price);
+
+#st0x-dia-baseline-v3
+  _: call<'st0x-session-guard-v3>(),
+
+  dia-baseline: call<'dia-price-baseline'>(),
+
+  /*
+   * SAFETY GUARDS
+   * These protect against bugs, malformed oracle data, or server mishaps.
+   * They are NOT market risk controls - session gating already handles that.
+   */
+
+  /* Guard: zero ratio */
+  :ensure(
+    greater-than(dia-baseline 0)
+    "Oracle price is zero"
+  ),
+
+  /* Guard: minimum price bound */
+  :ensure(
+    greater-than(dia-baseline min-price)
+    "Price below minimum bound"
+  ),
+
+  /* Guard: maximum price bound */
+  :ensure(
+    less-than(dia-baseline max-price)
+    "Price above maximum bound"
+  ),
+  _: dia-baseline;
+
+#st0x-dia-baseline-inv-v3
+  _: call<'st0x-session-guard-v3>(),
+
+  dia-baseline: call<'dia-price-baseline'>(),
+
+  /* Guard: zero ratio */
+  :ensure(
+    greater-than(dia-baseline 0)
+    "Oracle price is zero"
+  ),
+
+  /* Guard: minimum price bound */
+  :ensure(
+    greater-than(dia-baseline min-price)
+    "Price below minimum bound"
+  ),
+
+  /* Guard: maximum price bound */
+  :ensure(
+    less-than(dia-baseline max-price)
+    "Price above maximum bound"
+  ),
+  _: inv(dia-baseline);
+
+#calculate-io
+using-words-from raindex-subparser subparser-0
+offer-amount: max-positive-value(),
+io: mul(call<'baseline-fn>() baseline-multiplier);
+
+#handle-io
+:;
+
+#handle-add-order
+:;
