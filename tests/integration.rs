@@ -590,6 +590,146 @@ async fn test_v3_single_returns_v3_schema_with_v3_session_encoding() {
 }
 
 #[tokio::test]
+async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
+    // /context/v4's whole reason for existing: the signed context binds
+    // the raw input/output token addresses so an attacker can't reuse a
+    // frame across pairs. This test asserts that binding is byte-exact:
+    // the caller's USDC + WCOIN come back at slot 6 and slot 7 with
+    // Ethereum's Address→bytes32 left-padding.
+    let mh = always_in_session_market_hours().await;
+    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v4")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(responses.len(), 1);
+    let resp = &responses[0];
+    assert_eq!(resp.context.len(), 8, "v4 must emit 8 context elements");
+
+    // schema_version = 4
+    let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
+    assert_eq!(version.format().unwrap(), "4");
+
+    // session tag still uses V3 IntOrAString (same shape as v3's slot 3)
+    // — v4 only adds tokens, it doesn't renegotiate session encoding.
+    let sess = resp.context[3].as_slice();
+    assert_eq!(sess[31], 0xe3, "byte 31 must be 0xe0 | 3");
+    assert_eq!(&sess[28..31], b"rth");
+
+    // Slot 6: input token = USDC, left-padded with 12 zero bytes.
+    let usdc_addr: alloy::primitives::Address = std::str::FromStr::from_str(USDC).unwrap();
+    let expected_input =
+        alloy::primitives::FixedBytes::<32>::left_padding_from(usdc_addr.as_slice());
+    assert_eq!(
+        resp.context[6], expected_input,
+        "slot 6 must equal left-padded input token (USDC)"
+    );
+
+    // Slot 7: output token = WCOIN, left-padded with 12 zero bytes.
+    let wcoin_addr: alloy::primitives::Address = std::str::FromStr::from_str(WCOIN).unwrap();
+    let expected_output =
+        alloy::primitives::FixedBytes::<32>::left_padding_from(wcoin_addr.as_slice());
+    assert_eq!(
+        resp.context[7], expected_output,
+        "slot 7 must equal left-padded output token (WCOIN)"
+    );
+
+    // The first 12 bytes of each token slot must be zero: a strategy
+    // that compares against `bytes32(uint160(address))` expects that
+    // convention, so anything nonzero in the padding would silently
+    // break equality.
+    for slot in [6, 7] {
+        let bytes = resp.context[slot].as_slice();
+        assert!(
+            bytes[..12].iter().all(|&b| b == 0),
+            "slot {slot} padding must be zero: {:?}",
+            &bytes[..12]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_v4_rejects_the_swapped_token_attack() {
+    // The scenario v4 exists to prevent: an attacker submits a signed
+    // context whose IO tokens don't match the running order. This test
+    // proves the tokens the signer commits to *are* the ones the caller
+    // sent — an on-chain byte-for-byte check against the order's IO
+    // therefore cannot be satisfied by a frame signed for a different
+    // pair. Signing itself is unconditional (an attacker can always
+    // get *a* frame for the pair they submit); the strategy's equality
+    // check on slots 6/7 is what closes the loophole.
+    //
+    // Scenario: victim has an order with IO = (USDC, WCOIN). An attacker
+    // asks the oracle for a frame targeting the SWAPPED pair (WCOIN, USDC)
+    // and tries to submit that as calldata against the victim order.
+    // The returned frame's slots 6/7 bind to what the attacker asked
+    // for, not to what the victim order will read on-chain — so the
+    // v4 strategy's `equal-to(signed-context<0 6> input-token())`
+    // check fails and the order reverts.
+    let mh = always_in_session_market_hours().await;
+    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+
+    // Attacker requests: input = WCOIN, output = USDC (swapped from the
+    // victim's (USDC, WCOIN) IO).
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v4")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(WCOIN, USDC)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let resp = &responses[0];
+
+    let usdc_addr: alloy::primitives::Address = std::str::FromStr::from_str(USDC).unwrap();
+    let wcoin_addr: alloy::primitives::Address = std::str::FromStr::from_str(WCOIN).unwrap();
+
+    // Signed slots reflect the attacker's swapped request, verbatim.
+    assert_eq!(
+        resp.context[6],
+        alloy::primitives::FixedBytes::<32>::left_padding_from(wcoin_addr.as_slice())
+    );
+    assert_eq!(
+        resp.context[7],
+        alloy::primitives::FixedBytes::<32>::left_padding_from(usdc_addr.as_slice())
+    );
+
+    // ...which means they do NOT match the victim order's `input-token()`
+    // (USDC) / `output-token()` (WCOIN). Those two `assert_ne!`s are the
+    // heart of the security property: the v4 strategy's on-chain
+    // `equal-to(signed-context<0 6> input-token())` check must fail
+    // against this frame, so the swapped-frame attack reverts.
+    assert_ne!(
+        resp.context[6],
+        alloy::primitives::FixedBytes::<32>::left_padding_from(usdc_addr.as_slice()),
+        "slot 6 must NOT match the victim order's input-token (USDC)"
+    );
+    assert_ne!(
+        resp.context[7],
+        alloy::primitives::FixedBytes::<32>::left_padding_from(wcoin_addr.as_slice()),
+        "slot 7 must NOT match the victim order's output-token (WCOIN)"
+    );
+}
+
+#[tokio::test]
 async fn test_v2_and_v3_session_slot_differ_byte_for_byte() {
     // Same request hitting both endpoints with the same session must
     // produce different slot-3 layouts: V1 byte-0 vs V3 byte-31. This

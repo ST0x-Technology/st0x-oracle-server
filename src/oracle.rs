@@ -25,6 +25,26 @@ pub const SCHEMA_VERSION_V2: u64 = 2;
 /// `LibIntOrAString::fromStringV3`).
 pub const SCHEMA_VERSION_V3: u64 = 3;
 
+/// Schema version emitted by `/context/v4`. Extends v3 by binding the
+/// signed price to the specific `(input_token, output_token)` pair the
+/// caller requested it for. Appends two extra slots after the v3 shape:
+///
+/// - `context[6]`: input token address (bytes32, Address left-padded)
+/// - `context[7]`: output token address (bytes32, Address left-padded)
+///
+/// Without this binding the signer commits to a numeric price + time
+/// only — an attacker holding a valid signed frame for `(A,B)` could
+/// stuff it into an order whose IO is `(C,D)` and (if the strategy's
+/// `min-price`/`max-price` bands overlap) execute at the wrong ratio.
+/// v4 strategies MUST assert
+/// `equal-to(signed-context<0 6>, input-token())` and
+/// `equal-to(signed-context<0 7>, output-token())` to close the gap.
+/// `input-token` / `output-token` are the rain.orderbook subparser
+/// context words (see `LibRaindexSubParser.sol`), NOT `order-*` — the
+/// canonical spelling matters because Rainlang doesn't fall back on
+/// alias names.
+pub const SCHEMA_VERSION_V4: u64 = 4;
+
 /// Oracle response matching Rain's SignedContextV1 format.
 /// The JSON array shape of this struct is what upstream
 /// `rain.orderbook/crates/quote/src/oracle.rs` expects to deserialize.
@@ -210,6 +230,56 @@ pub fn build_context_v3(
         session_end,
         inverted,
     )
+}
+
+/// Build the v4 signed-context array. Same first six slots as v3,
+/// plus the caller-supplied `input_token` / `output_token` at slots
+/// 6 and 7 respectively. Both addresses are the exact bytes the
+/// caller sent in `validInputs[input_io_index].token` /
+/// `validOutputs[output_io_index].token` — no server-side rewriting,
+/// no normalisation, so the strategy's byte-for-byte equality check
+/// against the running order's IO addresses is meaningful.
+///
+/// Layout:
+/// - `context[0]`: schema version (= 4)
+/// - `context[1]`: price (Rain Float; mark for buys, 1/mark for sells)
+/// - `context[2]`: publish_time (Rain Float, Unix seconds)
+/// - `context[3]`: session tag (Rain IntOrAString V3 — same encoding as v3)
+/// - `context[4]`: session_start (Rain Float, Unix seconds)
+/// - `context[5]`: session_end (Rain Float, Unix seconds)
+/// - `context[6]`: input_token address (bytes32, Address left-padded)
+/// - `context[7]`: output_token address (bytes32, Address left-padded)
+///
+/// `input_token` / `output_token` follow Ethereum's Address→bytes32
+/// convention: 12 bytes of zero followed by the 20-byte address, so a
+/// Rainlang `equal-to(signed-context<0 6> input-token())` comparison
+/// against a `bytes32(uint160(address))`-widened order IO address
+/// matches with no extra masking.
+#[allow(clippy::too_many_arguments)]
+pub fn build_context_v4(
+    price: f64,
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    input_token: Address,
+    output_token: Address,
+    inverted: bool,
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    let mut ctx = build_session_context(
+        SCHEMA_VERSION_V4,
+        price,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        inverted,
+    )?;
+    let input_b32 = FixedBytes::<32>::left_padding_from(input_token.as_slice());
+    let output_b32 = FixedBytes::<32>::left_padding_from(output_token.as_slice());
+    ctx.push(input_b32);
+    ctx.push(output_b32);
+    Ok(ctx)
 }
 
 /// Format an f64 price as a string suitable for Float::parse.
