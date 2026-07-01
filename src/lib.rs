@@ -105,6 +105,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/context/v1", post(post_signed_context_v1))
         .route("/context/v2", post(post_signed_context_v2))
         .route("/context/v3", post(post_signed_context_v3))
+        .route("/context/v4", post(post_signed_context_v4))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -274,6 +275,120 @@ async fn post_signed_context_v3(
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     post_signed_context_session(state, body, SessionSchema::V3).await
+}
+
+/// v4 handler — `/context/v4` endpoint. Same request shape and
+/// snapshot-once batching as v2/v3, plus the caller's raw
+/// `validInputs[input_io_index].token` /
+/// `validOutputs[output_io_index].token` addresses are stamped into
+/// signed-context slots 6 and 7 respectively.
+///
+/// The security property: a v4 strategy that asserts
+/// `equal-to(signed-context<0 6> input-token()) &&
+/// equal-to(signed-context<0 7> output-token())` can no longer be
+/// tricked into applying a signed price for pair `(A,B)` against an
+/// order whose IO pair is `(C,D)`. See `oracle::SCHEMA_VERSION_V4`
+/// for the full context layout.
+async fn post_signed_context_v4(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let requests = decode_request_body(&body)?;
+
+    if requests.is_empty() {
+        return Ok(Json(Vec::<oracle::OracleResponse>::new()));
+    }
+
+    // Same resolution + batching shape as v2/v3, but also keep the raw
+    // input_token/output_token per request so we can bind them into the
+    // signed context — that binding is the whole point of v4.
+    let mut resolved: Vec<(Address, Address, ResolvedPair)> = Vec::with_capacity(requests.len());
+    for (order, input_io_index, output_io_index, _counterparty) in requests {
+        let (input_token, output_token) = io_tokens_for(&order, input_io_index, output_io_index)?;
+        let pair = state
+            .registry
+            .resolve(input_token, output_token)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        tracing::info!(
+            symbol = %pair.symbol,
+            inverted = pair.inverted,
+            input = %input_token,
+            output = %output_token,
+            schema = "v4",
+            "Oracle request"
+        );
+        resolved.push((input_token, output_token, pair));
+    }
+
+    let needed_symbols: Vec<&str> = resolved.iter().map(|(_, _, p)| p.symbol.as_str()).collect();
+    let snapshot = state.cache.snapshot_many(&needed_symbols).await;
+
+    let now = Utc::now();
+    let publish_dt = state.market_hours.publish_time_for(now).await;
+    let session_info = state.market_hours.session_info_for(now).await;
+
+    let mut responses = Vec::with_capacity(resolved.len());
+    for (input_token, output_token, pair) in &resolved {
+        let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
+            AppError::Unavailable(format!(
+                "No cached quote for {} yet. The poll loop has not succeeded since startup.",
+                pair.symbol
+            ))
+        })?;
+        let resp = build_response_from_quote_v4(
+            &state,
+            pair,
+            &quote,
+            *input_token,
+            *output_token,
+            publish_dt,
+            &session_info,
+        )
+        .await?;
+        responses.push(resp);
+    }
+
+    Ok(Json(responses))
+}
+
+/// Extract the raw `(input_token, output_token)` addresses that the
+/// caller nominated in this request's `OrderV4`. Same bounds checks
+/// as `resolve_pair_for_order`, minus the registry lookup — the two
+/// helpers pull from the same source but v4 keeps the addresses even
+/// after they've been resolved to a symbol.
+fn io_tokens_for(
+    order: &OrderV4,
+    input_io_index: alloy::primitives::U256,
+    output_io_index: alloy::primitives::U256,
+) -> Result<(Address, Address), AppError> {
+    let input_idx: usize = input_io_index.try_into().unwrap_or(usize::MAX);
+    let output_idx: usize = output_io_index.try_into().unwrap_or(usize::MAX);
+
+    let input_token = order
+        .validInputs
+        .get(input_idx)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Invalid input IO index: {} (order has {} inputs)",
+                input_idx,
+                order.validInputs.len()
+            ))
+        })?
+        .token;
+
+    let output_token = order
+        .validOutputs
+        .get(output_idx)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Invalid output IO index: {} (order has {} outputs)",
+                output_idx,
+                order.validOutputs.len()
+            ))
+        })?
+        .token;
+
+    Ok((input_token, output_token))
 }
 
 /// Shared body for `/context/v2` and `/context/v3`. Same orderbook
@@ -489,6 +604,74 @@ async fn build_response_from_quote_session(
         schema.encode_session(session_info.session),
         session_start,
         session_end,
+        pair.inverted,
+    )?;
+    let (signature, signer) = state.signer.sign_context(&context).await?;
+
+    Ok(oracle::OracleResponse {
+        signer,
+        context,
+        signature,
+    })
+}
+
+/// v4 response builder. Same price + publish_time + session-bounds logic
+/// as v3's `build_response_from_quote_session`, plus the caller's raw
+/// input/output token addresses stamped into signed-context slots 6 and
+/// 7 (see `oracle::build_context_v4` for the layout).
+async fn build_response_from_quote_v4(
+    state: &AppState,
+    pair: &ResolvedPair,
+    quote: &crate::alpaca::QuoteData,
+    input_token: Address,
+    output_token: Address,
+    publish_dt: chrono::DateTime<Utc>,
+    session_info: &crate::market_hours::SessionInfo,
+) -> Result<oracle::OracleResponse, AppError> {
+    if quote.price <= 0.0 {
+        return Err(AppError::BadRequest(format!(
+            "Zero or negative broker mark for {} (price={}). Market may be closed or data is bad.",
+            pair.symbol, quote.price
+        )));
+    }
+
+    let publish_time: u64 = publish_dt
+        .timestamp()
+        .try_into()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
+    let session_start: u64 = session_info
+        .start
+        .timestamp()
+        .try_into()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("session_start out of range")))?;
+    let session_end: u64 = session_info
+        .end
+        .timestamp()
+        .try_into()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
+
+    tracing::info!(
+        symbol = %pair.symbol,
+        price = quote.price,
+        inverted = pair.inverted,
+        schema = "v4",
+        input = %input_token,
+        output = %output_token,
+        publish_time = publish_time,
+        session = session_info.session.as_str(),
+        session_start = session_start,
+        session_end = session_end,
+        "Building v4 signed context from cache"
+    );
+
+    let context = oracle::build_context_v4(
+        quote.price,
+        publish_time,
+        session_info.session.to_bytes32_v3(),
+        session_start,
+        session_end,
+        input_token,
+        output_token,
         pair.inverted,
     )?;
     let (signature, signer) = state.signer.sign_context(&context).await?;

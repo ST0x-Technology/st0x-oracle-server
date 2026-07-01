@@ -1,0 +1,234 @@
+version: 6
+
+orders:
+  base:
+    raindex: base
+    oracle-url: https://st0x-oracle-server.fly.dev/context/v4
+    inputs:
+      - token: input
+    outputs:
+      - token: output
+
+scenarios:
+  st0x-oracle-baseline-v4:
+    raindex: base
+    rainlang: base
+    runs: 1
+    bindings:
+      raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
+      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-schema-version: 4
+
+deployments:
+  base-st0x-baseline-v4:
+    order: base
+    scenario: st0x-oracle-baseline-v4
+
+builder:
+  name: St0x fixed spread limit v4
+  description: https://raw.githubusercontent.com/rainlanguage/rain.strategies/e25bc4876b5ffb8bb28097b0ca66de291c75ff56/src/fixed-spread.md
+  short-description: >
+    A strategy where the ratio tracks a benchmark price with a fixed
+    multiplier, gated on market session AND pair-bound via the v4
+    oracle endpoint (the signed frame is checked byte-for-byte against
+    the running order's input/output token addresses so cross-pair
+    signature replay is impossible).
+  deployments:
+    base-st0x-baseline-v4:
+      name: Base st0x fixed spread v4
+      description: Deploy a fixed-spread strategy on Base, pair-bound to the deployed IO pair.
+      deposits:
+        - token: output
+      fields:
+        - binding: allowed-session
+          name: Market session
+          description: >
+            Which market session this strategy will quote during. The
+            v4 oracle signs the current session into the context;
+            orders revert when the signed session does not match.
+            Choose a single session or all active sessions (pre-market,
+            regular hours, and after-hours). Overnight and weekend
+            closed sessions always revert.
+          default: '"rth"'
+          presets:
+            - name: Regular trading hours (09:30-16:00 ET)
+              value: '"rth"'
+            - name: Pre-market (04:00-09:30 ET)
+              value: '"premarket"'
+            - name: After-hours (16:00-20:00 ET)
+              value: '"afterhours"'
+            - name: All active sessions (pre-market, RTH, after-hours)
+              value: '"all"'
+        - binding: baseline-multiplier
+          name: Benchmark price multiplier
+          description: |
+            The multiplier to be applied to the benchmark when calculating the price the strategy will offer at
+          show-custom-field: true
+          default: 1.001
+          min: 0.000001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: min-price
+          name: Minimum Price
+          description: >
+            Floor price as a safety guard. If the oracle returns a price
+            below this, the order reverts. Protects against catastrophic
+            mispricings or broken oracle data. Set based on the asset -
+            e.g. 0.01 for penny stocks, 10 for blue chips.
+          default: 0.01
+          min: 0.000001
+        - binding: max-price
+          name: Maximum Price
+          description: >
+            Ceiling price as a safety guard. If the oracle returns a
+            price above this, the order reverts. Protects against
+            overflow or encoding errors. Set generously above the
+            asset's expected range.
+          default: 100000
+          min: 1
+      select-tokens:
+        - key: output
+          name: Token to Sell
+          description: Select the tStock you want to sell (e.g. wtCOIN)
+        - key: input
+          name: Token to Buy
+          description: Select USDC as the token you want to receive
+---
+#raindex-subparser !Raindex subparser.
+#oracle-signer !The trusted signer address for the st0x oracle server.
+#baseline-multiplier !WAD multiplier to apply to the baseline (e.g. 1.001).
+#oracle-schema-version !Expected oracle context schema version (= 4 for v4).
+#allowed-session !Market-session filter (Rain string literal). Use the "rth", "premarket", or "afterhours" presets for a single session, or "all" for pre+RTH+post.
+#min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
+#max-price !Maximum acceptable oracle price. Orders revert above this. Catches overflow or encoding errors.
+
+
+#st0x-oracle-baseline-v4
+  /* Verify the signed context comes from the trusted st0x oracle signer */
+  :ensure(
+    equal-to(signer<0>() oracle-signer)
+    "Untrusted oracle signer"
+  ),
+
+  /* Schema version guard
+  * If the server ever changes the v4 layout, live orders must
+  * revert instead of misreading slots. */
+  oracle-version: signed-context<0 0>(),
+  :ensure(
+    equal-to(oracle-version oracle-schema-version)
+    "Oracle schema version mismatch"
+  ),
+
+  /* Read oracle price from signed context column 0, row 1 */
+  oracle-price: signed-context<0 1>(),
+
+  /* Read the market session this quote was signed during. */
+  oracle-session: signed-context<0 3>(),
+
+  /* Read the UTC start and end of that current session. */
+  oracle-session-start: signed-context<0 4>(),
+  oracle-session-end: signed-context<0 5>(),
+
+  /* Read the input/output token addresses the signer committed this
+   * price to. Both are Address values in bytes32 (left-padded with 12
+   * zero bytes) matching Ethereum's Address→bytes32 convention. */
+  oracle-input-token: signed-context<0 6>(),
+  oracle-output-token: signed-context<0 7>(),
+
+  /* PAIR BIND: the whole reason v4 exists. Assert the signed frame
+   * targets THIS order's IO pair. Without this check, a valid signed
+   * frame for pair (A,B) could be replayed against an order whose IO
+   * is (C,D) whenever the min/max price bands overlap. `input-token()`
+   * and `output-token()` are the raindex subparser context words that
+   * expose the current order's IO addresses at execution time. */
+  :ensure(
+    equal-to(oracle-input-token input-token())
+    "Oracle input token does not match order input"
+  ),
+  :ensure(
+    equal-to(oracle-output-token output-token())
+    "Oracle output token does not match order output"
+  ),
+
+  /* Session guard. When `allowed-session` is the deployer-only "all"
+   * sentinel, accept pre-market, RTH, or after-hours. Otherwise
+   * require an exact match to the chosen session. Overnight/weekend
+   * closed sessions always revert. */
+  :ensure(
+    any(
+      every(
+        equal-to(allowed-session "all")
+        any(
+          equal-to(oracle-session "rth")
+          equal-to(oracle-session "premarket")
+          equal-to(oracle-session "afterhours")
+        )
+      )
+      equal-to(oracle-session allowed-session)
+    )
+    "Not in allowed market session"
+  ),
+
+  /* Chain-time bounds: block.timestamp must fall inside the session
+   * window the oracle stamped. */
+  :ensure(
+    greater-than-or-equal-to(now() oracle-session-start)
+    "Before session start"
+  ),
+  :ensure(
+    less-than-or-equal-to(now() oracle-session-end)
+    "After session end"
+  ),
+
+  /*
+   * SAFETY GUARDS
+   * These protect against bugs, malformed oracle data, or server mishaps.
+   * They are NOT market risk controls - session gating already handles that.
+   */
+
+  /* Guard: zero ratio */
+  :ensure(
+    greater-than(oracle-price 0)
+    "Oracle price is zero"
+  ),
+
+  /* Guard: minimum price bound. Redundant with the pair bind above for
+   * the swapped-frame case, but still useful for a compromised signer
+   * or model regression that returns an in-band but wrong price for
+   * the correct pair. Inclusive: a price exactly at `min-price` matches
+   * the UI's "below this reverts" wording. */
+  :ensure(
+    greater-than-or-equal-to(oracle-price min-price)
+    "Price below minimum bound"
+  ),
+
+  /* Guard: maximum price bound. Inclusive: same reasoning as min. */
+  :ensure(
+    less-than-or-equal-to(oracle-price max-price)
+    "Price above maximum bound"
+  ),
+
+  /* Guard: baseline-multiplier must be strictly positive. The builder
+   * `min:` clamps this at deploy-time, but on-chain re-validation
+   * defends against a raw-order-submit path that bypasses the UI. */
+  :ensure(
+    greater-than(baseline-multiplier 0)
+    "Baseline multiplier must be positive"
+  ),
+  _: oracle-price;
+
+#calculate-io
+using-words-from raindex-subparser
+offer-amount: max-positive-value(),
+io: mul(call<'st0x-oracle-baseline-v4>() baseline-multiplier);
+
+#handle-io
+:;
+
+#handle-add-order
+:;
