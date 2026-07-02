@@ -58,7 +58,9 @@ builder:
   short-description: >
     A strategy where the ratio tracks a benchmark price with a fixed
     multiplier, gated on market session AND pair-bound via the v4
-    oracle endpoint, and adjusted for the on-chain ERC4626 wrap ratio.
+    oracle endpoint. The base-st0x-baseline-v4 deployment uses the
+    raw oracle baseline; dividends sell/buy deployments optionally
+    adjust it via the on-chain ERC4626 wrap ratio.
   deployments:
     base-st0x-baseline-v4:
       name: Base st0x fixed spread v4
