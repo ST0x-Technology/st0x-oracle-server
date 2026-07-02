@@ -294,7 +294,7 @@ builder:
 
   /* Read the input/output token addresses the signer committed this
    * price to. Both are Address values in bytes32 (left-padded with 12
-   * zero bytes) matching Ethereum's Address→bytes32 convention. */
+   * zero bytes) matching Ethereum's Address->bytes32 convention. */
   oracle-input-token: signed-context<0 6>(),
   oracle-output-token: signed-context<0 7>(),
 
