@@ -89,3 +89,7 @@ symbol  = "DRAM"
 [[tokens]]
 address = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
 symbol  = "TSM"
+
+[[tokens]]
+address = "0xF4f8c66085910d583c01f3b4e44Bf731D4e2c565"
+symbol  = "RKLB"
