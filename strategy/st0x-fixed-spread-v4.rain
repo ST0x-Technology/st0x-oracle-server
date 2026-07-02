@@ -306,11 +306,11 @@ builder:
    * expose the current order's IO addresses at execution time. */
   :ensure(
     equal-to(oracle-input-token input-token())
-    "Oracle input token does not match order input"
+    "Oracle input token mismatch"
   ),
   :ensure(
     equal-to(oracle-output-token output-token())
-    "Oracle output token does not match order output"
+    "Oracle output token mismatch"
   ),
 
   /* Session guard. When `allowed-session` is the deployer-only "all"
@@ -376,7 +376,7 @@ builder:
    * defends against a raw-order-submit path that bypasses the UI. */
   :ensure(
     greater-than(baseline-multiplier 0)
-    "Baseline multiplier must be positive"
+    "Multiplier must be positive"
   ),
   _: oracle-price;
 
