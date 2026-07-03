@@ -12,6 +12,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 alloy = { version = "1.0", features = ["signers", "signer-local", "sol-types"] }
+# GCP Cloud KMS signing (production): the key never leaves KMS; auth is ADC
+# (native on Cloud Run service accounts). gcloud-sdk must mirror
+# alloy-signer-gcp's exact dep spec — same minor (its GoogleApi type appears
+# in the GcpSigner constructor signature) and same TLS features (a mismatch
+# duplicates tonic's `init_tls_config`).
+alloy-signer-gcp = "1.8"
+gcloud-sdk = { version = "0.29", default-features = false, features = [
+  "google-cloud-kms-v1",
+  "google-longrunning",
+  "tls-webpki-roots",
+] }
+# Direct dep only to select the `ring` CryptoProvider that from_gcp_kms
+# installs as the process default (both ring and aws-lc-rs are in-graph, so
+# rustls cannot auto-select — see sign.rs).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rain-math-float = "0.1.1-alpha.2"
 hex = "0.4"
 thiserror = "2"
