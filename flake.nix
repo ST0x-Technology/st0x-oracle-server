@@ -188,6 +188,36 @@
           st0x-oracle-server = rust.package;
           default = rust.package;
 
+          # OCI image for Cloud Run — the same nix-built binary the droplet
+          # profile ships, containerised with NO base image: just the
+          # binary's runtime closure + CA certs + the non-secret config.
+          # No shell, no package manager — less surface than distroless.
+          # `created` is pinned so the same commit rebuilds to the same
+          # digest (promote-by-digest = content-address of the commit).
+          # Built in CI (linux) and streamed to Artifact Registry; secrets
+          # stay in Secret Manager env injection, never in the image.
+          oci = pkgs.dockerTools.streamLayeredImage {
+            name = "st0x-oracle-server";
+            tag = "latest";
+            created = "1970-01-01T00:00:01Z";
+            contents = [
+              rust.package
+              pkgs.cacert
+              (pkgs.runCommand "oracle-config" { } ''
+                mkdir -p $out/etc
+                cp ${./config/st0x-oracle-server.toml} $out/etc/st0x-oracle-server.toml
+              '')
+            ];
+            config = {
+              Cmd = [ "${rust.package}/bin/st0x-oracle-server" ];
+              Env = [
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                "CONFIG_PATH=/etc/st0x-oracle-server.toml"
+              ];
+              ExposedPorts."3000/tcp" = { };
+            };
+          };
+
           tf-init = infraPkgs.tfInit;
           tf-plan = infraPkgs.tfPlan;
           tf-apply = infraPkgs.tfApply;
