@@ -1,0 +1,24 @@
+name: audit
+
+# RustSec advisory scan over Cargo.lock. The container is nix-built straight
+# from this lockfile — no distro, no OS packages — so registry-side scanners
+# (Artifact Analysis) have almost nothing to inventory: the Rust dependency
+# tree IS the attack surface, and this is the scanner that sees it.
+#
+# The weekly run surfaces newly published advisories without waiting for a
+# code change (schedules fire on the default branch once merged).
+
+on:
+  push:
+    branches: [main, feature/rai-1002-gcp-kms-signer]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nixbuild/nix-quick-install-action@v30
+      - run: nix run nixpkgs#cargo-audit -- audit
