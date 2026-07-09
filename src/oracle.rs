@@ -200,9 +200,15 @@ pub fn build_context_v3(
 /// no normalisation, so the strategy's byte-for-byte equality check
 /// against the running order's IO addresses is meaningful.
 ///
+/// `price_bytes` is the 32-byte packed Rain Float the caller already
+/// picked for this request's swap direction (via `pick_rate_bytes`),
+/// exactly as for v2/v3 — the pricing service emits both directional
+/// rates pre-spread so the oracle signs the correct one straight
+/// through with no inversion.
+///
 /// Layout:
 /// - `context[0]`: schema version (= 4)
-/// - `context[1]`: price (Rain Float; mark for buys, 1/mark for sells)
+/// - `context[1]`: price (Rain Float; direction-correct, pre-spread)
 /// - `context[2]`: publish_time (Rain Float, Unix seconds)
 /// - `context[3]`: session tag (Rain IntOrAString V3 — same encoding as v3)
 /// - `context[4]`: session_start (Rain Float, Unix seconds)
@@ -215,45 +221,28 @@ pub fn build_context_v3(
 /// Rainlang `equal-to(signed-context<0 6> input-token())` comparison
 /// against a `bytes32(uint160(address))`-widened order IO address
 /// matches with no extra masking.
-#[allow(clippy::too_many_arguments)]
 pub fn build_context_v4(
-    price: f64,
+    price_bytes: [u8; 32],
     publish_time: u64,
     session_bytes: [u8; 32],
     session_start: u64,
     session_end: u64,
     input_token: Address,
     output_token: Address,
-    inverted: bool,
 ) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
     let mut ctx = build_session_context(
         SCHEMA_VERSION_V4,
-        price,
+        price_bytes,
         publish_time,
         session_bytes,
         session_start,
         session_end,
-        inverted,
     )?;
     let input_b32 = FixedBytes::<32>::left_padding_from(input_token.as_slice());
     let output_b32 = FixedBytes::<32>::left_padding_from(output_token.as_slice());
     ctx.push(input_b32);
     ctx.push(output_b32);
     Ok(ctx)
-}
-
-/// Format an f64 price as a string suitable for Float::parse.
-/// Avoids scientific notation which Float::parse may not handle.
-fn format_price(price: f64) -> String {
-    // Use enough decimal places to preserve precision
-    let s = format!("{:.10}", price);
-    // Trim trailing zeros after decimal point
-    if s.contains('.') {
-        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-        trimmed.to_string()
-    } else {
-        s
-    }
 }
 
 #[cfg(test)]
