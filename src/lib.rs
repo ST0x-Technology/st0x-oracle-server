@@ -369,7 +369,7 @@ async fn post_signed_context_v4(
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
         tracing::info!(
             symbol = %pair.symbol,
-            inverted = pair.inverted,
+            direction = pair.direction.as_str(),
             input = %input_token,
             output = %output_token,
             schema = "v4",
@@ -379,7 +379,7 @@ async fn post_signed_context_v4(
     }
 
     let needed_symbols: Vec<&str> = resolved.iter().map(|(_, _, p)| p.symbol.as_str()).collect();
-    let snapshot = state.cache.snapshot_many(&needed_symbols).await;
+    let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
 
     // Session classification is snapshot once per batch so every signed
     // context agrees on the session even across a phase boundary
@@ -391,7 +391,7 @@ async fn post_signed_context_v4(
     for (input_token, output_token, pair) in &resolved {
         let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
             AppError::Unavailable(format!(
-                "No cached quote for {} yet. The poll loop has not succeeded since startup.",
+                "No live quote for {} yet. The pricing WS has not delivered a frame since startup.",
                 pair.symbol
             ))
         })?;
@@ -685,23 +685,12 @@ async fn build_response_from_quote_session(
 async fn build_response_from_quote_v4(
     state: &AppState,
     pair: &ResolvedPair,
-    quote: &crate::alpaca::QuoteData,
+    quote: &Quote,
     input_token: Address,
     output_token: Address,
     session_info: &crate::market_hours::SessionInfo,
 ) -> Result<oracle::OracleResponse, AppError> {
-    if quote.price <= 0.0 {
-        return Err(AppError::BadRequest(format!(
-            "Zero or negative broker mark for {} (price={}). Market may be closed or data is bad.",
-            pair.symbol, quote.price
-        )));
-    }
-
-    // publish_time is the mark's own fetch time (see
-    // `build_response_from_quote` for why we sign the fetch instant
-    // rather than the request-handling instant).
-    let publish_time: u64 = quote
-        .t
+    let publish_time: u64 = publish_dt
         .timestamp()
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
@@ -716,10 +705,14 @@ async fn build_response_from_quote_v4(
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
 
+    // Same as v3: the pricing service publishes both swap directions
+    // pre-spread, so we pick the direction-correct rate slot straight
+    // through — no f64 inversion in the oracle.
+    let price_bytes = pick_rate_bytes(quote, pair.direction);
+
     tracing::info!(
         symbol = %pair.symbol,
-        price = quote.price,
-        inverted = pair.inverted,
+        direction = pair.direction.as_str(),
         schema = "v4",
         input = %input_token,
         output = %output_token,
@@ -727,18 +720,18 @@ async fn build_response_from_quote_v4(
         session = session_info.session.as_str(),
         session_start = session_start,
         session_end = session_end,
-        "Building v4 signed context from cache"
+        source_ts_unix_ms = quote.source_ts_unix_ms,
+        "Building v4 signed context from live pricing quote"
     );
 
     let context = oracle::build_context_v4(
-        quote.price,
+        price_bytes,
         publish_time,
         session_info.session.to_bytes32_v3(),
         session_start,
         session_end,
         input_token,
         output_token,
-        pair.inverted,
     )?;
     let (signature, signer) = state.signer.sign_context(&context).await?;
 
