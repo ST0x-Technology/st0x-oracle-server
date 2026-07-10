@@ -93,3 +93,7 @@ symbol  = "TSM"
 [[tokens]]
 address = "0xF4f8c66085910d583c01f3b4e44Bf731D4e2c565"
 symbol  = "RKLB"
+
+[[tokens]]
+address = "0x8200c6d9AB9E02A25D7F2099244C476d99a085ef"
+symbol  = "ASML"
