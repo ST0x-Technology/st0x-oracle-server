@@ -463,15 +463,15 @@ builder:
   oracle-session: signed-context<0 3>(),
   :ensure(
     greater-than(baseline-multiplier-rth 0)
-    "RTH multiplier must be positive"
+    "RTH multiplier positive"
   ),
   :ensure(
     greater-than(baseline-multiplier-premarket 0)
-    "Pre-market multiplier must be positive"
+    "Premarket multiplier positive"
   ),
   :ensure(
     greater-than(baseline-multiplier-afterhours 0)
-    "After-hours multiplier must be positive"
+    "Afterhours multiplier positive"
   ),
   _: if(
     equal-to(oracle-session "rth")
