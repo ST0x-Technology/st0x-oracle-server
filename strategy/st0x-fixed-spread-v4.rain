@@ -54,7 +54,7 @@ deployments:
 
 builder:
   name: St0x fixed spread limit v4
-  description: https://raw.githubusercontent.com/rainlanguage/rain.strategies/e25bc4876b5ffb8bb28097b0ca66de291c75ff56/src/fixed-spread.md
+  description: https://raw.githubusercontent.com/rainlanguage/rain.strategies/main/src/fixed-spread.md
   short-description: >
     A strategy where the ratio tracks a benchmark price with a per-session
     multiplier, gated on market session AND pair-bound via the v4
@@ -473,17 +473,21 @@ builder:
     greater-than(baseline-multiplier-afterhours 0)
     "Afterhours multiplier positive"
   ),
+  :ensure(
+    any(
+      equal-to(oracle-session "rth")
+      equal-to(oracle-session "premarket")
+      equal-to(oracle-session "afterhours")
+    )
+    "Unknown oracle session"
+  ),
   _: if(
     equal-to(oracle-session "rth")
     baseline-multiplier-rth
     if(
       equal-to(oracle-session "premarket")
       baseline-multiplier-premarket
-      if(
-        equal-to(oracle-session "afterhours")
-        baseline-multiplier-afterhours
-        0
-      )
+      baseline-multiplier-afterhours
     )
   );
 
