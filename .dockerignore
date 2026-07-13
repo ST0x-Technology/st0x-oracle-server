@@ -1,0 +1,13 @@
+# Ignore everything, then allow back only what the Dockerfile COPYs.
+# Without this, `fly deploy` uploads the whole working tree — target/
+# (gigabytes of Rust artifacts), the vendored lib/ submodules, and .git —
+# to Fly's remote builder, blowing the context-upload deadline
+# ("context deadline exceeded"). The submodules are cloned fresh inside
+# the build (see Dockerfile), so none of that local state is needed.
+*
+!Cargo.toml
+!Cargo.lock
+!config.toml
+!.gitmodules
+!src
+!artifacts
