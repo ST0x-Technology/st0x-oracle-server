@@ -1,18 +1,22 @@
 //! Authoritative market-hours cache from Alpaca's `/v1/calendar` endpoint.
+//! Serves two roles, both fed by the same session windows:
 //!
-//! Used to classify the current market session for the v2/v3/v4 signed
-//! context: the session tag (slot 3) plus the UTC start/end bounds of
-//! that session (slots 4/5). Strategies gate on those — they only quote
-//! when the signed session matches the deployer's `allowed-session` and
-//! `block.timestamp` falls inside the signed window.
+//! 1. **Mark as-of stamping (`publish_time_for`).** Called by the poll
+//!    loop at fetch time to compute each mark's "as-of" timestamp:
+//!    `fetch_time` in-session, the last `session_close` out-of-session
+//!    (the price hasn't been valid since then). That value is stored on
+//!    `QuoteData.t` and signed straight through as `publish_time`, so the
+//!    strategy's `max-staleness` sees a truthful age. Stamping at fetch
+//!    time (not sign time) means a stalled poll loop can't hide: `t`
+//!    stops advancing and the timestamp ages out.
 //!
-//! This cache does NOT feed `publish_time`. That is the mark's own fetch
-//! time (`QuoteData.t`) signed straight through — see
-//! `lib::build_response_from_quote`. Signing the fetch time (rather than
-//! the request-handling instant) means a stalled poll loop surfaces
-//! directly: `t` stops advancing, the signed timestamp goes stale, and
-//! the strategy's `max-staleness` rejects. Out-of-session frozen marks
-//! are handled by the session gate above, not by the timestamp.
+//! 2. **Session classification (`session_info_for`).** The v2/v3/v4
+//!    signed context carries the session tag (slot 3) plus the UTC
+//!    start/end bounds (slots 4/5); strategies gate on those.
+//!
+//! This is the fetch-time refinement of RAI-693: the frozen-out-of-session
+//! mark still gets a stale timestamp, but now it's decided when the price
+//! is obtained rather than when a consumer requests a signature.
 
 use crate::alpaca::AlpacaClient;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
@@ -127,6 +131,38 @@ impl MarketHoursCache {
     pub async fn set(&self, mut windows: Vec<SessionWindow>) {
         windows.sort_by_key(|w| w.date);
         *self.windows.write().await = windows;
+    }
+
+    /// Compute the "as-of" timestamp to stamp on a mark fetched at
+    /// `fetch_time`. This is called by the **poll loop** at fetch time,
+    /// and the value is signed straight through as `publish_time`.
+    ///
+    /// - Inside an active extended-session window -> `fetch_time` (the
+    ///   broker mark is genuinely live, so the fetch instant is truthful).
+    /// - Outside any active window (overnight / weekend / holiday) the
+    ///   broker keeps returning a frozen mark; the price hasn't been valid
+    ///   since the last close, so we stamp the most recent past
+    ///   `session_close`. The strategy's `max-staleness` then rejects it.
+    /// - No cached windows yet (cold start) -> `fetch_time`, preserving
+    ///   liveness rather than blocking until the calendar primes.
+    ///
+    /// Stamping at fetch time (rather than sign time) means a stalled poll
+    /// loop is self-evident: `t` stops advancing, so the signed timestamp
+    /// ages out and the strategy rejects — the failure can't hide behind
+    /// a fresh request clock.
+    pub async fn publish_time_for(&self, fetch_time: DateTime<Utc>) -> DateTime<Utc> {
+        let windows = self.windows.read().await;
+        for w in windows.iter() {
+            if w.session_open <= fetch_time && fetch_time < w.session_close {
+                return fetch_time;
+            }
+        }
+        windows
+            .iter()
+            .filter(|w| w.session_close <= fetch_time)
+            .map(|w| w.session_close)
+            .max()
+            .unwrap_or(fetch_time)
     }
 
     /// Classify the current market session and return its UTC bounds.
@@ -296,6 +332,81 @@ mod tests {
             rth_close: utc(2026, 6, 1, 20, 0),
             session_close: utc(2026, 6, 2, 0, 0),
         }
+    }
+
+    #[tokio::test]
+    async fn inside_session_returns_fetch_time() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let fetch = utc(2026, 5, 29, 14, 30); // 10:30 ET Friday — RTH
+        assert_eq!(c.publish_time_for(fetch).await, fetch);
+    }
+
+    #[tokio::test]
+    async fn premarket_inside_session_returns_fetch_time() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let fetch = utc(2026, 5, 29, 9, 0); // 05:00 ET Friday — pre-market, still in session
+        assert_eq!(c.publish_time_for(fetch).await, fetch);
+    }
+
+    #[tokio::test]
+    async fn weekend_returns_last_friday_session_close() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let fetch = utc(2026, 5, 31, 12, 0); // Sunday noon UTC
+        assert_eq!(c.publish_time_for(fetch).await, fri_window().session_close);
+    }
+
+    #[tokio::test]
+    async fn holiday_monday_returns_previous_friday_close() {
+        let c = MarketHoursCache::new();
+        // Mon 2026-06-01 has no entry (simulated holiday); Tue has one.
+        let tue_window = SessionWindow {
+            date: date(2026, 6, 2),
+            session_open: utc(2026, 6, 2, 8, 0),
+            rth_open: Utc.with_ymd_and_hms(2026, 6, 2, 13, 30, 0).unwrap(),
+            rth_close: utc(2026, 6, 2, 20, 0),
+            session_close: utc(2026, 6, 3, 0, 0),
+        };
+        c.set(vec![fri_window(), tue_window]).await;
+        let fetch = utc(2026, 6, 1, 14, 0); // Mon 10:00 ET — would be RTH on a non-holiday
+        assert_eq!(c.publish_time_for(fetch).await, fri_window().session_close);
+    }
+
+    #[tokio::test]
+    async fn overnight_weekday_returns_previous_session_close() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window(), mon_window()]).await;
+        // Mon 02:00 ET = Mon 06:00 UTC — before Monday's 04:00 ET session_open
+        let fetch = utc(2026, 6, 1, 6, 0);
+        assert_eq!(c.publish_time_for(fetch).await, fri_window().session_close);
+    }
+
+    #[tokio::test]
+    async fn boundary_at_session_open_is_in_session() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let exactly_open = fri_window().session_open;
+        assert_eq!(c.publish_time_for(exactly_open).await, exactly_open);
+    }
+
+    #[tokio::test]
+    async fn boundary_at_session_close_is_out_of_session() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let exactly_close = fri_window().session_close;
+        // At session_close exactly, we're outside the window and stamp the
+        // close timestamp itself (which equals `fetch_time` here, but
+        // would diverge a moment later).
+        assert_eq!(c.publish_time_for(exactly_close).await, exactly_close);
+    }
+
+    #[tokio::test]
+    async fn empty_cache_falls_back_to_fetch_time() {
+        let c = MarketHoursCache::new();
+        let fetch = utc(2026, 5, 31, 12, 0);
+        assert_eq!(c.publish_time_for(fetch).await, fetch);
     }
 
     #[test]

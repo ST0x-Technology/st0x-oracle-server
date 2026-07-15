@@ -69,11 +69,11 @@ pub struct AppState {
     /// Every symbol declared in config.toml. /status compares this
     /// against the cache to surface the partial-serving set.
     configured_symbols: Vec<String>,
-    /// Authoritative market-hours source from Alpaca's calendar. Used to
-    /// classify the current market session for the v2/v3/v4 session slots
-    /// (tag + start/end bounds). It no longer feeds `publish_time` — that
-    /// is the mark's own fetch time (`QuoteData.t`), signed straight
-    /// through so a stalled poll loop surfaces as a stale timestamp.
+    /// Authoritative market-hours source from Alpaca's calendar. Feeds
+    /// the v2/v3/v4 session slots (tag + start/end bounds) here, and — in
+    /// the poll loop — each mark's as-of `publish_time` (fetch instant
+    /// in-session, last `session_close` out-of-session). The sign path
+    /// itself just signs `QuoteData.t` straight through.
     market_hours: Arc<MarketHoursCache>,
 }
 
@@ -500,16 +500,16 @@ fn resolve_pair_for_order(
 /// sell directions both use it; `build_context` inverts via Rain Float
 /// when `pair.inverted` is true.
 ///
-/// `publish_time` is the mark's own fetch time (`QuoteData.t`) — the
-/// instant the background poll loop obtained this price from Alpaca —
-/// NOT the moment a consumer hit `/context` for a signature. Signing
-/// the request-handling instant would make a stalled poll loop
-/// invisible: it would keep stamping a fresh `now` onto an
-/// increasingly-stale cached mark, and the strategy's `max-staleness`
-/// (which clocks off this signed timestamp) could never catch it.
-/// Signing the fetch time means a frozen poll loop surfaces directly:
-/// `t` stops advancing, the signed timestamp goes stale, and the
-/// strategy rejects.
+/// `publish_time` is `QuoteData.t` — the mark's as-of timestamp, computed
+/// by the poll loop when it fetched this price (fetch instant in-session,
+/// last `session_close` out-of-session; see `MarketHoursCache::publish_time_for`).
+/// The sign path signs it straight through, NOT the moment a consumer hit
+/// `/context`. Signing the request instant would make a stalled poll loop
+/// invisible — it would keep stamping a fresh `now` onto an increasingly
+/// stale cached mark, and the strategy's `max-staleness` (which clocks off
+/// this timestamp) could never catch it. Signing the fetch-time as-of
+/// means a frozen poll surfaces directly: `t` stops advancing, the
+/// timestamp ages out, the strategy rejects.
 async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,

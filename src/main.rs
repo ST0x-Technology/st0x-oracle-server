@@ -95,10 +95,33 @@ async fn main() -> anyhow::Result<()> {
     // chose this over the old hard-bail because the bail took the whole
     // oracle down on the next Fly restart whenever any single position
     // went to 0 — and the "alert" was the outage itself.
+    // Prime market hours (Alpaca trading calendar) BEFORE the first price
+    // poll, because the poll loop stamps each mark's as-of timestamp via
+    // `MarketHoursCache::publish_time_for`. Failure here isn't fatal — an
+    // empty cache stamps the raw fetch time and classifies sessions as
+    // closed, both self-correcting once the hourly refresh succeeds.
+    let market_hours = Arc::new(MarketHoursCache::new());
+    match refresh_once(&market_hours, &alpaca).await {
+        Ok(()) => tracing::info!(
+            window_count = market_hours.window_count().await,
+            "Primed market hours from Alpaca calendar"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "Initial market hours fetch failed; marks stamp raw fetch time and \
+             session slots classify as closed until refresh succeeds"
+        ),
+    }
+    spawn_market_hours_refresh(
+        market_hours.clone(),
+        alpaca.clone(),
+        Duration::from_secs(3600),
+    );
+
     let cache = Arc::new(QuoteCache::new());
     let symbols = config.symbols();
     tracing::info!("Priming quote cache with {} symbols...", symbols.len());
-    poll_once(&cache, &alpaca, &symbols).await;
+    poll_once(&cache, &alpaca, &symbols, &market_hours).await;
     let missing = cache.missing(&symbols).await;
     if missing.is_empty() {
         tracing::info!("Cache primed for all {} symbols", symbols.len());
@@ -121,34 +144,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Start background poller.
+    // Start background poller. It stamps as-of timestamps via the
+    // market-hours cache primed above.
     spawn_poll_loop(
         cache.clone(),
         alpaca.clone(),
         symbols.clone(),
-        Duration::from_secs(config.poll_interval_secs),
-    );
-
-    // Prime market hours (Alpaca trading calendar). Failure here isn't
-    // fatal — an empty cache classifies as `OvernightClosed` with
-    // degenerate bounds, so v2/v3/v4 session guards revert until the
-    // hourly refresh succeeds. `publish_time` is unaffected (it's the
-    // mark's fetch time, not derived from the calendar).
-    let market_hours = Arc::new(MarketHoursCache::new());
-    match refresh_once(&market_hours, &alpaca).await {
-        Ok(()) => tracing::info!(
-            window_count = market_hours.window_count().await,
-            "Primed market hours from Alpaca calendar"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "Initial market hours fetch failed; session slots will classify as closed until refresh succeeds"
-        ),
-    }
-    spawn_market_hours_refresh(
         market_hours.clone(),
-        alpaca.clone(),
-        Duration::from_secs(3600),
+        Duration::from_secs(config.poll_interval_secs),
     );
 
     let state = AppState::new(signer, registry, cache, symbols, market_hours);
