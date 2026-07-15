@@ -1,4 +1,6 @@
 use crate::alpaca::{AlpacaClient, QuoteData};
+use crate::market_hours::MarketHoursCache;
+use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,9 +9,10 @@ use tokio::sync::RwLock;
 /// In-memory cache of the latest known mark for each symbol.
 ///
 /// On poll failure we intentionally leave the previous entry untouched so
-/// that `/context/v1` can serve the last-known-good mark (with its
-/// original fetch timestamp) rather than hard-failing. The strategy
-/// is responsible for bounding staleness via `max-staleness`.
+/// that requests can serve the last-known-good mark (with its as-of
+/// timestamp frozen at the last successful poll) rather than hard-failing.
+/// Because that stale timestamp is signed as `publish_time`, the
+/// strategy's `max-staleness` bounds how long a frozen mark stays usable.
 #[derive(Debug, Default)]
 pub struct QuoteCache {
     entries: RwLock<HashMap<String, QuoteData>>,
@@ -66,8 +69,20 @@ impl QuoteCache {
 /// Symbols not held by the broker (or dropped during parsing) are
 /// logged but not removed from the cache — `/context/v1` will continue
 /// serving the last-known-good mark until `max-staleness` rejects it.
-pub async fn poll_once(cache: &QuoteCache, alpaca: &AlpacaClient, symbols: &[String]) {
-    let marks = match alpaca.fetch_marks().await {
+///
+/// The mark's `t` (its as-of timestamp, later signed as `publish_time`)
+/// is computed here via `market_hours`: the fetch instant in-session, the
+/// last `session_close` out-of-session. Deciding this at fetch time means
+/// a stalled poll simply stops refreshing `t`, so the signed timestamp
+/// ages out on its own.
+pub async fn poll_once(
+    cache: &QuoteCache,
+    alpaca: &AlpacaClient,
+    symbols: &[String],
+    market_hours: &MarketHoursCache,
+) {
+    let as_of = market_hours.publish_time_for(Utc::now()).await;
+    let marks = match alpaca.fetch_marks(as_of).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, "Broker positions fetch failed; keeping previous cache");
@@ -98,6 +113,7 @@ pub fn spawn_poll_loop(
     cache: Arc<QuoteCache>,
     alpaca: AlpacaClient,
     symbols: Vec<String>,
+    market_hours: Arc<MarketHoursCache>,
     interval: Duration,
 ) {
     tokio::spawn(async move {
@@ -113,7 +129,7 @@ pub fn spawn_poll_loop(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            poll_once(&cache, &alpaca, &symbols).await;
+            poll_once(&cache, &alpaca, &symbols, &market_hours).await;
         }
     });
 }

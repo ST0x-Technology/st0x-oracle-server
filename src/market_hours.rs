@@ -1,19 +1,22 @@
 //! Authoritative market-hours cache from Alpaca's `/v1/calendar` endpoint.
+//! Serves two roles, both fed by the same session windows:
 //!
-//! Used at sign time to choose `publish_time` truthfully:
+//! 1. **Mark as-of stamping (`publish_time_for`).** Called by the poll
+//!    loop at fetch time to compute each mark's "as-of" timestamp:
+//!    `fetch_time` in-session, the last `session_close` out-of-session
+//!    (the price hasn't been valid since then). That value is stored on
+//!    `QuoteData.t` and signed straight through as `publish_time`, so the
+//!    strategy's `max-staleness` sees a truthful age. Stamping at fetch
+//!    time (not sign time) means a stalled poll loop can't hide: `t`
+//!    stops advancing and the timestamp ages out.
 //!
-//! - Inside the **extended session window** for a trading day
-//!   (04:00 ET -> 20:00 ET) the broker mark legitimately tracks live
-//!   extended-hours quotes, so we sign with the current instant.
-//! - Outside any active window (overnight, weekends, holidays) the broker
-//!   keeps returning a frozen mark with no per-symbol timestamp. Signing
-//!   `now()` would lie. We sign the most recent past `session_close`
-//!   instead, and the strategy's `max-staleness` correctly rejects.
+//! 2. **Session classification (`session_info_for`).** The v2/v3/v4
+//!    signed context carries the session tag (slot 3) plus the UTC
+//!    start/end bounds (slots 4/5); strategies gate on those.
 //!
-//! This is the fix for RAI-693. See the original stopgap-doesn't-work
-//! discussion: the alternative ("only re-stamp when current_price changes")
-//! breaks SGOV/AMZN RTH false-positives because the broker mark can freeze
-//! for 15-45 min during real trading on thin-to-mid tickers.
+//! This is the fetch-time refinement of RAI-693: the frozen-out-of-session
+//! mark still gets a stale timestamp, but now it's decided when the price
+//! is obtained rather than when a consumer requests a signature.
 
 use crate::alpaca::AlpacaClient;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
@@ -112,7 +115,8 @@ pub struct SessionInfo {
 }
 
 /// Rolling cache of session windows around today. Refreshed periodically
-/// in the background; read by `/context/v1` on every request.
+/// in the background; read by the v2/v3/v4 handlers to classify the
+/// current session for the signed context's session slots.
 #[derive(Debug, Default)]
 pub struct MarketHoursCache {
     windows: RwLock<Vec<SessionWindow>>,
@@ -129,25 +133,36 @@ impl MarketHoursCache {
         *self.windows.write().await = windows;
     }
 
-    /// Choose `publish_time` for a sign at `now`.
+    /// Compute the "as-of" timestamp to stamp on a mark fetched at
+    /// `fetch_time`. This is called by the **poll loop** at fetch time,
+    /// and the value is signed straight through as `publish_time`.
     ///
-    /// In an active window -> `now` (broker mark is genuinely live).
-    /// Otherwise -> most recent past `session_close`.
-    /// If no windows are cached yet (cold-start failure) -> `now`, which
-    /// preserves pre-fix behaviour rather than blocking sign attempts.
-    pub async fn publish_time_for(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+    /// - Inside an active extended-session window -> `fetch_time` (the
+    ///   broker mark is genuinely live, so the fetch instant is truthful).
+    /// - Outside any active window (overnight / weekend / holiday) the
+    ///   broker keeps returning a frozen mark; the price hasn't been valid
+    ///   since the last close, so we stamp the most recent past
+    ///   `session_close`. The strategy's `max-staleness` then rejects it.
+    /// - No cached windows yet (cold start) -> `fetch_time`, preserving
+    ///   liveness rather than blocking until the calendar primes.
+    ///
+    /// Stamping at fetch time (rather than sign time) means a stalled poll
+    /// loop is self-evident: `t` stops advancing, so the signed timestamp
+    /// ages out and the strategy rejects — the failure can't hide behind
+    /// a fresh request clock.
+    pub async fn publish_time_for(&self, fetch_time: DateTime<Utc>) -> DateTime<Utc> {
         let windows = self.windows.read().await;
         for w in windows.iter() {
-            if w.session_open <= now && now < w.session_close {
-                return now;
+            if w.session_open <= fetch_time && fetch_time < w.session_close {
+                return fetch_time;
             }
         }
         windows
             .iter()
-            .filter(|w| w.session_close <= now)
+            .filter(|w| w.session_close <= fetch_time)
             .map(|w| w.session_close)
             .max()
-            .unwrap_or(now)
+            .unwrap_or(fetch_time)
     }
 
     /// Classify the current market session and return its UTC bounds.
@@ -320,27 +335,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inside_session_returns_now() {
+    async fn inside_session_returns_fetch_time() {
         let c = MarketHoursCache::new();
         c.set(vec![fri_window()]).await;
-        let now = utc(2026, 5, 29, 14, 30); // 10:30 ET Friday — RTH
-        assert_eq!(c.publish_time_for(now).await, now);
+        let fetch = utc(2026, 5, 29, 14, 30); // 10:30 ET Friday — RTH
+        assert_eq!(c.publish_time_for(fetch).await, fetch);
     }
 
     #[tokio::test]
-    async fn premarket_inside_session_returns_now() {
+    async fn premarket_inside_session_returns_fetch_time() {
         let c = MarketHoursCache::new();
         c.set(vec![fri_window()]).await;
-        let now = utc(2026, 5, 29, 9, 0); // 05:00 ET Friday — pre-market, still in session
-        assert_eq!(c.publish_time_for(now).await, now);
+        let fetch = utc(2026, 5, 29, 9, 0); // 05:00 ET Friday — pre-market, still in session
+        assert_eq!(c.publish_time_for(fetch).await, fetch);
     }
 
     #[tokio::test]
     async fn weekend_returns_last_friday_session_close() {
         let c = MarketHoursCache::new();
         c.set(vec![fri_window()]).await;
-        let now = utc(2026, 5, 31, 12, 0); // Sunday noon UTC
-        assert_eq!(c.publish_time_for(now).await, fri_window().session_close);
+        let fetch = utc(2026, 5, 31, 12, 0); // Sunday noon UTC
+        assert_eq!(c.publish_time_for(fetch).await, fri_window().session_close);
     }
 
     #[tokio::test]
@@ -355,8 +370,8 @@ mod tests {
             session_close: utc(2026, 6, 3, 0, 0),
         };
         c.set(vec![fri_window(), tue_window]).await;
-        let now = utc(2026, 6, 1, 14, 0); // Mon 10:00 ET — would be RTH on a non-holiday
-        assert_eq!(c.publish_time_for(now).await, fri_window().session_close);
+        let fetch = utc(2026, 6, 1, 14, 0); // Mon 10:00 ET — would be RTH on a non-holiday
+        assert_eq!(c.publish_time_for(fetch).await, fri_window().session_close);
     }
 
     #[tokio::test]
@@ -364,8 +379,8 @@ mod tests {
         let c = MarketHoursCache::new();
         c.set(vec![fri_window(), mon_window()]).await;
         // Mon 02:00 ET = Mon 06:00 UTC — before Monday's 04:00 ET session_open
-        let now = utc(2026, 6, 1, 6, 0);
-        assert_eq!(c.publish_time_for(now).await, fri_window().session_close);
+        let fetch = utc(2026, 6, 1, 6, 0);
+        assert_eq!(c.publish_time_for(fetch).await, fri_window().session_close);
     }
 
     #[tokio::test]
@@ -381,17 +396,17 @@ mod tests {
         let c = MarketHoursCache::new();
         c.set(vec![fri_window()]).await;
         let exactly_close = fri_window().session_close;
-        // At session_close exactly, we're outside the window and should
-        // emit the close timestamp itself (which equals `now` here, but
+        // At session_close exactly, we're outside the window and stamp the
+        // close timestamp itself (which equals `fetch_time` here, but
         // would diverge a moment later).
         assert_eq!(c.publish_time_for(exactly_close).await, exactly_close);
     }
 
     #[tokio::test]
-    async fn empty_cache_falls_back_to_now() {
+    async fn empty_cache_falls_back_to_fetch_time() {
         let c = MarketHoursCache::new();
-        let now = utc(2026, 5, 31, 12, 0);
-        assert_eq!(c.publish_time_for(now).await, now);
+        let fetch = utc(2026, 5, 31, 12, 0);
+        assert_eq!(c.publish_time_for(fetch).await, fetch);
     }
 
     #[test]

@@ -83,7 +83,17 @@ impl AlpacaClient {
     ///
     /// Position rows with a non-positive or non-numeric `current_price`
     /// are dropped so downstream signing never sees a bad mark.
-    pub async fn fetch_marks(&self) -> anyhow::Result<HashMap<String, QuoteData>> {
+    ///
+    /// `as_of` is the timestamp stamped on every returned mark — the
+    /// caller (poll loop) computes it via `MarketHoursCache` so it is the
+    /// fetch instant in-session and the last `session_close`
+    /// out-of-session. The broker positions endpoint carries no per-mark
+    /// timestamp of its own, so this stamped value is the mark's only
+    /// as-of signal.
+    pub async fn fetch_marks(
+        &self,
+        as_of: DateTime<Utc>,
+    ) -> anyhow::Result<HashMap<String, QuoteData>> {
         let url = format!(
             "{}/v1/trading/accounts/{}/positions",
             self.broker_url, self.account_id
@@ -99,7 +109,7 @@ impl AlpacaClient {
             .json()
             .await?;
 
-        Ok(positions_to_marks(positions, Utc::now()))
+        Ok(positions_to_marks(positions, as_of))
     }
 
     /// Fetch the trading calendar over `[start, end]` (inclusive). Each

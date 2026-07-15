@@ -69,9 +69,11 @@ pub struct AppState {
     /// Every symbol declared in config.toml. /status compares this
     /// against the cache to surface the partial-serving set.
     configured_symbols: Vec<String>,
-    /// Authoritative market-hours source from Alpaca's calendar.
-    /// Determines whether `publish_time` is `now` (inside an active
-    /// session) or the most recent `session_close` (outside).
+    /// Authoritative market-hours source from Alpaca's calendar. Feeds
+    /// the v2/v3/v4 session slots (tag + start/end bounds) here, and — in
+    /// the poll loop — each mark's as-of `publish_time` (fetch instant
+    /// in-session, last `session_close` out-of-session). The sign path
+    /// itself just signs `QuoteData.t` straight through.
     market_hours: Arc<MarketHoursCache>,
 }
 
@@ -323,9 +325,11 @@ async fn post_signed_context_v4(
     let needed_symbols: Vec<&str> = resolved.iter().map(|(_, _, p)| p.symbol.as_str()).collect();
     let snapshot = state.cache.snapshot_many(&needed_symbols).await;
 
-    let now = Utc::now();
-    let publish_dt = state.market_hours.publish_time_for(now).await;
-    let session_info = state.market_hours.session_info_for(now).await;
+    // Session classification is snapshot once per batch so every signed
+    // context agrees on the session even across a phase boundary
+    // mid-iteration. `publish_time`, by contrast, is per-quote — it's
+    // the mark's own fetch time (`quote.t`), read inside each builder.
+    let session_info = state.market_hours.session_info_for(Utc::now()).await;
 
     let mut responses = Vec::with_capacity(resolved.len());
     for (input_token, output_token, pair) in &resolved {
@@ -341,7 +345,6 @@ async fn post_signed_context_v4(
             &quote,
             *input_token,
             *output_token,
-            publish_dt,
             &session_info,
         )
         .await?;
@@ -417,10 +420,9 @@ async fn post_signed_context_session(
 
     // Snapshot the session classification once for the whole batch so
     // every signed context in this response agrees on which session
-    // we're in, even across a phase boundary mid-iteration.
-    let now = Utc::now();
-    let publish_dt = state.market_hours.publish_time_for(now).await;
-    let session_info = state.market_hours.session_info_for(now).await;
+    // we're in, even across a phase boundary mid-iteration. `publish_time`
+    // is per-quote (the mark's own fetch time), read inside the builder.
+    let session_info = state.market_hours.session_info_for(Utc::now()).await;
 
     let mut responses = Vec::with_capacity(resolved.len());
     for (_, pair) in &resolved {
@@ -430,15 +432,8 @@ async fn post_signed_context_session(
                 pair.symbol
             ))
         })?;
-        let resp = build_response_from_quote_session(
-            &state,
-            pair,
-            &quote,
-            publish_dt,
-            &session_info,
-            schema,
-        )
-        .await?;
+        let resp =
+            build_response_from_quote_session(&state, pair, &quote, &session_info, schema).await?;
         responses.push(resp);
     }
 
@@ -505,12 +500,16 @@ fn resolve_pair_for_order(
 /// sell directions both use it; `build_context` inverts via Rain Float
 /// when `pair.inverted` is true.
 ///
-/// `publish_time` is chosen by `MarketHoursCache`: inside an active
-/// extended session window we sign `now`; outside we sign the most
-/// recent `session_close`. This is RAI-693: the broker mark has no
-/// per-symbol timestamp, so a naive `fetch_time` stamps an old close
-/// price with a fresh timestamp during weekends/holidays, which the
-/// strategy then accepts even though the mark is hours stale.
+/// `publish_time` is `QuoteData.t` — the mark's as-of timestamp, computed
+/// by the poll loop when it fetched this price (fetch instant in-session,
+/// last `session_close` out-of-session; see `MarketHoursCache::publish_time_for`).
+/// The sign path signs it straight through, NOT the moment a consumer hit
+/// `/context`. Signing the request instant would make a stalled poll loop
+/// invisible — it would keep stamping a fresh `now` onto an increasingly
+/// stale cached mark, and the strategy's `max-staleness` (which clocks off
+/// this timestamp) could never catch it. Signing the fetch-time as-of
+/// means a frozen poll surfaces directly: `t` stops advancing, the
+/// timestamp ages out, the strategy rejects.
 async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
@@ -525,9 +524,8 @@ async fn build_response_from_quote(
         )));
     }
 
-    let now = Utc::now();
-    let publish_dt = state.market_hours.publish_time_for(now).await;
-    let publish_time: u64 = publish_dt
+    let publish_time: u64 = quote
+        .t
         .timestamp()
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
@@ -537,7 +535,6 @@ async fn build_response_from_quote(
         price = quote.price,
         inverted = pair.inverted,
         publish_time = publish_time,
-        in_session = (publish_dt == now),
         "Building signed context from cache"
     );
 
@@ -560,7 +557,6 @@ async fn build_response_from_quote_session(
     state: &AppState,
     pair: &ResolvedPair,
     quote: &crate::alpaca::QuoteData,
-    publish_dt: chrono::DateTime<Utc>,
     session_info: &crate::market_hours::SessionInfo,
     schema: SessionSchema,
 ) -> Result<oracle::OracleResponse, AppError> {
@@ -571,7 +567,11 @@ async fn build_response_from_quote_session(
         )));
     }
 
-    let publish_time: u64 = publish_dt
+    // publish_time is the mark's own fetch time (see
+    // `build_response_from_quote` for why we sign the fetch instant
+    // rather than the request-handling instant).
+    let publish_time: u64 = quote
+        .t
         .timestamp()
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
@@ -625,7 +625,6 @@ async fn build_response_from_quote_v4(
     quote: &crate::alpaca::QuoteData,
     input_token: Address,
     output_token: Address,
-    publish_dt: chrono::DateTime<Utc>,
     session_info: &crate::market_hours::SessionInfo,
 ) -> Result<oracle::OracleResponse, AppError> {
     if quote.price <= 0.0 {
@@ -635,7 +634,11 @@ async fn build_response_from_quote_v4(
         )));
     }
 
-    let publish_time: u64 = publish_dt
+    // publish_time is the mark's own fetch time (see
+    // `build_response_from_quote` for why we sign the fetch instant
+    // rather than the request-handling instant).
+    let publish_time: u64 = quote
+        .t
         .timestamp()
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
