@@ -54,9 +54,9 @@ deployments:
 
 builder:
   name: St0x fixed spread limit v4
-  description: https://raw.githubusercontent.com/rainlanguage/rain.strategies/e25bc4876b5ffb8bb28097b0ca66de291c75ff56/src/fixed-spread.md
+  description: https://raw.githubusercontent.com/rainlanguage/rain.strategies/main/src/fixed-spread.md
   short-description: >
-    A strategy where the ratio tracks a benchmark price with a fixed
+    A strategy where the ratio tracks a benchmark price with a per-session
     multiplier, gated on market session AND pair-bound via the v4
     oracle endpoint. The base-st0x-baseline-v4 deployment uses the
     raw oracle baseline; dividends sell/buy deployments optionally
@@ -87,10 +87,38 @@ builder:
               value: '"afterhours"'
             - name: All active sessions (pre-market, RTH, after-hours)
               value: '"all"'
-        - binding: baseline-multiplier
-          name: Benchmark price multiplier
-          description: |
-            The multiplier to be applied to the benchmark when calculating the price the strategy will offer at
+        - binding: baseline-multiplier-rth
+          name: Benchmark price multiplier (RTH)
+          description: >
+            Multiplier applied during regular trading hours (09:30-16:00 ET).
+          show-custom-field: true
+          default: 1.001
+          min: 0.000001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: baseline-multiplier-premarket
+          name: Benchmark price multiplier (pre-market)
+          description: >
+            Multiplier applied during pre-market (04:00-09:30 ET).
+          show-custom-field: true
+          default: 1.001
+          min: 0.000001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: baseline-multiplier-afterhours
+          name: Benchmark price multiplier (after-hours)
+          description: >
+            Multiplier applied during after-hours (16:00-20:00 ET).
           show-custom-field: true
           default: 1.001
           min: 0.000001
@@ -151,10 +179,38 @@ builder:
               value: '"afterhours"'
             - name: All active sessions (pre-market, RTH, after-hours)
               value: '"all"'
-        - binding: baseline-multiplier
-          name: Benchmark price multiplier
-          description: |
-            The multiplier to be applied to the benchmark when calculating the price the strategy will offer at
+        - binding: baseline-multiplier-rth
+          name: Benchmark price multiplier (RTH)
+          description: >
+            Multiplier applied during regular trading hours (09:30-16:00 ET).
+          show-custom-field: true
+          default: 1.001
+          min: 0.000001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: baseline-multiplier-premarket
+          name: Benchmark price multiplier (pre-market)
+          description: >
+            Multiplier applied during pre-market (04:00-09:30 ET).
+          show-custom-field: true
+          default: 1.001
+          min: 0.000001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: baseline-multiplier-afterhours
+          name: Benchmark price multiplier (after-hours)
+          description: >
+            Multiplier applied during after-hours (16:00-20:00 ET).
           show-custom-field: true
           default: 1.001
           min: 0.000001
@@ -215,10 +271,38 @@ builder:
               value: '"afterhours"'
             - name: All active sessions (pre-market, RTH, after-hours)
               value: '"all"'
-        - binding: baseline-multiplier
-          name: Benchmark price multiplier
-          description: |
-            The multiplier to be applied to the benchmark when calculating the price the strategy will offer at
+        - binding: baseline-multiplier-rth
+          name: Benchmark price multiplier (RTH)
+          description: >
+            Multiplier applied during regular trading hours (09:30-16:00 ET).
+          show-custom-field: true
+          default: 1.001
+          min: 0.000001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: baseline-multiplier-premarket
+          name: Benchmark price multiplier (pre-market)
+          description: >
+            Multiplier applied during pre-market (04:00-09:30 ET).
+          show-custom-field: true
+          default: 1.001
+          min: 0.000001
+          presets:
+            - name: 1.001x
+              value: 1.001
+            - name: 1.005x
+              value: 1.005
+            - name: 1.0025x
+              value: 1.0025
+        - binding: baseline-multiplier-afterhours
+          name: Benchmark price multiplier (after-hours)
+          description: >
+            Multiplier applied during after-hours (16:00-20:00 ET).
           show-custom-field: true
           default: 1.001
           min: 0.000001
@@ -259,7 +343,9 @@ builder:
 #erc4626-words !St0x words (ERC4626 convert).
 #baseline-fn !Baseline function binding (sell or buy variant).
 #oracle-signer !The trusted signer address for the st0x oracle server.
-#baseline-multiplier !WAD multiplier to apply to the baseline (e.g. 1.001).
+#baseline-multiplier-rth !WAD multiplier for regular trading hours (e.g. 1.001).
+#baseline-multiplier-premarket !WAD multiplier for pre-market (e.g. 1.001).
+#baseline-multiplier-afterhours !WAD multiplier for after-hours (e.g. 1.001).
 #oracle-schema-version !Expected oracle context schema version (= 4 for v4).
 #allowed-session !Market-session filter (Rain string literal). Use the "rth", "premarket", or "afterhours" presets for a single session, or "all" for pre+RTH+post.
 #min-price !Minimum acceptable oracle price. Orders revert below this. Catches catastrophic mispricings.
@@ -370,15 +456,40 @@ builder:
     less-than-or-equal-to(oracle-price max-price)
     "Price above maximum bound"
   ),
-
-  /* Guard: baseline-multiplier must be strictly positive. The builder
-   * `min:` clamps this at deploy-time, but on-chain re-validation
-   * defends against a raw-order-submit path that bypasses the UI. */
-  :ensure(
-    greater-than(baseline-multiplier 0)
-    "Multiplier must be positive"
-  ),
   _: oracle-price;
+
+#session-baseline-multiplier
+  /* Pick the deployer's multiplier for the session the oracle signed. */
+  oracle-session: signed-context<0 3>(),
+  :ensure(
+    greater-than(baseline-multiplier-rth 0)
+    "RTH multiplier positive"
+  ),
+  :ensure(
+    greater-than(baseline-multiplier-premarket 0)
+    "Premarket multiplier positive"
+  ),
+  :ensure(
+    greater-than(baseline-multiplier-afterhours 0)
+    "Afterhours multiplier positive"
+  ),
+  :ensure(
+    any(
+      equal-to(oracle-session "rth")
+      equal-to(oracle-session "premarket")
+      equal-to(oracle-session "afterhours")
+    )
+    "Unknown oracle session"
+  ),
+  _: if(
+    equal-to(oracle-session "rth")
+    baseline-multiplier-rth
+    if(
+      equal-to(oracle-session "premarket")
+      baseline-multiplier-premarket
+      baseline-multiplier-afterhours
+    )
+  );
 
 #st0x-oracle-baseline-dividends-sell-v4
   oracle-price: call<'st0x-oracle-baseline-v4>(),
@@ -401,7 +512,10 @@ builder:
 #calculate-io
 using-words-from raindex-subparser erc4626-words
 offer-amount: max-positive-value(),
-io: mul(call<'baseline-fn>() baseline-multiplier);
+io: mul(
+  call<'baseline-fn>()
+  call<'session-baseline-multiplier>()
+);
 
 #handle-io
 :;
