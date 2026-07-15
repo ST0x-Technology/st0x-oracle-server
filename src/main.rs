@@ -130,9 +130,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Prime market hours (Alpaca trading calendar). Failure here isn't
-    // fatal — `MarketHoursCache::publish_time_for` falls back to `now`
-    // when empty, which is the pre-RAI-693 behaviour. The hourly refresh
-    // task will keep trying.
+    // fatal — an empty cache classifies as `OvernightClosed` with
+    // degenerate bounds, so v2/v3/v4 session guards revert until the
+    // hourly refresh succeeds. `publish_time` is unaffected (it's the
+    // mark's fetch time, not derived from the calendar).
     let market_hours = Arc::new(MarketHoursCache::new());
     match refresh_once(&market_hours, &alpaca).await {
         Ok(()) => tracing::info!(
@@ -141,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         Err(e) => tracing::warn!(
             error = %e,
-            "Initial market hours fetch failed; publish_time will use `now` until refresh succeeds"
+            "Initial market hours fetch failed; session slots will classify as closed until refresh succeeds"
         ),
     }
     spawn_market_hours_refresh(
