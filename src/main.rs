@@ -151,10 +151,10 @@ async fn main() -> anyhow::Result<()> {
         "Spawned pricing WS subscriber (live quotes warm asynchronously)"
     );
 
-    // Prime market hours (Alpaca trading calendar). Failure here isn't
-    // fatal — `MarketHoursCache::publish_time_for` falls back to `now`
-    // when empty, which is the pre-RAI-693 behaviour. The hourly refresh
-    // task will keep trying.
+    // Prime market hours (Alpaca trading calendar). Used only to classify
+    // the session for the v2/v3/v4 session slots — `publish_time` comes
+    // from the pricing quote's `source_ts`, so a failure here just means
+    // sessions classify as closed until the hourly refresh succeeds.
     let market_hours = Arc::new(MarketHoursCache::new());
     match refresh_once(&market_hours, &alpaca).await {
         Ok(()) => tracing::info!(
@@ -163,12 +163,13 @@ async fn main() -> anyhow::Result<()> {
         ),
         Err(e) => tracing::warn!(
             error = %e,
-            "Initial market hours fetch failed; publish_time will use `now` until refresh succeeds"
+            "Initial market hours fetch failed; session slots classify as closed until refresh succeeds"
         ),
     }
     spawn_market_hours_refresh(
         market_hours.clone(),
-        Duration::from_secs(config.poll_interval_secs),
+        alpaca.clone(),
+        Duration::from_secs(3600),
     );
 
     let state = AppState::new(signer, registry, pricing, symbols, market_hours, metrics);
