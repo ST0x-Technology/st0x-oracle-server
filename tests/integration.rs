@@ -23,11 +23,11 @@ const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x1111111111111111111111111111111111111111";
 const WDRAM: &str = "0x2222222222222222222222222222222222222222";
 
-// The cached `QuoteData.t` (mark fetch time) for every seeded quote.
-// Since publish_time IS the fetch time, tests assert the signed
-// publish_time equals this exact value. Chosen in the past relative to
-// wall-clock now so a regression that accidentally signs `now` would
-// diverge visibly. 1_700_000_000 = 2023-11-14T22:13:20Z.
+// The `source_ts` (Unix seconds) seeded on every test quote via
+// `fake_quote` (which multiplies by 1000 for the ms field). Since the
+// oracle signs the quote's source_ts as publish_time, tests assert the
+// signed publish_time equals this. Chosen in the past so a regression
+// that signed `now` would diverge visibly. 1_700_000_000 = 2023-11-14.
 const FIXED_PUBLISH_TIME: i64 = 1_700_000_000;
 
 fn test_order_tuple(input_token: &str, output_token: &str) -> (OrderV4, U256, U256, Address) {
@@ -92,10 +92,11 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
     }
 }
 
-/// Build a test app with a pre-populated pricing cache. By default we
-/// use a market-hours cache pinned **outside** any session window so
-/// signed `publish_time` is deterministic — the `last_session_close`
-/// is set to `FIXED_PUBLISH_TIME` and tests can assert against it.
+/// Build a test app with a pre-populated pricing cache. Seeded quotes
+/// carry `source_ts_unix_ms = FIXED_PUBLISH_TIME * 1000`, and since the
+/// oracle signs the quote's source_ts as publish_time, tests assert the
+/// signed publish_time against `FIXED_PUBLISH_TIME`. The market-hours
+/// cache only affects the v2/v3/v4 session slots, not publish_time.
 async fn test_app() -> axum::Router {
     test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await
 }
@@ -169,11 +170,10 @@ async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::
     create_app(state)
 }
 
-/// Cache configured with one prior session window whose `session_close`
-/// equals `FIXED_PUBLISH_TIME`. Since that close is far in the past (the
-/// sampler runs in the present), every `publish_time_for(now)` returns
-/// the close — i.e. the app behaves as "out of session" and signs
-/// `FIXED_PUBLISH_TIME` deterministically.
+/// Cache with one prior session window in the past, so the app classifies
+/// as "out of session" for the v2/v3/v4 session slots. publish_time is
+/// unaffected (it's the quote's source_ts); this just makes the session
+/// classification deterministic.
 async fn fixed_close_market_hours() -> Arc<MarketHoursCache> {
     let mh = Arc::new(MarketHoursCache::new());
     let close = Utc.timestamp_opt(FIXED_PUBLISH_TIME, 0).unwrap();
@@ -190,8 +190,8 @@ async fn fixed_close_market_hours() -> Arc<MarketHoursCache> {
 }
 
 /// Cache that places `now` strictly inside an active session window, so
-/// the session slots classify as `rth`. publish_time is still the mark's
-/// fetch time regardless; used by the session-slot tests.
+/// the session slots classify as `rth`. publish_time is still the quote's
+/// source_ts regardless; used by the session-slot tests.
 async fn always_in_session_market_hours() -> Arc<MarketHoursCache> {
     let mh = Arc::new(MarketHoursCache::new());
     let now = Utc::now();
@@ -498,13 +498,13 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
 }
 
 #[tokio::test]
-async fn test_v1_publish_time_is_fetch_time_even_when_in_session() {
-    // publish_time is ALWAYS the mark's own fetch time (`QuoteData.t`),
-    // never the request-handling instant. Here the market-hours cache
-    // says we're inside an active session — under the old sign-time
-    // behaviour that would have stamped `now`. The signed timestamp must
-    // instead be the cached fetch time (FIXED_PUBLISH_TIME), so a stalled
-    // poll loop can't hide behind a fresh request clock.
+async fn test_v1_publish_time_is_quote_source_ts_even_when_in_session() {
+    // publish_time is ALWAYS the pricing quote's own `source_ts`, never
+    // the oracle's request clock. Here the market-hours cache says we're
+    // inside an active session — under the old behaviour that would have
+    // stamped `now`. The signed timestamp must instead be the quote's
+    // seeded source_ts (FIXED_PUBLISH_TIME), so the oracle trusts
+    // st0x.pricing's honest as-of stamp rather than re-deriving one.
     let mh = always_in_session_market_hours().await;
     let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
 
@@ -531,7 +531,7 @@ async fn test_v1_publish_time_is_fetch_time_even_when_in_session() {
     assert_eq!(
         publish.format().unwrap(),
         expected,
-        "in-session publish_time must be the mark's fetch time, not the request clock"
+        "in-session publish_time must be the quote's source_ts, not the request clock"
     );
 }
 

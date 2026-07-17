@@ -75,11 +75,10 @@ pub struct AppState {
     /// Every symbol declared in config.toml. /status compares this
     /// against the pricing cache to surface the partial-serving set.
     configured_symbols: Vec<String>,
-    /// Authoritative market-hours source from Alpaca's calendar. Feeds
-    /// the v2/v3/v4 session slots (tag + start/end bounds) here, and — in
-    /// the poll loop — each mark's as-of `publish_time` (fetch instant
-    /// in-session, last `session_close` out-of-session). The sign path
-    /// itself just signs `QuoteData.t` straight through.
+    /// Market-hours source from Alpaca's calendar, used ONLY to classify
+    /// the current session for the v2/v3/v4 session slots (tag +
+    /// start/end bounds). `publish_time` comes from the pricing quote's
+    /// own `source_ts_unix_ms`, not from this cache.
     market_hours: Arc<MarketHoursCache>,
     /// Prometheus exposition format renderer for `/metrics`.
     metrics: MetricsHandle,
@@ -381,10 +380,8 @@ async fn post_signed_context_v4(
     let needed_symbols: Vec<&str> = resolved.iter().map(|(_, _, p)| p.symbol.as_str()).collect();
     let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
 
-    // Session classification is snapshot once per batch so every signed
-    // context agrees on the session even across a phase boundary
-    // mid-iteration. `publish_time`, by contrast, is per-quote — it's
-    // the mark's own fetch time (`quote.t`), read inside each builder.
+    // Session classification is snapshot once per batch; publish_time is
+    // per-quote (the pricing quote's own source_ts), read inside the builder.
     let session_info = state.market_hours.session_info_for(Utc::now()).await;
 
     let mut responses = Vec::with_capacity(resolved.len());
@@ -476,8 +473,8 @@ async fn post_signed_context_session(
 
     // Snapshot the session classification once for the whole batch so
     // every signed context in this response agrees on which session
-    // we're in, even across a phase boundary mid-iteration. `publish_time`
-    // is per-quote (the mark's own fetch time), read inside the builder.
+    // we're in, even across a phase boundary mid-iteration. publish_time
+    // is per-quote (the pricing quote's own source_ts), read in the builder.
     let session_info = state.market_hours.session_info_for(Utc::now()).await;
 
     let mut responses = Vec::with_capacity(resolved.len());
@@ -582,22 +579,31 @@ fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> [u8; 32] {
 /// matches the request's direction and signs the 32-byte Rain Float
 /// straight through — no inversion, no f64 round-trip, no extra spread.
 ///
-/// `publish_time` is chosen by `MarketHoursCache`: inside an active
-/// extended session window we sign `now`; outside we sign the most
-/// recent `session_close`. This is RAI-693: pricing-service quotes are
-/// pushed continuously even when the underlying market is closed, so a
-/// naive `now` would label an off-hours quote with a fresh timestamp.
+/// `publish_time` is the pricing quote's own `source_ts_unix_ms` — the
+/// honest as-of instant st0x.pricing already stamped on the mark (the
+/// fetch time inside a session, the last `session_close` out-of-session;
+/// RAI-732). The oracle signs that straight through rather than
+/// re-deriving a timestamp from its own clock: pricing owns the
+/// market-hours truth, and trusting its `source_ts` means a stalled or
+/// frozen pricing feed surfaces directly — `source_ts` stops advancing,
+/// the signed timestamp goes stale, and the strategy's `max-staleness`
+/// rejects. The oracle's own `MarketHoursCache` is used only for the
+/// v2/v3/v4 session slots, never for `publish_time`.
+/// Derive the signed `publish_time` (Unix seconds) from a pricing-service
+/// `Quote.source_ts_unix_ms` (Unix milliseconds). st0x.pricing already
+/// stamps `source_ts` with the mark's honest as-of instant (RAI-732), so
+/// the oracle just converts ms → s and signs it.
+fn publish_time_from_quote(quote: &Quote) -> Result<u64, AppError> {
+    u64::try_from(quote.source_ts_unix_ms / 1000)
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("source_ts out of range")))
+}
+
 async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
     quote: &Quote,
 ) -> Result<oracle::OracleResponse, AppError> {
-    let now = Utc::now();
-    let publish_dt = state.market_hours.publish_time_for(now).await;
-    let publish_time: u64 = publish_dt
-        .timestamp()
-        .try_into()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
+    let publish_time = publish_time_from_quote(quote)?;
 
     let price_bytes = pick_rate_bytes(quote, pair.direction);
 
@@ -605,7 +611,6 @@ async fn build_response_from_quote(
         symbol = %pair.symbol,
         direction = pair.direction.as_str(),
         publish_time = publish_time,
-        in_session = (publish_dt == now),
         source_ts_unix_ms = quote.source_ts_unix_ms,
         "Building signed context from live pricing quote"
     );
@@ -629,14 +634,13 @@ async fn build_response_from_quote_session(
     state: &AppState,
     pair: &ResolvedPair,
     quote: &Quote,
-    publish_dt: chrono::DateTime<Utc>,
     session_info: &crate::market_hours::SessionInfo,
     schema: SessionSchema,
 ) -> Result<oracle::OracleResponse, AppError> {
-    let publish_time: u64 = publish_dt
-        .timestamp()
-        .try_into()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
+    // publish_time is the pricing quote's source_ts (see
+    // `build_response_from_quote`); session slots come from the oracle's
+    // own market-hours classification.
+    let publish_time = publish_time_from_quote(quote)?;
     let session_start: u64 = session_info
         .start
         .timestamp()
@@ -690,10 +694,10 @@ async fn build_response_from_quote_v4(
     output_token: Address,
     session_info: &crate::market_hours::SessionInfo,
 ) -> Result<oracle::OracleResponse, AppError> {
-    let publish_time: u64 = publish_dt
-        .timestamp()
-        .try_into()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("publish_time out of range")))?;
+    // publish_time is the pricing quote's source_ts (see
+    // `build_response_from_quote`); session slots come from the oracle's
+    // own market-hours classification.
+    let publish_time = publish_time_from_quote(quote)?;
     let session_start: u64 = session_info
         .start
         .timestamp()
