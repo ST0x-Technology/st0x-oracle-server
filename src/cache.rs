@@ -1,6 +1,6 @@
 use crate::alpaca::{AlpacaClient, QuoteData};
 use crate::market_hours::MarketHoursCache;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,7 +81,13 @@ pub async fn poll_once(
     symbols: &[String],
     market_hours: &MarketHoursCache,
 ) {
-    let as_of = market_hours.publish_time_for(Utc::now()).await;
+    if market_hours.window_count().await == 0 {
+        tracing::warn!("market-hours cache is empty; keeping previous quotes");
+        return;
+    }
+    let now = Utc::now();
+    let as_of = market_hours.publish_time_for(now).await;
+    let active_session_start = market_hours.active_signed_session_start_for(now).await;
     let marks = match alpaca.fetch_marks(as_of).await {
         Ok(m) => m,
         Err(e) => {
@@ -93,6 +99,38 @@ pub async fn poll_once(
     for symbol in symbols {
         match marks.get(symbol) {
             Some(q) => {
+                let previous = cache.get(symbol).await;
+                if let (None, Some(session_start)) = (previous.as_ref(), active_session_start) {
+                    tracing::warn!(
+                        symbol = %symbol,
+                        price = q.price,
+                        session_start = %session_start,
+                        "no previous quote during active signed session; seeding quote before session start"
+                    );
+                    cache
+                        .update(symbol, untrusted_session_seed_quote(q, session_start))
+                        .await;
+                    continue;
+                }
+                if should_keep_previous_quote_at_session_open(
+                    previous.as_ref(),
+                    q.price,
+                    active_session_start,
+                ) {
+                    let previous = previous
+                        .as_ref()
+                        .expect("previous is Some when the guard returns true");
+                    let session_start = active_session_start
+                        .expect("active_session_start is Some when the guard returns true");
+                    tracing::warn!(
+                        symbol = %symbol,
+                        price = q.price,
+                        session_start = %session_start,
+                        previous_ts = %previous.t,
+                        "broker mark unchanged since before session open; keeping previous timestamp"
+                    );
+                    continue;
+                }
                 tracing::debug!(symbol = %symbol, price = q.price, t = %q.t, "Polled broker mark");
                 cache.update(symbol, q.clone()).await;
             }
@@ -134,6 +172,24 @@ pub fn spawn_poll_loop(
     });
 }
 
+fn should_keep_previous_quote_at_session_open(
+    previous: Option<&QuoteData>,
+    current_price: f64,
+    active_session_start: Option<DateTime<Utc>>,
+) -> bool {
+    let (Some(previous), Some(session_start)) = (previous, active_session_start) else {
+        return false;
+    };
+    previous.t < session_start && previous.price.to_bits() == current_price.to_bits()
+}
+
+fn untrusted_session_seed_quote(q: &QuoteData, session_start: DateTime<Utc>) -> QuoteData {
+    QuoteData {
+        price: q.price,
+        t: session_start - chrono::Duration::milliseconds(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +225,54 @@ mod tests {
         let got = cache.get("COIN").await.unwrap();
         assert_eq!(got.price, 200.0);
         assert_eq!(got.t.timestamp(), 2);
+    }
+
+    #[test]
+    fn session_open_gate_holds_unchanged_pre_session_quote() {
+        let previous = quote(100.0, 1_000);
+        let session_start = Utc.timestamp_opt(2_000, 0).unwrap();
+
+        assert!(should_keep_previous_quote_at_session_open(
+            Some(&previous),
+            100.0,
+            Some(session_start)
+        ));
+    }
+
+    #[test]
+    fn session_open_gate_accepts_changed_quote() {
+        let previous = quote(100.0, 1_000);
+        let session_start = Utc.timestamp_opt(2_000, 0).unwrap();
+
+        assert!(!should_keep_previous_quote_at_session_open(
+            Some(&previous),
+            100.01,
+            Some(session_start)
+        ));
+    }
+
+    #[test]
+    fn session_open_gate_accepts_quotes_already_seen_this_session() {
+        let previous = quote(100.0, 2_000);
+        let session_start = Utc.timestamp_opt(2_000, 0).unwrap();
+
+        assert!(!should_keep_previous_quote_at_session_open(
+            Some(&previous),
+            100.0,
+            Some(session_start)
+        ));
+    }
+
+    #[test]
+    fn untrusted_session_seed_keeps_equal_quotes_blocked() {
+        let session_start = Utc.timestamp_opt(2_000, 0).unwrap();
+        let current = quote(100.0, 2_100);
+        let previous = untrusted_session_seed_quote(&current, session_start);
+
+        assert!(should_keep_previous_quote_at_session_open(
+            Some(&previous),
+            current.price,
+            Some(session_start)
+        ));
     }
 }
