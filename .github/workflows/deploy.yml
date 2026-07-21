@@ -23,6 +23,9 @@ on:
     branches:
       - main
       - feature/rai-1002-gcp-kms-signer
+      # Current top of the RAI-1002 stack (+ the WS read-deadline fix):
+      # staging-only, same staging deployer SA as the branch above.
+      - fix/pricing-ws-read-deadline
   workflow_dispatch: {}
 
 concurrency:
