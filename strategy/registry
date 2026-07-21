@@ -1,7 +1,7 @@
-https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/a29a0f91810089239b7d2d4a08143d613876da12/strategy/settings.yaml
-st0x-oracle-limit https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/a29a0f91810089239b7d2d4a08143d613876da12/strategy/st0x-oracle-limit.rain
-st0x-fixed-spread https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/a29a0f91810089239b7d2d4a08143d613876da12/strategy/st0x-fixed-spread.rain
-st0x-oracle-limit-v3 https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/a29a0f91810089239b7d2d4a08143d613876da12/strategy/st0x-oracle-limit-v3.rain
-st0x-fixed-spread-v3 https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/a29a0f91810089239b7d2d4a08143d613876da12/strategy/st0x-fixed-spread-v3.rain
-st0x-oracle-limit-v4 https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/a29a0f91810089239b7d2d4a08143d613876da12/strategy/st0x-oracle-limit-v4.rain
-st0x-fixed-spread-v4 https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/a29a0f91810089239b7d2d4a08143d613876da12/strategy/st0x-fixed-spread-v4.rain
+https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/903c63145b6217e387ad1440a0ed39f3a9be26d3/strategy/settings.yaml
+st0x-oracle-limit https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/903c63145b6217e387ad1440a0ed39f3a9be26d3/strategy/st0x-oracle-limit.rain
+st0x-fixed-spread https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/903c63145b6217e387ad1440a0ed39f3a9be26d3/strategy/st0x-fixed-spread.rain
+st0x-oracle-limit-v3 https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/903c63145b6217e387ad1440a0ed39f3a9be26d3/strategy/st0x-oracle-limit-v3.rain
+st0x-fixed-spread-v3 https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/903c63145b6217e387ad1440a0ed39f3a9be26d3/strategy/st0x-fixed-spread-v3.rain
+st0x-oracle-limit-v4 https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/903c63145b6217e387ad1440a0ed39f3a9be26d3/strategy/st0x-oracle-limit-v4.rain
+st0x-fixed-spread-v4 https://raw.githubusercontent.com/ST0x-Technology/st0x-oracle-server/903c63145b6217e387ad1440a0ed39f3a9be26d3/strategy/st0x-fixed-spread-v4.rain
