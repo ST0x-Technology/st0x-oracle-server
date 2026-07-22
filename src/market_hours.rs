@@ -165,6 +165,30 @@ impl MarketHoursCache {
             .unwrap_or(fetch_time)
     }
 
+    /// Return the active extended-session start for `now`, if the market
+    /// is currently inside a cached session window.
+    pub async fn active_session_start_for(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let windows = self.windows.read().await;
+        windows
+            .iter()
+            .find(|w| w.session_open <= now && now < w.session_close)
+            .map(|w| w.session_open)
+    }
+
+    /// Return the current signed session start, using the same
+    /// premarket/RTH/afterhours boundaries that `/context/v3` and
+    /// `/context/v4` sign into slot 4.
+    pub async fn active_signed_session_start_for(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let info = self.session_info_for(now).await;
+        match info.session {
+            Session::Premarket | Session::Rth | Session::Afterhours => Some(info.start),
+            Session::OvernightClosed | Session::WeekendClosed => None,
+        }
+    }
+
     /// Classify the current market session and return its UTC bounds.
     ///
     /// - Inside an active extended-session window we look at the cached
@@ -348,6 +372,55 @@ mod tests {
         c.set(vec![fri_window()]).await;
         let fetch = utc(2026, 5, 29, 9, 0); // 05:00 ET Friday — pre-market, still in session
         assert_eq!(c.publish_time_for(fetch).await, fetch);
+    }
+
+    #[tokio::test]
+    async fn active_session_start_returns_open_inside_session() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let now = utc(2026, 5, 29, 9, 0);
+        assert_eq!(
+            c.active_session_start_for(now).await,
+            Some(fri_window().session_open)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_session_start_returns_none_outside_session() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window(), mon_window()]).await;
+        let now = utc(2026, 6, 1, 6, 0);
+        assert_eq!(c.active_session_start_for(now).await, None);
+    }
+
+    #[tokio::test]
+    async fn active_signed_session_start_returns_rth_open_during_rth() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let now = utc(2026, 5, 29, 17, 0);
+        assert_eq!(
+            c.active_signed_session_start_for(now).await,
+            Some(fri_window().rth_open)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_signed_session_start_returns_afterhours_open_during_afterhours() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window()]).await;
+        let now = utc(2026, 5, 29, 22, 0);
+        assert_eq!(
+            c.active_signed_session_start_for(now).await,
+            Some(fri_window().rth_close)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_signed_session_start_returns_none_when_closed() {
+        let c = MarketHoursCache::new();
+        c.set(vec![fri_window(), mon_window()]).await;
+        let now = utc(2026, 6, 1, 6, 0);
+        assert_eq!(c.active_signed_session_start_for(now).await, None);
     }
 
     #[tokio::test]
