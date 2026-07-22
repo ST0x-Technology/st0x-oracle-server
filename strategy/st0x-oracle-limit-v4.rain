@@ -175,7 +175,7 @@ oracle-output-token: signed-context<0 7>(),
 ),
 :ensure(
   greater-than-or-equal-to(oracle-publish-time oracle-session-start)
-  "Oracle price before session start"
+  "Price before session start"
 ),
 
 /* Safety guard: zero price means something is fundamentally broken
