@@ -123,6 +123,9 @@ builder:
   /* Read oracle price from signed context column 0, row 1 */
   oracle-price: signed-context<0 1>(),
 
+  /* Read the source timestamp for the signed price. */
+  oracle-publish-time: signed-context<0 2>(),
+
   /* Read the market session this quote was signed during. */
   oracle-session: signed-context<0 3>(),
 
@@ -158,6 +161,10 @@ builder:
   :ensure(
     less-than-or-equal-to(now() oracle-session-end)
     "After session end"
+  ),
+  :ensure(
+    greater-than-or-equal-to(oracle-publish-time oracle-session-start)
+    "Oracle price before session start"
   ),
 
   /*
