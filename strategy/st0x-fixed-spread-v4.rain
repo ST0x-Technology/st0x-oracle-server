@@ -3,7 +3,7 @@ version: 6
 orders:
   base:
     raindex: base
-    oracle-url: https://st0x-oracle-server.fly.dev/context/v4
+    oracle-url: https://oracle.t0trade.com/context/v4
     inputs:
       - token: input
     outputs:
