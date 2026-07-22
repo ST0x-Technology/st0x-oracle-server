@@ -15,7 +15,7 @@ use st0x_oracle_server::oracle::OracleResponse;
 use st0x_oracle_server::{EvaluableV4, OrderV4, IOV2};
 use std::str::FromStr;
 
-/// Probed URL. Override with ORACLE_URL=https://st0x-oracle-server.fly.dev/context/v1
+/// Probed URL. Override with ORACLE_URL=https://oracle.t0trade.com/context/v1
 /// to compare prod against the broker.
 fn oracle_url() -> String {
     std::env::var("ORACLE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000/context/v1".to_string())
