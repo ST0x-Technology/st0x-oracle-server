@@ -17,7 +17,7 @@ scenarios:
     bindings:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       erc4626-words: 0x0d09364EFa7753e53c9101715E7597E660E2919B
-      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-signer: 0xE2f3e6aBde8D4dF23256B250Ae98dEe760C7ec84
       oracle-schema-version: 4
       baseline-fn: '''st0x-oracle-baseline-v4'
   st0x-oracle-baseline-dividends-sell-v4:
@@ -27,7 +27,7 @@ scenarios:
     bindings:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       erc4626-words: 0x0d09364EFa7753e53c9101715E7597E660E2919B
-      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-signer: 0xE2f3e6aBde8D4dF23256B250Ae98dEe760C7ec84
       oracle-schema-version: 4
       baseline-fn: '''st0x-oracle-baseline-dividends-sell-v4'
   st0x-oracle-baseline-dividends-buy-v4:
@@ -37,7 +37,7 @@ scenarios:
     bindings:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
       erc4626-words: 0x0d09364EFa7753e53c9101715E7597E660E2919B
-      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-signer: 0xE2f3e6aBde8D4dF23256B250Ae98dEe760C7ec84
       oracle-schema-version: 4
       baseline-fn: '''st0x-oracle-baseline-dividends-buy-v4'
 
