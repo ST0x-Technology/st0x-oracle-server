@@ -27,9 +27,21 @@ struct Cli {
     #[arg(long, default_value = "config.toml", env = "CONFIG_PATH")]
     config: PathBuf,
 
-    /// Private key for EIP-191 signing (hex, with or without 0x prefix)
-    #[arg(long, env = "SIGNER_PRIVATE_KEY")]
-    signer_private_key: String,
+    /// Private key for EIP-191 signing (hex, with or without 0x prefix).
+    /// Local dev / tests only — production uses --signer-kms-key. Exactly
+    /// one of the two signer sources must be set (validated after parsing
+    /// so that empty env vars — e.g. from compose templating — count as
+    /// unset instead of tripping clap-level conflicts).
+    #[arg(long, env = "SIGNER_PRIVATE_KEY", hide_env_values = true)]
+    signer_private_key: Option<String>,
+
+    /// GCP Cloud KMS key VERSION resource name for EIP-191 signing
+    /// (projects/…/locations/…/keyRings/…/cryptoKeys/…/cryptoKeyVersions/N).
+    /// The key never leaves KMS; each signature is an AsymmetricSign call
+    /// authenticated via ADC (native on GCP runtimes such as Cloud Run;
+    /// elsewhere provide GOOGLE_APPLICATION_CREDENTIALS).
+    #[arg(long, env = "SIGNER_KMS_KEY")]
+    signer_kms_key: Option<String>,
 
     /// Alpaca Broker API key (used as HTTP Basic auth username).
     /// We read reference prices from the issuer's brokerage positions,
@@ -71,7 +83,39 @@ async fn main() -> anyhow::Result<()> {
         "Loaded config"
     );
 
-    let signer = Signer::new(&cli.signer_private_key)?;
+    // Exactly one signer source, validated here rather than via clap
+    // conflicts: empty/whitespace env values (compose/CI templating of unset
+    // vars) are treated as absent, and ambiguous config fails loud with a
+    // message naming both options — no silent precedence for a signer that
+    // guards real funds.
+    let kms_key = cli
+        .signer_kms_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let private_key = cli
+        .signer_private_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let signer = match (kms_key, private_key) {
+        (Some(kms_key), None) => {
+            tracing::info!(key = %kms_key, "Using GCP Cloud KMS signer");
+            Signer::from_gcp_kms(kms_key).await?
+        }
+        (None, Some(private_key)) => {
+            tracing::warn!("Using local private key signer — production must use SIGNER_KMS_KEY");
+            Signer::new(private_key)?
+        }
+        (Some(_), Some(_)) => anyhow::bail!(
+            "Both SIGNER_KMS_KEY and SIGNER_PRIVATE_KEY are set — set exactly one \
+             (SIGNER_KMS_KEY for production, SIGNER_PRIVATE_KEY for local dev)"
+        ),
+        (None, None) => anyhow::bail!(
+            "No signer configured — set exactly one of SIGNER_KMS_KEY (production, \
+             GCP Cloud KMS) or SIGNER_PRIVATE_KEY (local dev)"
+        ),
+    };
     let alpaca = AlpacaClient::new(
         &cli.alpaca_api_key_id,
         &cli.alpaca_api_secret_key,

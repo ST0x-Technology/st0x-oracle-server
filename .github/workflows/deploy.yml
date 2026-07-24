@@ -1,0 +1,205 @@
+name: deploy
+
+# Application releases, hub-and-spoke:
+#
+#   nix build .#oci → push digest → st0x-artifacts (central Artifact Registry)
+#     ├─ deploy digest → st0x-staging      (this branch + main)
+#     └─ deploy digest → st0x-production   (main only, approval-gated, SAME digest)
+#
+# The image is built BY THE FLAKE (dockerTools) — no Dockerfile, no base
+# image: the exact nix store closure `nix build .#st0x-oracle-server`
+# produces, plus CA certs and the non-secret config. `created` is pinned in
+# the flake, so a commit rebuilds to the same digest.
+#
+# While the RAI-1002 parity window runs, THIS STACK BRANCH deploys to
+# staging via a staging-only deployer SA (can touch st0x-staging and the
+# registry, nothing in production). Production deploys remain main-only via
+# oracle-deployer. Bindings live in st0x.devops/terraform/{artifacts,staging}.
+#
+# Auth: GitHub OIDC -> WIF, no stored keys. PRs get nothing (ci.yml gates).
+
+on:
+  push:
+    branches:
+      - main
+      - feature/rai-1002-gcp-kms-signer
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  # GitHub/Sigstore provenance attestation on every pushed digest.
+  attestations: write
+
+env:
+  PROJECT_STAGING: st0x-staging
+  PROJECT_PROD: st0x-production
+  REGION: europe-west3
+  SERVICE: st0x-oracle
+  IMAGE: europe-west3-docker.pkg.dev/st0x-artifacts/st0x-oracle/st0x-oracle-server
+  # From st0x.devops/terraform/artifacts outputs.
+  WIF_PROVIDER: projects/1029268607565/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+  # main -> oracle-deployer (staging + production); branch -> staging-only SA.
+  DEPLOYER_SA: ${{ github.ref == 'refs/heads/main'
+    && 'oracle-deployer@st0x-artifacts.iam.gserviceaccount.com'
+    || 'oracle-deployer-staging@st0x-artifacts.iam.gserviceaccount.com' }}
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-oci-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-oci-${{ runner.os }}-
+          gc-max-store-size-linux: 10G
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          # `container binauthz` lives in the beta component.
+          install_components: beta
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build OCI image from the flake
+        run: |
+          set -euo pipefail
+          nix build --impure .#oci
+          # streamLayeredImage output is a script that streams the tar.
+          ./result | docker load
+          docker tag st0x-oracle-server:latest "${IMAGE}:${GITHUB_SHA}"
+
+      - name: Push image and resolve digest
+        id: push
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${GITHUB_SHA}")
+          echo "Pushed: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${DIGEST##*@}" >> "$GITHUB_OUTPUT"
+
+      # Two independent provenance proofs on the digest just pushed:
+      #
+      # 1. GitHub/Sigstore attestation — binds the digest to THIS repo,
+      #    workflow, and commit. Anyone verifies with:
+      #    gh attestation verify oci://<image>@<digest> --repo ${{ github.repository }}
+      #
+      # 2. Binary Authorization attestation — the digest signed with the
+      #    st0x-artifacts attestor KMS key. staging/production only admit
+      #    signed digests (policies in st0x.devops terraform/{staging,production}).
+      #
+      # Both run as the same WIF identity as the push, so the boundary they
+      # enforce is "built by a deploying branch of this repo" — a rogue image
+      # pushed straight into the registry can't be deployed. (Third, manual
+      # proof: the image is a reproducible nix build — `nix build .#oci` at
+      # this commit re-derives the digest byte-for-byte.)
+      - name: Attest build provenance (GitHub / Sigstore)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.sha256 }}
+
+      - name: Sign Binary Authorization attestation
+        run: |
+          set -euo pipefail
+          gcloud beta container binauthz attestations sign-and-create \
+            --project="st0x-artifacts" \
+            --artifact-url="${{ steps.push.outputs.digest }}" \
+            --attestor="projects/st0x-artifacts/attestors/oracle-image" \
+            --keyversion="projects/st0x-artifacts/locations/${REGION}/keyRings/attestors/cryptoKeys/oracle-image-attestor/cryptoKeyVersions/1"
+
+  deploy-staging:
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Deploys by immutable digest, never by tag. Skips (loudly) while the
+      # service doesn't exist yet — the FIRST deploy is Terraform's
+      # (deploy_workload=true, oracle_container_image = a digest this
+      # workflow already pushed); every deploy after that happens here.
+      - name: Deploy to Cloud Run (staging)
+        run: |
+          set -euo pipefail
+          if ! gcloud run services describe "${SERVICE}" --project "${PROJECT_STAGING}" --region "${REGION}" --format='value(metadata.name)' >/dev/null 2>&1; then
+            echo "::warning::Cloud Run service '${SERVICE}' not found in ${PROJECT_STAGING} — image pushed but not deployed." \
+              "Bootstrap via st0x.devops/terraform/staging (deploy_workload=true," \
+              "oracle_container_image=${{ needs.build-push.outputs.digest }})."
+            exit 0
+          fi
+          gcloud run services update "${SERVICE}" \
+            --project "${PROJECT_STAGING}" \
+            --region "${REGION}" \
+            --image "${{ needs.build-push.outputs.digest }}" \
+            --quiet
+          gcloud run services describe "${SERVICE}" --project "${PROJECT_STAGING}" --region "${REGION}" \
+            --format='value(status.latestReadyRevisionName, status.url)'
+
+  # Same digest staging just took — promotion, not a rebuild. Only ever
+  # from main; the `production` GitHub environment carries the approval
+  # gate (required reviewers in Settings -> Environments).
+  deploy-production:
+    if: github.ref == 'refs/heads/main'
+    needs: [build-push, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run (production)
+        run: |
+          set -euo pipefail
+          if ! gcloud run services describe "${SERVICE}" --project "${PROJECT_PROD}" --region "${REGION}" --format='value(metadata.name)' >/dev/null 2>&1; then
+            echo "::warning::Cloud Run service '${SERVICE}' not found in ${PROJECT_PROD} — image pushed but not deployed." \
+              "Bootstrap via st0x.devops/terraform/production (deploy_workload=true," \
+              "oracle_container_image=${{ needs.build-push.outputs.digest }})."
+            exit 0
+          fi
+          gcloud run services update "${SERVICE}" \
+            --project "${PROJECT_PROD}" \
+            --region "${REGION}" \
+            --image "${{ needs.build-push.outputs.digest }}" \
+            --quiet
+          gcloud run services describe "${SERVICE}" --project "${PROJECT_PROD}" --region "${REGION}" \
+            --format='value(status.latestReadyRevisionName, status.url)'
