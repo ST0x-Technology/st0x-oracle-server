@@ -19,112 +19,112 @@ consumer = "oracle"
 
 [[tokens]]
 address = "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"
-symbol = "NVDA"
+symbol = "wtNVDA"
 
 [[tokens]]
 address = "0x997baE3EC193a249596d3708C3fAB7C501Bb8a53"
-symbol = "AMZN"
+symbol = "wtAMZN"
 
 [[tokens]]
 address = "0x219A8d384a10BF19b9f24cB5cC53F79Dd0e5A03D"
-symbol = "TSLA"
+symbol = "wtTSLA"
 
 [[tokens]]
 address = "0xFF05E1bD696900dc6A52CA35Ca61Bb1024eDa8e2"
-symbol = "MSTR"
+symbol = "wtMSTR"
 
 [[tokens]]
 address = "0x1E46d7eFef64A833AFB1CD49299a7AD5B439f4d8"
-symbol = "IAU"
+symbol = "wtIAU"
 
 [[tokens]]
 address = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"
-symbol = "COIN"
+symbol = "wtCOIN"
 
 [[tokens]]
 address = "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"
-symbol = "SPYM"
+symbol = "wtSPYM"
 
 [[tokens]]
 address = "0xEB7F3E4093C9d68253b6104FbbfF561F3eC0442F"
-symbol = "SIVR"
+symbol = "wtSIVR"
 
 [[tokens]]
 address = "0x8AFba81DEc38DE0A18E2Df5E1967a7493651eebf"
-symbol = "CRCL"
+symbol = "wtCRCL"
 
 [[tokens]]
 address = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
-symbol = "BMNR"
+symbol = "wtBMNR"
 
 [[tokens]]
 address = "0x82f5BAEE1076334357a34A19E04f7c282D51cE47"
-symbol = "PPLT"
+symbol = "wtPPLT"
 
 [[tokens]]
 address = "0x823FF7Bbde2869aAe73A6CD53e7f614442836757"
-symbol = "QQQM"
+symbol = "wtQQQM"
 
 [[tokens]]
 address = "0x23ec6886b49D7ab123E9ee8e474D2fa7AB6Cbc2d"
-symbol = "VWO"
+symbol = "wtVWO"
 
 [[tokens]]
 address = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"
-symbol = "ARKK"
+symbol = "wtARKK"
 
 [[tokens]]
 address = "0x78c31580c97101694C70022c83D570150c11e935"
-symbol = "SGOV"
+symbol = "wtSGOV"
 
 [[tokens]]
 address = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
-symbol = "SPCX"
+symbol = "wtSPCX"
 
 [[tokens]]
 address = "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"
-symbol = "CEG"
+symbol = "wtCEG"
 
 [[tokens]]
 address = "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"
-symbol = "DRAM"
+symbol = "wtDRAM"
 
 [[tokens]]
 address = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
-symbol = "TSM"
+symbol = "wtTSM"
 
 [[tokens]]
 address = "0xF4f8c66085910d583c01f3b4e44Bf731D4e2c565"
-symbol = "RKLB"
+symbol = "wtRKLB"
 
 [[tokens]]
 address = "0x8200c6d9AB9E02A25D7F2099244C476d99a085ef"
-symbol = "ASML"
+symbol = "wtASML"
 
 [[tokens]]
 address = "0xFcD17aC4c4BF6a72c93018096F3fC09e66573Ff9"
-symbol = "SKHY"
+symbol = "wtSKHY"
 
 [[tokens]]
 address = "0x89EcfE9E0728D6b3c5eb0EE7236f8C6F806C7B56"
-symbol = "MU"
+symbol = "wtMU"
 
 [[tokens]]
 address = "0x648042Acd8638E12fEfd51C2b25A9f993f21a612"
-symbol = "AMD"
+symbol = "wtAMD"
 
 [[tokens]]
 address = "0x70A182f481AEF05836666B6CfDbe84dCBCE8AC19"
-symbol = "AVGO"
+symbol = "wtAVGO"
 
 [[tokens]]
 address = "0x522DC65c89C9Af4f410BAe01bbf53aF75854a9f9"
-symbol = "AMAT"
+symbol = "wtAMAT"
 
 [[tokens]]
 address = "0x328B9aFFa511fE26673edBb4fEa37eDaF908A3bc"
-symbol = "LRCX"
+symbol = "wtLRCX"
 
 [[tokens]]
 address = "0x045Fb493D970f94a54FeaF931033622fC82192e6"
-symbol = "TTWO"
+symbol = "wtTTWO"
