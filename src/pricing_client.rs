@@ -22,6 +22,11 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
+/// Longest we let the socket sit silent before declaring it dead. The
+/// pricing server heartbeats every 15s, so this is four missed heartbeats —
+/// generous against jitter, still under a minute to detect a frozen feed.
+const READ_DEADLINE: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("WebSocket error: {0}")]
@@ -271,7 +276,27 @@ async fn connect_and_run(
         .await
         .map_err(|e| ClientError::WebSocket(format!("{e}")))?;
 
-    while let Some(msg) = socket.next().await {
+    // Bound every read. The pricing server heartbeats every 15s
+    // (ServerFrame::Ping) and itself drops clients that stop ponging, so a
+    // healthy wire always carries a frame at least every 15s. Without a
+    // deadline, a half-open TCP path (LB idle drop, NAT timeout — the close
+    // never reaches us) leaves `socket.next()` blocked forever: no error, no
+    // reconnect, and the price cache silently freezes. That is exactly how
+    // production served 14-hour-old marks on 2026-07-20 (source_ts pinned at
+    // 09:21 UTC with zero session-error log lines). Four missed heartbeats
+    // means the session is dead — surface it as an error so `run_loop`
+    // reconnects with backoff.
+    loop {
+        let msg = match tokio::time::timeout(READ_DEADLINE, socket.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(ClientError::WebSocket(format!(
+                    "no frame for {READ_DEADLINE:?} (server heartbeats every 15s); \
+                     presuming half-open connection"
+                )))
+            }
+        };
         match msg {
             Ok(WsMessage::Binary(b)) => {
                 let frame = match decode_server_frame(&b[..]) {
