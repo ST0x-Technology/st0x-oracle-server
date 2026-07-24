@@ -3,8 +3,14 @@ name: deploy
 # Application releases, hub-and-spoke:
 #
 #   nix build .#oci → push digest → st0x-artifacts (central Artifact Registry)
-#     ├─ deploy digest → st0x-staging      (this branch + main)
-#     └─ deploy digest → st0x-production   (main only, approval-gated, SAME digest)
+#     └─ deploy digest → st0x-staging      (this branch + main)
+#
+# PRODUCTION IS NOT DEPLOYED FROM THIS REPO. Prod rolls happen exclusively
+# in t0.devops: promote the staging-verified digest into
+# terraform/production-oracle/images.yaml — merging that fires the
+# release-oracle workflow (PAM-approved apply + image roll). This repo's
+# deployer SAs hold no rights in st0x-production (revoked 2026-07-24,
+# t0.devops#93), so a prod-deploy job here could only 403.
 #
 # The image is built BY THE FLAKE (dockerTools) — no Dockerfile, no base
 # image: the exact nix store closure `nix build .#st0x-oracle-server`
@@ -13,8 +19,8 @@ name: deploy
 #
 # While the RAI-1002 parity window runs, THIS STACK BRANCH deploys to
 # staging via a staging-only deployer SA (can touch st0x-staging and the
-# registry, nothing in production). Production deploys remain main-only via
-# oracle-deployer. Bindings live in st0x.devops/terraform/{artifacts,staging}.
+# registry, nothing in production). Bindings live in
+# t0.devops/terraform/{production-artifacts,staging-oracle}.
 #
 # Auth: GitHub OIDC -> WIF, no stored keys. PRs get nothing (ci.yml gates).
 
@@ -40,13 +46,12 @@ permissions:
 
 env:
   PROJECT_STAGING: st0x-staging
-  PROJECT_PROD: st0x-production
   REGION: europe-west3
   SERVICE: st0x-oracle
   IMAGE: europe-west3-docker.pkg.dev/st0x-artifacts/st0x-oracle/st0x-oracle-server
-  # From st0x.devops/terraform/artifacts outputs.
+  # From t0.devops/terraform/production-artifacts outputs.
   WIF_PROVIDER: projects/1029268607565/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
-  # main -> oracle-deployer (staging + production); branch -> staging-only SA.
+  # main -> oracle-deployer; branch -> staging-only SA. Both stop at staging.
   DEPLOYER_SA: ${{ github.ref == 'refs/heads/main'
     && 'oracle-deployer@st0x-artifacts.iam.gserviceaccount.com'
     || 'oracle-deployer-staging@st0x-artifacts.iam.gserviceaccount.com' }}
@@ -171,38 +176,4 @@ jobs:
             --image "${{ needs.build-push.outputs.digest }}" \
             --quiet
           gcloud run services describe "${SERVICE}" --project "${PROJECT_STAGING}" --region "${REGION}" \
-            --format='value(status.latestReadyRevisionName, status.url)'
-
-  # Same digest staging just took — promotion, not a rebuild. Only ever
-  # from main; the `production` GitHub environment carries the approval
-  # gate (required reviewers in Settings -> Environments).
-  deploy-production:
-    if: github.ref == 'refs/heads/main'
-    needs: [build-push, deploy-staging]
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ env.WIF_PROVIDER }}
-          service_account: ${{ env.DEPLOYER_SA }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Deploy to Cloud Run (production)
-        run: |
-          set -euo pipefail
-          if ! gcloud run services describe "${SERVICE}" --project "${PROJECT_PROD}" --region "${REGION}" --format='value(metadata.name)' >/dev/null 2>&1; then
-            echo "::warning::Cloud Run service '${SERVICE}' not found in ${PROJECT_PROD} — image pushed but not deployed." \
-              "Bootstrap via st0x.devops/terraform/production (deploy_workload=true," \
-              "oracle_container_image=${{ needs.build-push.outputs.digest }})."
-            exit 0
-          fi
-          gcloud run services update "${SERVICE}" \
-            --project "${PROJECT_PROD}" \
-            --region "${REGION}" \
-            --image "${{ needs.build-push.outputs.digest }}" \
-            --quiet
-          gcloud run services describe "${SERVICE}" --project "${PROJECT_PROD}" --region "${REGION}" \
             --format='value(status.latestReadyRevisionName, status.url)'
