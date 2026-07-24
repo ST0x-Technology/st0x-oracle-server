@@ -45,9 +45,21 @@ struct Cli {
 
     /// API key for the st0x.pricing WebSocket. Format
     /// `pricing_<consumer>_<32 hex>`; consumer name must match the
-    /// `[pricing].consumer` value in config.toml.
+    /// `[pricing].consumer` value in config.toml. Unused when
+    /// `--pricing-iam-auth` is set (Cloud Run IAM replaces it).
     #[arg(long, env = "PRICING_API_KEY")]
     pricing_api_key: String,
+
+    /// Override the pricing WS URL from config. Set per-env (the image is
+    /// built once and promoted staging->prod, which point at different
+    /// pricing services), e.g. `wss://st0x-pricing-….run.app/ws`.
+    #[arg(long, env = "PRICING_WS_URL")]
+    pricing_ws_url: Option<String>,
+
+    /// Authenticate to pricing with a Google ID token (Cloud Run IAM) instead
+    /// of the API key. Set true where pricing is a private Cloud Run service.
+    #[arg(long, env = "PRICING_IAM_AUTH", action = clap::ArgAction::Set, default_value_t = false)]
+    pricing_iam_auth: bool,
 
     /// Alpaca Broker API key id. Used only for the trading calendar
     /// endpoint — the oracle no longer polls Alpaca for reference
@@ -140,12 +152,19 @@ async fn main() -> anyhow::Result<()> {
     // connect — that would block boot on a transient pricing-service
     // outage.
     let symbols = config.symbols();
-    let pricing = LiveClient::spawn(LiveClientConfig::new(
-        config.pricing.ws_url.clone(),
-        cli.pricing_api_key.clone(),
-        config.pricing.consumer.clone(),
-        symbols.clone(),
-    ));
+    let pricing_ws_url = cli
+        .pricing_ws_url
+        .clone()
+        .unwrap_or_else(|| config.pricing.ws_url.clone());
+    let pricing = LiveClient::spawn(
+        LiveClientConfig::new(
+            pricing_ws_url,
+            cli.pricing_api_key.clone(),
+            config.pricing.consumer.clone(),
+            symbols.clone(),
+        )
+        .with_iam_auth(cli.pricing_iam_auth),
+    );
     tracing::info!(
         symbol_count = symbols.len(),
         "Spawned pricing WS subscriber (live quotes warm asynchronously)"

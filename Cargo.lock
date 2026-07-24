@@ -5348,6 +5348,7 @@ dependencies = [
  "http-body-util",
  "metrics",
  "metrics-exporter-prometheus",
+ "proptest",
  "rain-math-float",
  "reqwest 0.12.28",
  "rustls",

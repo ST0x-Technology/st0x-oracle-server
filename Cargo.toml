@@ -67,3 +67,7 @@ wasm-bindgen = "=0.2.100"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Property-based tests. Same version as st0x.pricing / st0x.bebop.
+# Used for the signing fuzz target + the pricing-client wire-decode
+# fuzz target (RAI-363 quality-bar sweep).
+proptest = "1"

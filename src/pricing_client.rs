@@ -30,6 +30,8 @@ pub enum ClientError {
     Cbor(String),
     #[error("invalid header value: {0}")]
     Header(String),
+    #[error("id-token error: {0}")]
+    IdToken(String),
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,13 @@ pub struct LiveClientConfig {
     pub assets: Vec<Symbol>,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    /// When true, authenticate the WS handshake with a Google ID token minted
+    /// from the runtime service account (Cloud Run IAM), instead of the
+    /// app-level `api_key`. Set for the GCP deployment, where pricing is a
+    /// private Cloud Run service gated by IAM; false on the tailnet/local,
+    /// where pricing checks the API key itself. No secret either way — the ID
+    /// token is fetched on the fly from the metadata server.
+    pub iam_auth: bool,
 }
 
 impl LiveClientConfig {
@@ -56,7 +65,15 @@ impl LiveClientConfig {
             assets,
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
+            iam_auth: false,
         }
+    }
+
+    /// Authenticate with a Cloud Run IAM ID token instead of the API key.
+    #[must_use]
+    pub fn with_iam_auth(mut self, on: bool) -> Self {
+        self.iam_auth = on;
+        self
     }
 }
 
@@ -165,6 +182,57 @@ fn encode_cbor<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, ClientError> {
     Ok(buf)
 }
 
+/// Pure decoder for an inbound `ServerFrame`. Exposed for fuzzing
+/// (RAI-363): the on-wire loop uses this and discards `Err` results,
+/// so any input that panics here is a real bug. Property tests at
+/// the bottom of this file exercise it against arbitrary byte strings.
+pub fn decode_server_frame(bytes: &[u8]) -> Result<ServerFrame, ClientError> {
+    ciborium::from_reader(bytes).map_err(|e| ClientError::Cbor(e.to_string()))
+}
+
+/// Derive the Cloud Run audience (the service's base URL) from a WS URL:
+/// `wss://host/ws` -> `https://host`. A Cloud Run ID token's audience must
+/// exactly match the invoked service's URL (scheme + host, no path).
+fn service_audience(ws_url: &str) -> String {
+    let http = ws_url
+        .strip_prefix("wss://")
+        .map(|r| format!("https://{r}"))
+        .or_else(|| ws_url.strip_prefix("ws://").map(|r| format!("http://{r}")))
+        .unwrap_or_else(|| ws_url.to_string());
+    match http.find("://") {
+        Some(i) => {
+            let rest = &http[i + 3..];
+            let host_len = rest.find('/').unwrap_or(rest.len());
+            format!("{}{}", &http[..i + 3], &rest[..host_len])
+        }
+        None => http,
+    }
+}
+
+/// Mint a Google-signed ID token for the runtime service account from the
+/// GCE/Cloud Run metadata server, scoped to `audience`. No stored secret: the
+/// token is fetched on demand and lives ~1h — each reconnect gets a fresh one.
+async fn fetch_id_token(audience: &str) -> Result<String, ClientError> {
+    let resp = reqwest::Client::new()
+        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity")
+        .query(&[("audience", audience)])
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await
+        .map_err(|e| ClientError::IdToken(format!("metadata request: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(ClientError::IdToken(format!(
+            "metadata status {}",
+            resp.status()
+        )));
+    }
+    let token = resp
+        .text()
+        .await
+        .map_err(|e| ClientError::IdToken(format!("metadata body: {e}")))?;
+    Ok(token.trim().to_string())
+}
+
 async fn connect_and_run(
     cfg: &LiveClientConfig,
     cache: &Arc<RwLock<HashMap<Symbol, Quote>>>,
@@ -174,7 +242,18 @@ async fn connect_and_run(
         .as_str()
         .into_client_request()
         .map_err(|e| ClientError::WebSocket(format!("{e}")))?;
-    let bearer = format!("Bearer {}", cfg.api_key);
+    // Cloud Run IAM commandeers the Authorization header for a Google ID token,
+    // so when iam_auth is set we mint one for the runtime SA (audience = the
+    // pricing service's base URL) and send that; pricing's own API-key auth is
+    // disabled behind IAM. Otherwise send the app-level API key (tailnet/local).
+    let bearer = if cfg.iam_auth {
+        format!(
+            "Bearer {}",
+            fetch_id_token(&service_audience(&cfg.ws_url)).await?
+        )
+    } else {
+        format!("Bearer {}", cfg.api_key)
+    };
     req.headers_mut().insert(
         http::header::AUTHORIZATION,
         HeaderValue::from_str(&bearer).map_err(|e| ClientError::Header(format!("{e}")))?,
@@ -195,7 +274,7 @@ async fn connect_and_run(
     while let Some(msg) = socket.next().await {
         match msg {
             Ok(WsMessage::Binary(b)) => {
-                let frame: ServerFrame = match ciborium::from_reader(&b[..]) {
+                let frame = match decode_server_frame(&b[..]) {
                     Ok(f) => f,
                     Err(e) => {
                         tracing::warn!(error = %e, "Bad pricing WS frame; ignoring");
@@ -242,4 +321,24 @@ async fn connect_and_run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The WS receive loop runs `decode_server_frame` on every
+        /// inbound binary frame and silently drops the result on
+        /// `Err`. Any panic here would crash the subscriber task and
+        /// stall the pricing cache until the next reconnect — bad
+        /// enough that we exercise it against arbitrary bytes.
+        #[test]
+        fn wire_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let _ = decode_server_frame(&bytes);
+        }
+    }
 }
