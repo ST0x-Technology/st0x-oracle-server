@@ -1,17 +1,17 @@
-use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::primitives::{Address, FixedBytes, B256, U256};
 use alloy::sol_types::SolValue;
 use axum::body::Bytes;
 use chrono::{Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use http_body_util::BodyExt;
 use rain_math_float::Float;
-use st0x_oracle_server::alpaca::QuoteData;
-use st0x_oracle_server::cache::QuoteCache;
 use st0x_oracle_server::market_hours::{MarketHoursCache, SessionWindow};
 use st0x_oracle_server::metrics::MetricsHandle;
 use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
+use st0x_oracle_server::pricing_client::LiveClient;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::{create_app, AppState, EvaluableV4, OrderV4, IOV2};
+use st0x_pricing_types::{Quote, WireAddress, WireFloat};
 use std::str::FromStr;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -23,11 +23,11 @@ const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x1111111111111111111111111111111111111111";
 const WDRAM: &str = "0x2222222222222222222222222222222222222222";
 
-// The cached `QuoteData.t` (mark fetch time) for every seeded quote.
-// Since publish_time IS the fetch time, tests assert the signed
-// publish_time equals this exact value. Chosen in the past relative to
-// wall-clock now so a regression that accidentally signs `now` would
-// diverge visibly. 1_700_000_000 = 2023-11-14T22:13:20Z.
+// The `source_ts` (Unix seconds) seeded on every test quote via
+// `fake_quote` (which multiplies by 1000 for the ms field). Since the
+// oracle signs the quote's source_ts as publish_time, tests assert the
+// signed publish_time equals this. Chosen in the past so a regression
+// that signed `now` would diverge visibly. 1_700_000_000 = 2023-11-14.
 const FIXED_PUBLISH_TIME: i64 = 1_700_000_000;
 
 fn test_order_tuple(input_token: &str, output_token: &str) -> (OrderV4, U256, U256, Address) {
@@ -63,11 +63,40 @@ fn encode_batch(pairs: &[(&str, &str)]) -> Bytes {
     Bytes::from(tuples.abi_encode())
 }
 
-/// Build a test app with a pre-populated cache. Seeded quotes carry
-/// `QuoteData.t = FIXED_PUBLISH_TIME`, and since publish_time is the
-/// mark's fetch time, tests assert the signed publish_time against it.
-/// The default market-hours cache is pinned outside any session window;
-/// that only affects the v2/v3/v4 session slots, not publish_time.
+/// Build a 32-byte Rain WireFloat from a decimal string. Used to seed
+/// deterministic prices on test `Quote`s without going through the
+/// pricing WS.
+fn wire_float_of(s: &str) -> WireFloat {
+    let f = Float::parse(s.to_string()).unwrap();
+    let b: B256 = f.into();
+    WireFloat::from_bytes(b.into())
+}
+
+/// Build a fake live `Quote` for a single symbol. `quote_to_base` and
+/// `base_to_quote` get the same Rain Float — the oracle no longer
+/// inverts, so tests treat the rate as already-direction-correct from
+/// the pricing service. Tests that exercise direction-picking just
+/// assert that the chosen rate is the one we put in the chosen slot.
+fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote: &str) -> Quote {
+    let base_bytes: [u8; 20] = Address::from_str(base_token).unwrap().into();
+    let usdc_bytes: [u8; 20] = Address::from_str(USDC).unwrap().into();
+    Quote {
+        asset: symbol.to_string(),
+        chain_id: 8453,
+        base: WireAddress::from(base_bytes),
+        quote: WireAddress::from(usdc_bytes),
+        rate_base_to_quote: wire_float_of(base_to_quote),
+        rate_quote_to_base: wire_float_of(quote_to_base),
+        expiry_unix_ms: i64::MAX,
+        source_ts_unix_ms: FIXED_PUBLISH_TIME * 1000,
+    }
+}
+
+/// Build a test app with a pre-populated pricing cache. Seeded quotes
+/// carry `source_ts_unix_ms = FIXED_PUBLISH_TIME * 1000`, and since the
+/// oracle signs the quote's source_ts as publish_time, tests assert the
+/// signed publish_time against `FIXED_PUBLISH_TIME`. The market-hours
+/// cache only affects the v2/v3/v4 session slots, not publish_time.
 async fn test_app() -> axum::Router {
     test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await
 }
@@ -90,27 +119,24 @@ async fn test_app_full(
         .collect();
     let registry = TokenRegistry::new(registry_entries, USDC).unwrap();
 
-    let cache = Arc::new(QuoteCache::new());
-    for (_, sym, price) in entries {
+    let mut quotes = Vec::new();
+    for (addr, sym, price) in entries {
         if let Some(p) = price {
-            cache
-                .update(
-                    sym,
-                    QuoteData {
-                        price: *p,
-                        t: Utc.timestamp_opt(FIXED_PUBLISH_TIME, 0).unwrap(),
-                    },
-                )
-                .await;
+            // For tests both directions get the same rate. Real pricing
+            // service emits asymmetric rates per direction; we exercise
+            // the direction-pick path via `test_v1_directions_use_their_own_rate`.
+            let s = format!("{p}");
+            quotes.push(fake_quote(sym, addr, &s, &s));
         }
     }
+    let pricing = LiveClient::with_seeded(quotes).await;
 
     let configured_symbols: Vec<String> = entries.iter().map(|(_, s, _)| s.to_string()).collect();
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
         signer,
         registry,
-        cache,
+        pricing,
         configured_symbols,
         market_hours,
         metrics,
@@ -118,10 +144,36 @@ async fn test_app_full(
     create_app(state)
 }
 
-/// Cache configured with one prior session window in the past, so the
-/// app classifies as "out of session" for the v2/v3/v4 session slots.
-/// publish_time is unaffected (it's the fetch time); this just makes the
-/// session classification deterministic.
+/// Build a test app whose pricing cache holds asymmetric per-direction
+/// rates for one symbol. Used by the direction-pick test that proves
+/// the oracle picks the correct rate slot from `Quote` per request
+/// direction without doing any inversion of its own.
+async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::Router {
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
+    let pricing = LiveClient::with_seeded(vec![fake_quote(
+        "COIN",
+        WCOIN,
+        quote_to_base,
+        base_to_quote,
+    )])
+    .await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        pricing,
+        vec!["COIN".to_string()],
+        fixed_close_market_hours().await,
+        metrics,
+    );
+    create_app(state)
+}
+
+/// Cache with one prior session window in the past, so the app classifies
+/// as "out of session" for the v2/v3/v4 session slots. publish_time is
+/// unaffected (it's the quote's source_ts); this just makes the session
+/// classification deterministic.
 async fn fixed_close_market_hours() -> Arc<MarketHoursCache> {
     let mh = Arc::new(MarketHoursCache::new());
     let close = Utc.timestamp_opt(FIXED_PUBLISH_TIME, 0).unwrap();
@@ -138,8 +190,8 @@ async fn fixed_close_market_hours() -> Arc<MarketHoursCache> {
 }
 
 /// Cache that places `now` strictly inside an active session window, so
-/// the session slots classify as `rth`. publish_time is still the mark's
-/// fetch time regardless; used by the session-slot tests.
+/// the session slots classify as `rth`. publish_time is still the quote's
+/// source_ts regardless; used by the session-slot tests.
 async fn always_in_session_market_hours() -> Arc<MarketHoursCache> {
     let mh = Arc::new(MarketHoursCache::new());
     let now = Utc::now();
@@ -446,13 +498,13 @@ async fn test_v1_single_returns_v1_schema_from_cache() {
 }
 
 #[tokio::test]
-async fn test_v1_publish_time_is_fetch_time_even_when_in_session() {
-    // publish_time is ALWAYS the mark's own fetch time (`QuoteData.t`),
-    // never the request-handling instant. Here the market-hours cache
-    // says we're inside an active session — under the old sign-time
-    // behaviour that would have stamped `now`. The signed timestamp must
-    // instead be the cached fetch time (FIXED_PUBLISH_TIME), so a stalled
-    // poll loop can't hide behind a fresh request clock.
+async fn test_v1_publish_time_is_quote_source_ts_even_when_in_session() {
+    // publish_time is ALWAYS the pricing quote's own `source_ts`, never
+    // the oracle's request clock. Here the market-hours cache says we're
+    // inside an active session — under the old behaviour that would have
+    // stamped `now`. The signed timestamp must instead be the quote's
+    // seeded source_ts (FIXED_PUBLISH_TIME), so the oracle trusts
+    // st0x.pricing's honest as-of stamp rather than re-deriving one.
     let mh = always_in_session_market_hours().await;
     let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
 
@@ -479,7 +531,7 @@ async fn test_v1_publish_time_is_fetch_time_even_when_in_session() {
     assert_eq!(
         publish.format().unwrap(),
         expected,
-        "in-session publish_time must be the mark's fetch time, not the request clock"
+        "in-session publish_time must be the quote's source_ts, not the request clock"
     );
 }
 
@@ -884,10 +936,11 @@ async fn test_v2_batch_returns_length_matching_array_with_session() {
     assert_eq!(responses[0].context[3], responses[1].context[3]);
     assert_eq!(responses[0].context[4], responses[1].context[4]);
     assert_eq!(responses[0].context[5], responses[1].context[5]);
-    // Sell leg's price is inverted (1/100 = 0.01) per the build_context_v2
-    // contract — exercises the same inversion path as v1.
+    // Both legs sign the seeded rate straight through (the harness
+    // populates both direction slots with 100). The per-direction
+    // pick is exercised in `test_v1_picks_per_direction_rate_without_inversion`.
     let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
-    assert_eq!(sell_price.format().unwrap(), "0.01");
+    assert_eq!(sell_price.format().unwrap(), "100");
 }
 
 #[tokio::test]
@@ -1042,11 +1095,66 @@ async fn test_v1_batch_returns_length_matching_array() {
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
-    // First: buy → broker mark (100)
+    // First (buy): picks `rate_base_to_quote` — both slots seeded with
+    // the same 100 in our test harness, so we expect to see 100 here.
     let buy_price = Float::from(alloy::primitives::B256::from(responses[0].context[1]));
     assert_eq!(buy_price.format().unwrap(), "100");
 
-    // Second: sell → 1/mark, where mark = 100 → exactly 0.01
+    // Second (sell): picks `rate_quote_to_base` — also 100 in the
+    // harness. The direction-picking proof is in
+    // `test_v1_picks_per_direction_rate_without_inversion`; this test
+    // exercises batching coherence + array length.
     let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
-    assert_eq!(sell_price.format().unwrap(), "0.01");
+    assert_eq!(sell_price.format().unwrap(), "100");
+}
+
+#[tokio::test]
+async fn test_v1_picks_per_direction_rate_without_inversion() {
+    // Post-RAI-360 invariant: the oracle picks the matching rate slot
+    // straight from the pricing-service `Quote` and signs the raw
+    // 32-byte Float through. No inversion math. To prove this, seed
+    // ASYMMETRIC rates (quote_to_base = 50, base_to_quote = 0.03 —
+    // unrelated to 1/50 = 0.02) and assert each direction sees the
+    // exact slot we put in.
+    let app = test_app_asymmetric("50", "0.03").await;
+
+    // Buy (Raindex `ratio = USDC_in / WCOIN_out = rate_base_to_quote`):
+    // input=USDC (quote), output=tStock (base) → picks the slot we
+    // seeded with `base_to_quote = "0.03"`.
+    let buy_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v1")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = buy_resp.into_body().collect().await.unwrap().to_bytes();
+    let buy: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let buy_price = Float::from(alloy::primitives::B256::from(buy[0].context[1]));
+    assert_eq!(buy_price.format().unwrap(), "0.03");
+
+    // Sell (Raindex `ratio = WCOIN_in / USDC_out = rate_quote_to_base`):
+    // input=tStock (base), output=USDC (quote) → picks the slot we
+    // seeded with `quote_to_base = "50"`. If the oracle were still doing
+    // 1/x it would emit ~0.02 (= 1/50), not 50.
+    let sell_resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v1")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(WCOIN, USDC)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = sell_resp.into_body().collect().await.unwrap().to_bytes();
+    let sell: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    let sell_price = Float::from(alloy::primitives::B256::from(sell[0].context[1]));
+    assert_eq!(sell_price.format().unwrap(), "50");
 }
