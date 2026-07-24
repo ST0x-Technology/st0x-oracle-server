@@ -164,7 +164,7 @@ builder:
   ),
   :ensure(
     greater-than-or-equal-to(oracle-publish-time oracle-session-start)
-    "Oracle price before session start"
+    "Price before session start"
   ),
 
   /*

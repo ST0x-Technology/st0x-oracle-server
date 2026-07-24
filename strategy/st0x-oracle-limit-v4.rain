@@ -144,11 +144,11 @@ oracle-output-token: signed-context<0 7>(),
  * expose the current order's IO addresses at execution time. */
 :ensure(
   equal-to(oracle-input-token input-token())
-  "Oracle input token does not match order input"
+  "Oracle input token mismatch"
 ),
 :ensure(
   equal-to(oracle-output-token output-token())
-  "Oracle output token does not match order output"
+  "Oracle output token mismatch"
 ),
 
 /* Session guard. Strategy only operates in the deployer-chosen session.
@@ -175,7 +175,7 @@ oracle-output-token: signed-context<0 7>(),
 ),
 :ensure(
   greater-than-or-equal-to(oracle-publish-time oracle-session-start)
-  "Oracle price before session start"
+  "Price before session start"
 ),
 
 /* Safety guard: zero price means something is fundamentally broken
