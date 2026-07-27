@@ -1,0 +1,12 @@
+# cargo-audit configuration (.github/workflows/audit.yml)
+
+[advisories]
+ignore = [
+    # tracing-subscriber 0.2 ANSI-escape log poisoning. The 0.2 line is
+    # pinned by ark-relations (arkworks) and cannot cross to 0.3 — but it is
+    # UNREACHABLE in the built binary: `cargo tree -i tracing-subscriber@0.2.25
+    # --target all` finds no path; it's an optional dep that exists in the
+    # lockfile without ever being compiled. The oracle itself uses 0.3.x.
+    # Re-check whenever the arkworks/sp1 subtree changes.
+    "RUSTSEC-2025-0055",
+]
