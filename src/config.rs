@@ -8,9 +8,8 @@ use std::str::FromStr;
 pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs: u64,
     pub tokens: Vec<TokenEntry>,
+    pub pricing: PricingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -19,11 +18,18 @@ pub struct TokenEntry {
     pub symbol: String,
 }
 
+/// Connection settings for the st0x.pricing service. Live `Quote`s are
+/// pushed over the WebSocket; secrets (`api_key`) come from the env file
+/// as `PRICING_API_KEY` and override the placeholder in the TOML so the
+/// committed config can stay free of credentials.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PricingConfig {
+    pub ws_url: String,
+    pub consumer: String,
+}
+
 fn default_port() -> u16 {
     3000
-}
-fn default_poll_interval() -> u64 {
-    10
 }
 
 impl Config {
@@ -58,8 +64,11 @@ impl Config {
                 );
             }
         }
-        if self.poll_interval_secs == 0 {
-            anyhow::bail!("poll_interval_secs must be > 0");
+        if self.pricing.ws_url.trim().is_empty() {
+            anyhow::bail!("pricing.ws_url must be set");
+        }
+        if self.pricing.consumer.trim().is_empty() {
+            anyhow::bail!("pricing.consumer must be set");
         }
         Ok(())
     }
@@ -80,66 +89,84 @@ impl Config {
 mod tests {
     use super::*;
 
+    const MIN_PRICING: &str = r#"
+            [pricing]
+            ws_url = "ws://st0x-pricing:8080/ws"
+            consumer = "oracle"
+        "#;
+
     #[test]
     fn parses_minimal_config() {
-        let text = r#"
+        let text = format!(
+            r#"
             port = 4000
-            poll_interval_secs = 5
             [[tokens]]
             address = "0x1111111111111111111111111111111111111111"
             symbol = "COIN"
-        "#;
-        let cfg: Config = toml::from_str(text).unwrap();
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.port, 4000);
-        assert_eq!(cfg.poll_interval_secs, 5);
         assert_eq!(cfg.tokens.len(), 1);
+        assert_eq!(cfg.pricing.ws_url, "ws://st0x-pricing:8080/ws");
+        assert_eq!(cfg.pricing.consumer, "oracle");
     }
 
     #[test]
     fn defaults_applied() {
-        let text = r#"
+        let text = format!(
+            r#"
             [[tokens]]
             address = "0x1111111111111111111111111111111111111111"
             symbol = "COIN"
-        "#;
-        let cfg: Config = toml::from_str(text).unwrap();
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.port, 3000);
-        assert_eq!(cfg.poll_interval_secs, 10);
     }
 
     #[test]
     fn rejects_empty_tokens() {
-        let text = r#"tokens = []"#;
-        let cfg: Config = toml::from_str(text).unwrap();
+        let text = format!(
+            r#"tokens = []
+{MIN_PRICING}"#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_bad_address() {
-        let text = r#"
+        let text = format!(
+            r#"
             [[tokens]]
             address = "not-an-address"
             symbol = "COIN"
-        "#;
-        let cfg: Config = toml::from_str(text).unwrap();
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_duplicate_addresses() {
-        // Addresses with different casing should still be rejected (the
-        // Address parser normalizes via checksum decode).
-        let text = r#"
+        let text = format!(
+            r#"
             [[tokens]]
             address = "0x1111111111111111111111111111111111111111"
             symbol = "COIN"
             [[tokens]]
             address = "0x1111111111111111111111111111111111111111"
             symbol = "OTHER"
-        "#;
-        let cfg: Config = toml::from_str(text).unwrap();
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("Duplicate token address"),
@@ -148,12 +175,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_poll_interval() {
+    fn rejects_empty_pricing_ws_url() {
         let text = r#"
-            poll_interval_secs = 0
             [[tokens]]
             address = "0x1111111111111111111111111111111111111111"
             symbol = "COIN"
+
+            [pricing]
+            ws_url = ""
+            consumer = "oracle"
+        "#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_consumer() {
+        let text = r#"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "COIN"
+
+            [pricing]
+            ws_url = "ws://st0x-pricing:8080/ws"
+            consumer = ""
         "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_err());
