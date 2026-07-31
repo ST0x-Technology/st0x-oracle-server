@@ -49,7 +49,7 @@ env:
   # st0x-staging on 2026-07-31.
   PROJECT_STAGING: t0-oracle-staging
   REGION: europe-west3
-  SERVICE: st0x-oracle
+  SERVICE: t0-oracle
   IMAGE: europe-west3-docker.pkg.dev/st0x-artifacts/st0x-oracle/st0x-oracle-server
   # From t0.devops/terraform/production-artifacts outputs.
   WIF_PROVIDER: projects/1029268607565/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
