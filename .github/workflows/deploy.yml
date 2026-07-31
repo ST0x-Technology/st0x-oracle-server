@@ -3,7 +3,7 @@ name: deploy
 # Application releases, hub-and-spoke:
 #
 #   nix build .#oci → push digest → st0x-artifacts (central Artifact Registry)
-#     └─ deploy digest → st0x-staging      (this branch + main)
+#     └─ deploy digest → t0-oracle-staging (this branch + main)
 #
 # PRODUCTION IS NOT DEPLOYED FROM THIS REPO. Prod rolls happen exclusively
 # in t0.devops: promote the staging-verified digest into
@@ -18,7 +18,7 @@ name: deploy
 # the flake, so a commit rebuilds to the same digest.
 #
 # While the RAI-1002 parity window runs, THIS STACK BRANCH deploys to
-# staging via a staging-only deployer SA (can touch st0x-staging and the
+# staging via a staging-only deployer SA (can touch t0-oracle-staging and the
 # registry, nothing in production). Bindings live in
 # t0.devops/terraform/{production-artifacts,staging-oracle}.
 #
@@ -45,9 +45,11 @@ permissions:
   attestations: write
 
 env:
-  PROJECT_STAGING: st0x-staging
+  # Phase 5.1 cutover (t0.devops MIGRATION.md): t0-oracle-staging replaced
+  # st0x-staging on 2026-07-31.
+  PROJECT_STAGING: t0-oracle-staging
   REGION: europe-west3
-  SERVICE: st0x-oracle
+  SERVICE: t0-oracle
   IMAGE: europe-west3-docker.pkg.dev/st0x-artifacts/st0x-oracle/st0x-oracle-server
   # From t0.devops/terraform/production-artifacts outputs.
   WIF_PROVIDER: projects/1029268607565/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
