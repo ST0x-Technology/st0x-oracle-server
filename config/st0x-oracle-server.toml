@@ -128,3 +128,48 @@ symbol = "wtLRCX"
 [[tokens]]
 address = "0x045Fb493D970f94a54FeaF931033622fC82192e6"
 symbol = "wtTTWO"
+
+# 2026-08-06 onboarding batch (Alastair) — matches st0x.pricing PR #40.
+[[tokens]]
+address = "0x1020EC8Aa3f709a1f3D8705cdBa89b950451bd88"
+symbol = "wtAAPL"
+
+[[tokens]]
+address = "0x7e5cc7eAe0455A07Ab4abf354E0f5657BA2888BD"
+symbol = "wtBABA"
+
+[[tokens]]
+address = "0x6a2357Df4975C667B171bE53dA6FFe6deBf7030c"
+symbol = "wtGOOGL"
+
+[[tokens]]
+address = "0xd50f561322fe3235DBc9Ec8b3aB7693383d8A425"
+symbol = "wtHOOD"
+
+[[tokens]]
+address = "0xf567652fC2d7Db8D5469fD06AEbe8C9c4372d722"
+symbol = "wtINTC"
+
+[[tokens]]
+address = "0x892CcF5E75f4a7Ee6402971a1587F65BEE4d52bd"
+symbol = "wtLLY"
+
+[[tokens]]
+address = "0x515A3Ac2a6aB590bDFa970caFFFd7fAdC680886E"
+symbol = "wtMSFT"
+
+[[tokens]]
+address = "0xCB9571aB96aA47374eF30D8E9ACCC1cD51064726"
+symbol = "wtORCL"
+
+[[tokens]]
+address = "0xb6D779A79E7493ed821a65D52bA419F0F6D5dD0a"
+symbol = "wtPTY"
+
+[[tokens]]
+address = "0xA759FAbbD866e6DB8bF76613C35825dC2e380bf0"
+symbol = "wtSMCI"
+
+[[tokens]]
+address = "0x295e9eCAb319006900a53b3f8D6Fcb0C131F4ada"
+symbol = "wtTQQQ"
