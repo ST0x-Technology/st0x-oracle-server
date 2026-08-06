@@ -12,7 +12,7 @@ poll_interval_secs = 10
 # Token registry: maps on-chain Base token addresses (st0x wrapped
 # equities) to Alpaca tickers. USDC is the implicit quote token and is
 # hardcoded in main.rs because it's a chain invariant.
-# Synced with ST0x Base Token List v1.4.0 (2026-07-27).
+# Synced with ST0x Base Token List v1.5.0 (2026-08-05).
 
 [[tokens]]
 address = "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"
@@ -149,3 +149,23 @@ symbol  = "LLY"
 [[tokens]]
 address = "0xb6D779A79E7493ed821a65D52bA419F0F6D5dD0a"
 symbol  = "PTY"
+
+[[tokens]]
+address = "0xd50f561322fe3235DBc9Ec8b3aB7693383d8A425"
+symbol  = "HOOD"
+
+[[tokens]]
+address = "0xCB9571aB96aA47374eF30D8E9ACCC1cD51064726"
+symbol  = "ORCL"
+
+[[tokens]]
+address = "0xA759FAbbD866e6DB8bF76613C35825dC2e380bf0"
+symbol  = "SMCI"
+
+[[tokens]]
+address = "0x7e5cc7eAe0455A07Ab4abf354E0f5657BA2888BD"
+symbol  = "BABA"
+
+[[tokens]]
+address = "0x295e9eCAb319006900a53b3f8D6Fcb0C131F4ada"
+symbol  = "TQQQ"
