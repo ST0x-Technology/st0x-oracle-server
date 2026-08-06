@@ -10,7 +10,7 @@
 //! Usage:
 //!   cargo run --example probe_local_v2 -- SPYM
 //!
-//! `ORACLE_URL=https://st0x-oracle-server.fly.dev/context/v2 cargo run ...`
+//! `ORACLE_URL=https://oracle.t0trade.com/context/v2 cargo run ...`
 //! points the probe at prod.
 
 use alloy::primitives::{Address, FixedBytes, U256};
@@ -21,7 +21,7 @@ use st0x_oracle_server::{EvaluableV4, OrderV4, IOV2};
 use std::str::FromStr;
 
 /// Probed URL. Override with
-/// `ORACLE_URL=https://st0x-oracle-server.fly.dev/context/v2` to compare
+/// `ORACLE_URL=https://oracle.t0trade.com/context/v2` to compare
 /// prod against the broker.
 fn oracle_url() -> String {
     std::env::var("ORACLE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000/context/v2".to_string())

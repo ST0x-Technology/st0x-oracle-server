@@ -16,7 +16,7 @@ fn smoke_enabled() -> bool {
     matches!(std::env::var("RUN_PROD_SMOKE").as_deref(), Ok("1"))
 }
 
-const PROD_URL: &str = "https://st0x-oracle-server.fly.dev/context/v1";
+const PROD_URL: &str = "https://oracle.t0trade.com/context/v1";
 
 // Base mainnet
 const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
