@@ -61,10 +61,11 @@ pub struct OracleResponse {
 /// `price_bytes` is the 32-byte packed Rain Float representation taken
 /// directly from the pricing service's wire `Quote` (either
 /// `rate_quote_to_base` or `rate_base_to_quote` depending on swap
-/// direction; the caller has already picked the correct rate). The
-/// pricing service emits both rates pre-spread, so the oracle does no
-/// inversion and applies no spread of its own — its job is to sign and
-/// publish whatever the pricing service quoted.
+/// direction; the caller has already picked the DIRECTIONAL rate and
+/// inverted it into Raindex ratio units — see `pick_rate_bytes`). The
+/// pricing service's rates each carry their own direction's spread; the
+/// oracle applies no spread of its own — its job is to sign and publish
+/// the maker-side price the pricing service quoted for this direction.
 ///
 /// `publish_time` is the time at which the signed context is being
 /// produced (Unix seconds, UTC). Inside an active session this is `now`;
