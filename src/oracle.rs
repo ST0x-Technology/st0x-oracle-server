@@ -45,6 +45,32 @@ pub const SCHEMA_VERSION_V3: u64 = 3;
 /// alias names.
 pub const SCHEMA_VERSION_V4: u64 = 4;
 
+/// Schema version emitted by `/context/v5`. Extends v4 by signing the
+/// pricing model's own expiry alongside the price:
+///
+/// - `context[8]`: quote expiry (Rain Float, Unix seconds)
+///
+/// v1–v4 sign a price and a `publish_time` and leave the question of
+/// how long that price is good for entirely to the consumer, via the
+/// strategy's `max-staleness`. That number is a constant chosen when
+/// the strategy was written; the producer's actual binding horizon is
+/// not. `st0x.pricing` publishes `expiry_unix_ms` on every frame — the
+/// point past which it has explicitly disowned the rate — and it moves
+/// with the asset, the session and the calibrated model. A strategy
+/// comparing against its own hardcoded window either trusts a price
+/// past the point the model stopped standing behind it, or refuses one
+/// the model still honours.
+///
+/// v5 signs that horizon so the producer's answer, not the strategy's
+/// guess, is what binds. v5 strategies SHOULD assert
+/// `less-than(block-timestamp(), signed-context<0 8>)` in addition to
+/// whatever `max-staleness` bound they already apply — the two are
+/// complementary: `max-staleness` bounds how old the mark may be,
+/// `context[8]` bounds how long the model will honour it.
+///
+/// v4 stays unchanged and is still served on `/context/v4`.
+pub const SCHEMA_VERSION_V5: u64 = 5;
+
 /// Oracle response matching Rain's SignedContextV1 format.
 /// The JSON array shape of this struct is what upstream
 /// `rain.orderbook/crates/quote/src/oracle.rs` expects to deserialize.
@@ -230,8 +256,33 @@ pub fn build_context_v4(
     input_token: Address,
     output_token: Address,
 ) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
-    let mut ctx = build_session_context(
+    build_pair_bound_context(
         SCHEMA_VERSION_V4,
+        price_bytes,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        input_token,
+        output_token,
+    )
+}
+
+/// Shared body for the pair-bound schemas (v4 and v5): the six session
+/// slots followed by the caller's raw input/output token addresses.
+#[allow(clippy::too_many_arguments)]
+fn build_pair_bound_context(
+    schema_version: u64,
+    price_bytes: [u8; 32],
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    input_token: Address,
+    output_token: Address,
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    let mut ctx = build_session_context(
+        schema_version,
         price_bytes,
         publish_time,
         session_bytes,
@@ -242,6 +293,54 @@ pub fn build_context_v4(
     let output_b32 = FixedBytes::<32>::left_padding_from(output_token.as_slice());
     ctx.push(input_b32);
     ctx.push(output_b32);
+    Ok(ctx)
+}
+
+/// Build the v5 signed-context array — the v4 shape plus the pricing
+/// model's own expiry at slot 8.
+///
+/// `quote_expiry` is the frame's `expiry_unix_ms` reduced to whole Unix
+/// seconds. It is the producer's binding horizon for this exact rate,
+/// measured from the upstream mark's `source_ts`, so a price built off
+/// an already-old mark carries a correspondingly near expiry. Truncating
+/// to seconds floors it — the signed horizon can never round past the
+/// model's real one.
+///
+/// Layout:
+/// - `context[0]`: schema version (= 5)
+/// - `context[1]`: price (Rain Float; direction-correct, pre-spread)
+/// - `context[2]`: publish_time (Rain Float, Unix seconds)
+/// - `context[3]`: session tag (Rain IntOrAString V3)
+/// - `context[4]`: session_start (Rain Float, Unix seconds)
+/// - `context[5]`: session_end (Rain Float, Unix seconds)
+/// - `context[6]`: input_token address (bytes32, Address left-padded)
+/// - `context[7]`: output_token address (bytes32, Address left-padded)
+/// - `context[8]`: quote expiry (Rain Float, Unix seconds)
+#[allow(clippy::too_many_arguments)]
+pub fn build_context_v5(
+    price_bytes: [u8; 32],
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    input_token: Address,
+    output_token: Address,
+    quote_expiry: u64,
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    let mut ctx = build_pair_bound_context(
+        SCHEMA_VERSION_V5,
+        price_bytes,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        input_token,
+        output_token,
+    )?;
+    let expiry_float = Float::parse(quote_expiry.to_string())
+        .map_err(|e| anyhow::anyhow!("Failed to parse quote_expiry as Rain float: {:?}", e))?;
+    let expiry_b: B256 = expiry_float.into();
+    ctx.push(expiry_b);
     Ok(ctx)
 }
 
@@ -374,6 +473,93 @@ mod tests {
         sess[..3].copy_from_slice(b"rth");
         let bytes = price_bytes_of("0.005");
         let ctx = build_context_v3(bytes, 1, sess, 1, 2).unwrap();
+        assert_eq!(ctx[1].as_slice(), &bytes[..]);
+    }
+
+    fn v3_session_bytes() -> [u8; 32] {
+        let mut sess = [0u8; 32];
+        sess[31] = 0xe0 | 3;
+        sess[..3].copy_from_slice(b"rth");
+        sess
+    }
+
+    const IN_TOKEN: Address =
+        alloy::primitives::address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    const OUT_TOKEN: Address =
+        alloy::primitives::address!("5cDa0E1CA4ce2af96315f7F8963C85399c172204");
+
+    #[test]
+    fn test_build_context_v5_layout() {
+        let ctx = build_context_v5(
+            price_bytes_of("185.42"),
+            1_700_000_000,
+            v3_session_bytes(),
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+        )
+        .unwrap();
+        assert_eq!(ctx.len(), 9, "schema v5 must emit 9 elements");
+
+        let version = Float::from(alloy::primitives::B256::from(ctx[0]));
+        assert_eq!(version.format().unwrap(), "5");
+
+        let price = Float::from(alloy::primitives::B256::from(ctx[1]));
+        assert_eq!(price.format().unwrap(), "185.42");
+
+        // Slots 6/7 keep the v4 pair binding, left-padded per the
+        // Address→bytes32 convention.
+        assert_eq!(&ctx[6].as_slice()[12..], IN_TOKEN.as_slice());
+        assert_eq!(&ctx[6].as_slice()[..12], [0u8; 12]);
+        assert_eq!(&ctx[7].as_slice()[12..], OUT_TOKEN.as_slice());
+
+        // Slot 8 is the model's expiry as a Rain Float.
+        let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
+        assert_eq!(expiry.format().unwrap(), float_string_of(1_700_000_020));
+    }
+
+    #[test]
+    fn test_build_context_v5_is_v4_plus_expiry() {
+        // v5 must be a strict extension: bytes 0..8 identical to v4 for
+        // the same inputs. A v5 strategy that ignores slot 8 has to
+        // behave exactly like a v4 one, and anyone diffing the two
+        // schemas should see one appended slot and nothing else.
+        let price = price_bytes_of("185.42");
+        let sess = v3_session_bytes();
+        let v4 = build_context_v4(
+            price,
+            1_700_000_000,
+            sess,
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+        )
+        .unwrap();
+        let v5 = build_context_v5(
+            price,
+            1_700_000_000,
+            sess,
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+        )
+        .unwrap();
+
+        assert_eq!(v5.len(), v4.len() + 1);
+        // Slot 0 is the schema version and is expected to differ.
+        assert_eq!(&v5[1..8], &v4[1..8]);
+    }
+
+    #[test]
+    fn test_build_context_v5_passes_price_bytes_through_unchanged() {
+        let bytes = price_bytes_of("0.005");
+        let ctx =
+            build_context_v5(bytes, 1, v3_session_bytes(), 1, 2, IN_TOKEN, OUT_TOKEN, 3).unwrap();
         assert_eq!(ctx[1].as_slice(), &bytes[..]);
     }
 }
