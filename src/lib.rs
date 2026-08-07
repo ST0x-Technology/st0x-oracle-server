@@ -597,7 +597,8 @@ fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> Result<[u8; 32],
 /// The pricing service publishes both swap directions independently,
 /// already including its spread; the oracle just picks the rate that
 /// matches the request's direction and signs the 32-byte Rain Float
-/// straight through — no inversion, no f64 round-trip, no extra spread.
+/// with the single Rain-Float inversion from `pick_rate_bytes` — no
+/// f64 round-trip, no extra spread.
 ///
 /// `publish_time` is the pricing quote's own `source_ts_unix_ms` — the
 /// honest as-of instant st0x.pricing already stamped on the mark (the
@@ -729,9 +730,8 @@ async fn build_response_from_quote_v4(
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
 
-    // Same as v3: the pricing service publishes both swap directions
-    // pre-spread, so we pick the direction-correct rate slot straight
-    // through — no f64 inversion in the oracle.
+    // Same as v1-v3: pick the directional rate and invert it into
+    // Raindex ratio units (Rain-Float precision) — see `pick_rate_bytes`.
     let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
 
     tracing::info!(

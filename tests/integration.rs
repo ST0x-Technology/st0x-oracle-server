@@ -130,7 +130,11 @@ async fn test_app_full(
             // Asymmetric (spread-carrying) rates are exercised in
             // `test_maker_orientation_*` below.
             let s = format!("{p}");
-            let inv = format!("{}", 1.0 / p);
+            // Rain-Float reciprocal, not f64: keeps inv(1/p) == p exact
+            // for any seed price (an f64 reciprocal only round-trips for
+            // lucky values like 100).
+            let inv_f = Float::parse(s.clone()).unwrap().inv().unwrap();
+            let inv = inv_f.format().unwrap();
             quotes.push(fake_quote(sym, addr, &inv, &s));
         }
     }
@@ -150,9 +154,9 @@ async fn test_app_full(
 }
 
 /// Build a test app whose pricing cache holds asymmetric per-direction
-/// rates for one symbol. Used by the direction-pick test that proves
-/// the oracle picks the correct rate slot from `Quote` per request
-/// direction without doing any inversion of its own.
+/// rates for one symbol. Used by the maker-orientation test proving the
+/// oracle serves each order shape the inverse of its DIRECTIONAL rate
+/// (ask to sell-side orders, bid to buy-side).
 async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
@@ -1101,8 +1105,8 @@ async fn test_v1_batch_returns_length_matching_array() {
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
-    // First (buy): picks `rate_base_to_quote` — both slots seeded with
-    // the same 100 in our test harness, so we expect to see 100 here.
+    // First leg (input=USDC, output=tStock → maker sells base):
+    // quote-per-base at the ask = inv(quote_to_base) = inv(1/100) = 100.
     let buy_price = Float::from(alloy::primitives::B256::from(responses[0].context[1]));
     assert_eq!(buy_price.format().unwrap(), "100");
 
@@ -1135,10 +1139,70 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
     //                         maker ask = inv(0.01) = 100)
     let app = test_app_asymmetric("0.01", "99").await;
 
-    // Sell-side order (input=USDC, output=tStock): must serve the ASK
-    // in quote-per-base units = inv(quote_to_base) = 100.
-    let sell_resp = app
-        .clone()
+    // v4 is what production signs; v1-v3 share pick_rate_bytes but each
+    // handler carries its own code path and its own comments — the exact
+    // divergence surface that produced this bug — so pin all four.
+    for endpoint in ["/context/v1", "/context/v2", "/context/v3", "/context/v4"] {
+        // Sell-side order (input=USDC, output=tStock): must serve the ASK
+        // in quote-per-base units = inv(quote_to_base) = 100.
+        let sell_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = sell_resp.into_body().collect().await.unwrap().to_bytes();
+        let sell: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+        let sell_price = Float::from(alloy::primitives::B256::from(sell[0].context[1]));
+        assert_eq!(sell_price.format().unwrap(), "100");
+
+        // Buy-side order (input=tStock, output=USDC): must serve
+        // base-per-quote at the BID = inv(base_to_quote) = 1/99.
+        let buy_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(encode_single(WCOIN, USDC)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = buy_resp.into_body().collect().await.unwrap().to_bytes();
+        let buy: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+        let buy_price = Float::from(alloy::primitives::B256::from(buy[0].context[1]));
+        let buy_as_quote_per_base = buy_price.inv().unwrap();
+
+        // The pair, viewed in the same units, must be a healthy market:
+        // maker ask (100) strictly above maker bid (99). Under the old
+        // mapping this exact assertion fails with ask=99 < bid=100 — the
+        // crossed pair Raindex displayed.
+        assert_eq!(buy_as_quote_per_base.format().unwrap(), "99");
+        assert!(
+            sell_price.gt(buy_as_quote_per_base).unwrap(),
+            "maker ask must exceed maker bid ({endpoint}): ask={} bid={}",
+            sell_price.format().unwrap(),
+            buy_as_quote_per_base.format().unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_zero_rate_fails_closed_with_500() {
+    // A zero directional rate cannot be inverted; the request must fail
+    // before signing (previously a zero would have been signed, leaving
+    // the strategy's greater-than(price 0) guard as the only backstop).
+    // Note the blast radius: one bad symbol 500s the whole batch.
+    let app = test_app_asymmetric("0", "99").await;
+    let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
@@ -1149,38 +1213,5 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
         )
         .await
         .unwrap();
-    let bytes = sell_resp.into_body().collect().await.unwrap().to_bytes();
-    let sell: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    let sell_price = Float::from(alloy::primitives::B256::from(sell[0].context[1]));
-    assert_eq!(sell_price.format().unwrap(), "100");
-
-    // Buy-side order (input=tStock, output=USDC): must serve
-    // base-per-quote at the BID = inv(base_to_quote) = 1/99.
-    let buy_resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v1")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(encode_single(WCOIN, USDC)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let bytes = buy_resp.into_body().collect().await.unwrap().to_bytes();
-    let buy: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    let buy_price = Float::from(alloy::primitives::B256::from(buy[0].context[1]));
-    let buy_as_quote_per_base = buy_price.inv().unwrap();
-
-    // The pair, viewed in the same units, must be a healthy market:
-    // maker ask (100) strictly above maker bid (99). Under the old
-    // mapping this exact assertion fails with ask=99 < bid=100 — the
-    // crossed pair Raindex displayed.
-    assert_eq!(buy_as_quote_per_base.format().unwrap(), "99");
-    assert!(
-        sell_price.gt(buy_as_quote_per_base).unwrap(),
-        "maker ask must exceed maker bid: ask={} bid={}",
-        sell_price.format().unwrap(),
-        buy_as_quote_per_base.format().unwrap()
-    );
+    assert_eq!(resp.status(), 500, "zero rate must fail closed, not sign");
 }
