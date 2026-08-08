@@ -1142,7 +1142,13 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
     // v4 is what production signs; v1-v3 share pick_rate_bytes but each
     // handler carries its own code path and its own comments — the exact
     // divergence surface that produced this bug — so pin all four.
-    for endpoint in ["/context/v1", "/context/v2", "/context/v3", "/context/v4"] {
+    for endpoint in [
+        "/context/v1",
+        "/context/v2",
+        "/context/v3",
+        "/context/v4",
+        "/context/v5",
+    ] {
         // Sell-side order (input=USDC, output=tStock): must serve the ASK
         // in quote-per-base units = inv(quote_to_base) = 100.
         let sell_resp = app
