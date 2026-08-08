@@ -351,7 +351,9 @@ async fn post_signed_context_v4(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    post_signed_context_pair_bound(state, body, PairSchema::V4).await
+    let result = post_signed_context_pair_bound(state, body, PairSchema::V4).await;
+    record_request_outcome("v4", &result);
+    result
 }
 
 /// v5 handler — `/context/v5` endpoint. Identical request shape,
@@ -368,7 +370,9 @@ async fn post_signed_context_v5(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    post_signed_context_pair_bound(state, body, PairSchema::V5).await
+    let result = post_signed_context_pair_bound(state, body, PairSchema::V5).await;
+    record_request_outcome("v5", &result);
+    result
 }
 
 /// Which pair-bound schema a `/context/v4` or `/context/v5` request is
@@ -647,8 +651,10 @@ fn publish_time_from_quote(quote: &Quote) -> Result<u64, AppError> {
 
 /// The model's binding horizon for this quote, in whole Unix seconds.
 ///
-/// Integer division floors, which is the safe direction: the signed
-/// expiry can only ever land at or before the model's real one, never
+/// Integer division floors for the non-negative values that survive the
+/// conversion (for negatives it truncates toward zero, but `try_from`
+/// rejects those first) — the safe direction: the signed expiry can
+/// only ever land at or before the model's real one, never
 /// past it. A negative or out-of-range value fails the request rather
 /// than clamping — a defaulted expiry is a defaulted licence to keep
 /// trading on a price the model has disowned, and the whole point of v5

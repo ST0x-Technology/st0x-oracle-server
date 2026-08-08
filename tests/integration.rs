@@ -1158,3 +1158,60 @@ async fn test_v1_picks_per_direction_rate_without_inversion() {
     let sell_price = Float::from(alloy::primitives::B256::from(sell[0].context[1]));
     assert_eq!(sell_price.format().unwrap(), "50");
 }
+
+#[tokio::test]
+async fn test_v5_endpoint_signs_floored_quote_expiry() {
+    // Route-level pin for /context/v5. Every other v5 test exercises the
+    // context BUILDER — a typo routing the v5 handler through
+    // PairSchema::V4 would pass all of them. This one hits the endpoint
+    // and asserts the full nine-slot shape plus the expiry value derived
+    // from the seeded quote, with a realistic expiry (the shared harness
+    // seeds i64::MAX, which would hide a ms/s confusion).
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
+    let mut quote = fake_quote("COIN", WCOIN, "100", "100");
+    // 1_700_000_020_500 ms floors to 1_700_000_020 s — the trailing
+    // 500ms must be dropped, never rounded up past the model's horizon.
+    quote.expiry_unix_ms = 1_700_000_020_500;
+    let pricing = LiveClient::with_seeded(vec![quote]).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        pricing,
+        vec!["COIN".to_string()],
+        fixed_close_market_hours().await,
+        metrics,
+    );
+    let app = create_app(state);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v5")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(responses.len(), 1);
+    let ctx = &responses[0].context;
+    assert_eq!(ctx.len(), 9, "v5 endpoint must emit 9 context elements");
+
+    let version = Float::from(alloy::primitives::B256::from(ctx[0]));
+    assert_eq!(version.format().unwrap(), "5", "slot 0 must be schema v5");
+
+    // Slot 8: the seeded expiry, ms floored to whole seconds. Compare
+    // Float-canonical forms (large ints format in scientific notation).
+    let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
+    let expected = Float::parse("1700000020".to_string())
+        .unwrap()
+        .format()
+        .unwrap();
+    assert_eq!(expiry.format().unwrap(), expected);
+}

@@ -308,14 +308,17 @@ fn build_pair_bound_context(
 ///
 /// Layout:
 /// - `context[0]`: schema version (= 5)
-/// - `context[1]`: price (Rain Float; direction-correct, pre-spread)
+/// - `context[1]`: price (Rain Float; the rate for this request's
+///   direction, spread included — see `pick_rate_bytes`)
 /// - `context[2]`: publish_time (Rain Float, Unix seconds)
 /// - `context[3]`: session tag (Rain IntOrAString V3)
 /// - `context[4]`: session_start (Rain Float, Unix seconds)
 /// - `context[5]`: session_end (Rain Float, Unix seconds)
 /// - `context[6]`: input_token address (bytes32, Address left-padded)
 /// - `context[7]`: output_token address (bytes32, Address left-padded)
-/// - `context[8]`: quote expiry (Rain Float, Unix seconds)
+/// - `context[8]`: quote expiry (Rain Float, Unix seconds; the
+///   less-than consumer assert makes the expiry second itself
+///   EXCLUSIVE — already rejected)
 #[allow(clippy::too_many_arguments)]
 pub fn build_context_v5(
     price_bytes: [u8; 32],
