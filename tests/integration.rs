@@ -72,11 +72,10 @@ fn wire_float_of(s: &str) -> WireFloat {
     WireFloat::from_bytes(b.into())
 }
 
-/// Build a fake live `Quote` for a single symbol. `quote_to_base` and
-/// `base_to_quote` get the same Rain Float — the oracle no longer
-/// inverts, so tests treat the rate as already-direction-correct from
-/// the pricing service. Tests that exercise direction-picking just
-/// assert that the chosen rate is the one we put in the chosen slot.
+/// Build a fake live `Quote` for a single symbol. Rates are DIRECTIONAL
+/// per the pricing-types contract (`quote_to_base` prices quote-in/
+/// base-out, `base_to_quote` the reverse); the oracle inverts the
+/// directional rate into Raindex ratio units (`pick_rate_bytes`).
 fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote: &str) -> Quote {
     let base_bytes: [u8; 20] = Address::from_str(base_token).unwrap().into();
     let usdc_bytes: [u8; 20] = Address::from_str(USDC).unwrap().into();
@@ -122,11 +121,21 @@ async fn test_app_full(
     let mut quotes = Vec::new();
     for (addr, sym, price) in entries {
         if let Some(p) = price {
-            // For tests both directions get the same rate. Real pricing
-            // service emits asymmetric rates per direction; we exercise
-            // the direction-pick path via `test_v1_directions_use_their_own_rate`.
+            // Seed a spread-free two-sided quote at `p` USDC/base: per the
+            // pricing-types contract, `quote_to_base` is base-per-quote
+            // (= 1/p) and `base_to_quote` is quote-per-base (= p). The
+            // oracle inverts the DIRECTIONAL rate into Raindex ratio
+            // units (see `pick_rate_bytes`), so a QuoteToBase request
+            // serves inv(1/p) = p — schema tests keep asserting `p`.
+            // Asymmetric (spread-carrying) rates are exercised in
+            // `test_maker_orientation_*` below.
             let s = format!("{p}");
-            quotes.push(fake_quote(sym, addr, &s, &s));
+            // Rain-Float reciprocal, not f64: keeps inv(1/p) == p exact
+            // for any seed price (an f64 reciprocal only round-trips for
+            // lucky values like 100).
+            let inv_f = Float::parse(s.clone()).unwrap().inv().unwrap();
+            let inv = inv_f.format().unwrap();
+            quotes.push(fake_quote(sym, addr, &inv, &s));
         }
     }
     let pricing = LiveClient::with_seeded(quotes).await;
@@ -145,9 +154,9 @@ async fn test_app_full(
 }
 
 /// Build a test app whose pricing cache holds asymmetric per-direction
-/// rates for one symbol. Used by the direction-pick test that proves
-/// the oracle picks the correct rate slot from `Quote` per request
-/// direction without doing any inversion of its own.
+/// rates for one symbol. Used by the maker-orientation test proving the
+/// oracle serves each order shape the inverse of its DIRECTIONAL rate
+/// (ask to sell-side orders, bid to buy-side).
 async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
@@ -936,11 +945,12 @@ async fn test_v2_batch_returns_length_matching_array_with_session() {
     assert_eq!(responses[0].context[3], responses[1].context[3]);
     assert_eq!(responses[0].context[4], responses[1].context[4]);
     assert_eq!(responses[0].context[5], responses[1].context[5]);
-    // Both legs sign the seeded rate straight through (the harness
-    // populates both direction slots with 100). The per-direction
-    // pick is exercised in `test_v1_picks_per_direction_rate_without_inversion`.
+    // Second leg is a buy-side order (input=tStock, output=USDC): its
+    // ratio is base-per-quote at the bid = inv(base_to_quote) = 1/100.
+    // Maker orientation is pinned in
+    // `test_maker_orientation_ask_above_bid_per_direction`.
     let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
-    assert_eq!(sell_price.format().unwrap(), "100");
+    assert_eq!(sell_price.format().unwrap(), "0.01");
 }
 
 #[tokio::test]
@@ -1095,34 +1105,104 @@ async fn test_v1_batch_returns_length_matching_array() {
 
     assert_eq!(responses.len(), 2, "batch of 2 must return length-2 array");
 
-    // First (buy): picks `rate_base_to_quote` — both slots seeded with
-    // the same 100 in our test harness, so we expect to see 100 here.
+    // First leg (input=USDC, output=tStock → maker sells base):
+    // quote-per-base at the ask = inv(quote_to_base) = inv(1/100) = 100.
     let buy_price = Float::from(alloy::primitives::B256::from(responses[0].context[1]));
     assert_eq!(buy_price.format().unwrap(), "100");
 
-    // Second (sell): picks `rate_quote_to_base` — also 100 in the
-    // harness. The direction-picking proof is in
-    // `test_v1_picks_per_direction_rate_without_inversion`; this test
+    // Second leg (input=tStock, output=USDC → maker buys base):
+    // base-per-quote at the bid = inv(base_to_quote) = 1/100. Maker
+    // orientation is pinned in
+    // `test_maker_orientation_ask_above_bid_per_direction`; this test
     // exercises batching coherence + array length.
     let sell_price = Float::from(alloy::primitives::B256::from(responses[1].context[1]));
-    assert_eq!(sell_price.format().unwrap(), "100");
+    assert_eq!(sell_price.format().unwrap(), "0.01");
 }
 
 #[tokio::test]
-async fn test_v1_picks_per_direction_rate_without_inversion() {
-    // Post-RAI-360 invariant: the oracle picks the matching rate slot
-    // straight from the pricing-service `Quote` and signs the raw
-    // 32-byte Float through. No inversion math. To prove this, seed
-    // ASYMMETRIC rates (quote_to_base = 50, base_to_quote = 0.03 —
-    // unrelated to 1/50 = 0.02) and assert each direction sees the
-    // exact slot we put in.
-    let app = test_app_asymmetric("50", "0.03").await;
+async fn test_maker_orientation_ask_above_bid_per_direction() {
+    // MAKER-ORIENTATION INVARIANT (the 2026-08-07 crossed-order fix).
+    //
+    // Pricing rates are DIRECTIONAL: `quote_to_base` prices the
+    // quote-in/base-out swap, `base_to_quote` the base-in/quote-out
+    // swap, each carrying its own spread. A Raindex order with
+    // input=quote/output=base IS the quote-in/base-out venue, so its
+    // ratio (quote per base) must be inv(quote_to_base). The previous
+    // implementation grabbed the unit-compatible OPPOSITE slot instead
+    // ("no inversion math") — every sell order quoted the bid and every
+    // buy order the ask, and the first deployed order pair read as
+    // crossed by exactly 2x the session spread.
+    //
+    // Seed a realistic spread-carrying pair around mid 100:
+    //   base_to_quote = 99   (taker sells base, receives 99: maker bid)
+    //   quote_to_base = 0.01 (taker pays 1 quote, receives 0.01 base:
+    //                         maker ask = inv(0.01) = 100)
+    let app = test_app_asymmetric("0.01", "99").await;
 
-    // Buy (Raindex `ratio = USDC_in / WCOIN_out = rate_base_to_quote`):
-    // input=USDC (quote), output=tStock (base) → picks the slot we
-    // seeded with `base_to_quote = "0.03"`.
-    let buy_resp = app
-        .clone()
+    // v4 is what production signs; v1-v3 share pick_rate_bytes but each
+    // handler carries its own code path and its own comments — the exact
+    // divergence surface that produced this bug — so pin all four.
+    for endpoint in ["/context/v1", "/context/v2", "/context/v3", "/context/v4"] {
+        // Sell-side order (input=USDC, output=tStock): must serve the ASK
+        // in quote-per-base units = inv(quote_to_base) = 100.
+        let sell_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = sell_resp.into_body().collect().await.unwrap().to_bytes();
+        let sell: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+        let sell_price = Float::from(alloy::primitives::B256::from(sell[0].context[1]));
+        assert_eq!(sell_price.format().unwrap(), "100");
+
+        // Buy-side order (input=tStock, output=USDC): must serve
+        // base-per-quote at the BID = inv(base_to_quote) = 1/99.
+        let buy_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(encode_single(WCOIN, USDC)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = buy_resp.into_body().collect().await.unwrap().to_bytes();
+        let buy: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+        let buy_price = Float::from(alloy::primitives::B256::from(buy[0].context[1]));
+        let buy_as_quote_per_base = buy_price.inv().unwrap();
+
+        // The pair, viewed in the same units, must be a healthy market:
+        // maker ask (100) strictly above maker bid (99). Under the old
+        // mapping this exact assertion fails with ask=99 < bid=100 — the
+        // crossed pair Raindex displayed.
+        assert_eq!(buy_as_quote_per_base.format().unwrap(), "99");
+        assert!(
+            sell_price.gt(buy_as_quote_per_base).unwrap(),
+            "maker ask must exceed maker bid ({endpoint}): ask={} bid={}",
+            sell_price.format().unwrap(),
+            buy_as_quote_per_base.format().unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_zero_rate_fails_closed_with_500() {
+    // A zero directional rate cannot be inverted; the request must fail
+    // before signing (previously a zero would have been signed, leaving
+    // the strategy's greater-than(price 0) guard as the only backstop).
+    // Note the blast radius: one bad symbol 500s the whole batch.
+    let app = test_app_asymmetric("0", "99").await;
+    let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
@@ -1133,28 +1213,5 @@ async fn test_v1_picks_per_direction_rate_without_inversion() {
         )
         .await
         .unwrap();
-    let bytes = buy_resp.into_body().collect().await.unwrap().to_bytes();
-    let buy: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    let buy_price = Float::from(alloy::primitives::B256::from(buy[0].context[1]));
-    assert_eq!(buy_price.format().unwrap(), "0.03");
-
-    // Sell (Raindex `ratio = WCOIN_in / USDC_out = rate_quote_to_base`):
-    // input=tStock (base), output=USDC (quote) → picks the slot we
-    // seeded with `quote_to_base = "50"`. If the oracle were still doing
-    // 1/x it would emit ~0.02 (= 1/50), not 50.
-    let sell_resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v1")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(encode_single(WCOIN, USDC)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let bytes = sell_resp.into_body().collect().await.unwrap().to_bytes();
-    let sell: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    let sell_price = Float::from(alloy::primitives::B256::from(sell[0].context[1]));
-    assert_eq!(sell_price.format().unwrap(), "50");
+    assert_eq!(resp.status(), 500, "zero rate must fail closed, not sign");
 }

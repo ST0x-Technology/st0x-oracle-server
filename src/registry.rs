@@ -22,15 +22,17 @@ pub struct TokenRegistry {
 /// the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceDirection {
-    /// Input is USDC (quote), output is tStock (base) — i.e. the order's
-    /// `validInputs[0] = USDC`, `validOutputs[0] = tStock`. Raindex
-    /// `ratio = input / output = quote / base`, so this picks
-    /// `rate_base_to_quote` (pricing-service convention: quote per base).
+    /// Order input is USDC (quote), output is tStock (base) — the order
+    /// is the venue where takers swap quote→base. Priced by the
+    /// DIRECTIONAL rate `rate_quote_to_base`, inverted into Raindex
+    /// `ratio = input/output = quote per base` units by
+    /// `pick_rate_bytes`. (The unit-compatible `rate_base_to_quote`
+    /// carries the OTHER direction's spread — picking it was the
+    /// 2026-08-07 crossed-orders bug.)
     QuoteToBase,
-    /// Input is tStock (base), output is USDC (quote) — i.e. the order's
-    /// `validInputs[0] = tStock`, `validOutputs[0] = USDC`. Raindex
-    /// `ratio = input / output = base / quote`, so this picks
-    /// `rate_quote_to_base` (pricing-service convention: base per quote).
+    /// Order input is tStock (base), output is USDC (quote) — the
+    /// base→quote venue. Priced by `rate_base_to_quote`, inverted into
+    /// `base per quote` ratio units by `pick_rate_bytes`.
     BaseToQuote,
 }
 
@@ -90,7 +92,10 @@ impl TokenRegistry {
         input_token: Address,
         output_token: Address,
     ) -> anyhow::Result<ResolvedPair> {
-        // Case 1: input=USDC, output=tStock → user gives quote, receives base.
+        // Case 1: order input=USDC, output=tStock — the ORDER (maker) receives
+        // quote and pays out base: it is the venue where takers swap
+        // quote→base. Priced by pricing's `rate_quote_to_base`, inverted
+        // into ratio units (see `pick_rate_bytes`).
         if input_token == self.quote_token {
             let symbol = self.tokens.get(&output_token).ok_or_else(|| {
                 anyhow::anyhow!("Unknown tStock token: {} (not in registry)", output_token)
@@ -101,7 +106,9 @@ impl TokenRegistry {
             });
         }
 
-        // Case 2: input=tStock, output=USDC → user gives base, receives quote.
+        // Case 2: order input=tStock, output=USDC — the maker receives base
+        // and pays out quote: the base→quote venue. Priced by
+        // `rate_base_to_quote`, inverted into ratio units.
         if output_token == self.quote_token {
             let symbol = self.tokens.get(&input_token).ok_or_else(|| {
                 anyhow::anyhow!("Unknown tStock token: {} (not in registry)", input_token)

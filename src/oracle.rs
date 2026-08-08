@@ -61,10 +61,11 @@ pub struct OracleResponse {
 /// `price_bytes` is the 32-byte packed Rain Float representation taken
 /// directly from the pricing service's wire `Quote` (either
 /// `rate_quote_to_base` or `rate_base_to_quote` depending on swap
-/// direction; the caller has already picked the correct rate). The
-/// pricing service emits both rates pre-spread, so the oracle does no
-/// inversion and applies no spread of its own — its job is to sign and
-/// publish whatever the pricing service quoted.
+/// direction; the caller has already picked the DIRECTIONAL rate and
+/// inverted it into Raindex ratio units — see `pick_rate_bytes`). The
+/// pricing service's rates each carry their own direction's spread; the
+/// oracle applies no spread of its own — its job is to sign and publish
+/// the maker-side price the pricing service quoted for this direction.
 ///
 /// `publish_time` is the time at which the signed context is being
 /// produced (Unix seconds, UTC). Inside an active session this is `now`;
@@ -74,7 +75,8 @@ pub struct OracleResponse {
 ///
 /// Schema v1 context layout:
 /// - `context[0]`: schema version (Rain Float, = 1)
-/// - `context[1]`: price (Rain Float; pre-spread, direction-correct)
+/// - `context[1]`: price (Rain Float; maker-side for the request's
+///   direction, spread included — see `pick_rate_bytes`)
 /// - `context[2]`: publish_time (Rain Float, Unix seconds)
 pub fn build_context(
     price_bytes: [u8; 32],
@@ -105,7 +107,8 @@ pub fn build_context(
 /// Build a session-aware signed-context array. Layout:
 ///
 /// - `context[0]`: schema version (Rain Float)
-/// - `context[1]`: price (Rain Float; pre-spread, direction-correct)
+/// - `context[1]`: price (Rain Float; maker-side for the request's
+///   direction, spread included — see `pick_rate_bytes`)
 /// - `context[2]`: publish_time (Rain Float, Unix seconds — `now`
 ///   in-session, `last_session_close` out-of-session per RAI-693)
 /// - `context[3]`: session tag (Rain IntOrAString bytes32 in whatever
@@ -203,12 +206,13 @@ pub fn build_context_v3(
 /// `price_bytes` is the 32-byte packed Rain Float the caller already
 /// picked for this request's swap direction (via `pick_rate_bytes`),
 /// exactly as for v2/v3 — the pricing service emits both directional
-/// rates pre-spread so the oracle signs the correct one straight
-/// through with no inversion.
+/// rates directionally (each carrying its own spread); the caller
+/// (`pick_rate_bytes`) inverts the directional rate into Raindex ratio
+/// units, and this function signs that maker-side price.
 ///
 /// Layout:
 /// - `context[0]`: schema version (= 4)
-/// - `context[1]`: price (Rain Float; direction-correct, pre-spread)
+/// - `context[1]`: price (Rain Float; maker-side, spread included)
 /// - `context[2]`: publish_time (Rain Float, Unix seconds)
 /// - `context[3]`: session tag (Rain IntOrAString V3 — same encoding as v3)
 /// - `context[4]`: session_start (Rain Float, Unix seconds)
@@ -282,7 +286,8 @@ mod tests {
     #[test]
     fn test_build_context_v1_passes_price_bytes_through_unchanged() {
         // Anything in slot 1 must be the exact 32 bytes we passed in —
-        // the oracle no longer touches the price (no inversion, no
+        // beyond the pick+invert in `pick_rate_bytes` the oracle does no
+        // further price math (no
         // spread). This is the central invariant of the
         // pricing-client integration.
         let bytes = price_bytes_of("0.005");

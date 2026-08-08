@@ -7,7 +7,7 @@ pub mod pricing_client;
 pub mod registry;
 pub mod sign;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use alloy::sol;
 use alloy::sol_types::SolValue;
 use axum::{
@@ -18,6 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use rain_math_float::Float;
 use serde::Serialize;
 use sign::Signer;
 use std::sync::Arc;
@@ -544,29 +545,48 @@ fn resolve_pair_for_order(
     Ok(pair)
 }
 
-/// Pick the rate slot from a live pricing-service `Quote` that matches
-/// this request's swap direction. The pricing service emits both rates
-/// independently (each already incorporating the model's per-direction
-/// spread); the oracle never derives one from the other.
+/// Pick the maker-side rate for this request's swap direction from a
+/// live pricing-service `Quote`.
 ///
-/// Raindex's `ratio` for an order is `input_amount / output_amount`
-/// (units of inputToken received per outputToken paid). Pricing-service
-/// rate naming is "Y per X" — `rate_base_to_quote` is *quote per base*
-/// and `rate_quote_to_base` is *base per quote*. So a `QuoteToBase`
-/// order (input=quote, output=base) needs `quote / base = rate_base_to_quote`,
-/// and a `BaseToQuote` order (input=base, output=quote) needs
-/// `base / quote = rate_quote_to_base`. Names look reversed at first
-/// glance — they refer to which side of the *order* is which, not which
-/// conversion direction.
+/// Per the pricing-types contract, each rate is DIRECTIONAL: it is "the
+/// price the model would honour for an input of the named token going
+/// to an output of the other". A swap where the taker puts `quote` in
+/// and takes `base` out is priced by `rate_quote_to_base`; base-in /
+/// quote-out is priced by `rate_base_to_quote`. Each carries that
+/// direction's own spread — consumers must never use the opposite
+/// rate to dodge a unit conversion.
 ///
-/// Mismatching these silently flips the price by ~4 orders of magnitude;
-/// the parity-window diff observer caught this against the legacy Fly
-/// oracle on first probe (RAI-361).
-fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> [u8; 32] {
-    match direction {
-        PriceDirection::QuoteToBase => quote.rate_base_to_quote.0,
-        PriceDirection::BaseToQuote => quote.rate_quote_to_base.0,
-    }
+/// A Raindex order's `ratio` is `input_amount / output_amount` (units
+/// of inputToken per outputToken). An order with input=quote /
+/// output=base is the venue where takers swap quote→base, so its price
+/// is `rate_quote_to_base` — but in `quote per base` units, i.e.
+/// INVERTED. Same for the other direction. That `1/x` is exactly the
+/// "unit conversion at a protocol-adapter boundary" the pricing-types
+/// doc blesses; it does not touch the spread decision.
+///
+/// History, because this exact function shipped wrong: the original
+/// implementation picked the UNIT-compatible rate instead of the
+/// DIRECTION-compatible one (`QuoteToBase → rate_base_to_quote`, no
+/// inversion). Units lined up, so everything parsed and every parity
+/// check passed — but each rate carries the OTHER direction's spread,
+/// so every sell order quoted the bid and every buy order the ask.
+/// The first deployed 0trade order pair read as crossed by exactly
+/// 2x the session spread (2026-08-07, caught in pre-migration review;
+/// zero funded orders ever traded on it). The regression tests pin
+/// maker orientation: a sell-side request must price ABOVE the
+/// buy-side request for the same pair.
+fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> Result<[u8; 32], anyhow::Error> {
+    let (directional_rate, name) = match direction {
+        // Order input=quote, output=base: takers swap quote->base; the
+        // honoured rate is base-per-quote, inverted into ratio units.
+        PriceDirection::QuoteToBase => (quote.rate_quote_to_base.0, "rate_quote_to_base"),
+        // Order input=base, output=quote: takers swap base->quote.
+        PriceDirection::BaseToQuote => (quote.rate_base_to_quote.0, "rate_base_to_quote"),
+    };
+    let inverted = Float::from_raw(B256::new(directional_rate))
+        .inv()
+        .map_err(|e| anyhow::anyhow!("Failed to invert {name} into ratio units: {e:?}"))?;
+    Ok(B256::from(inverted).0)
 }
 
 /// Build a signed response from a pre-resolved pair and a snapshotted
@@ -577,7 +597,8 @@ fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> [u8; 32] {
 /// The pricing service publishes both swap directions independently,
 /// already including its spread; the oracle just picks the rate that
 /// matches the request's direction and signs the 32-byte Rain Float
-/// straight through — no inversion, no f64 round-trip, no extra spread.
+/// with the single Rain-Float inversion from `pick_rate_bytes` — no
+/// f64 round-trip, no extra spread.
 ///
 /// `publish_time` is the pricing quote's own `source_ts_unix_ms` — the
 /// honest as-of instant st0x.pricing already stamped on the mark (the
@@ -605,7 +626,7 @@ async fn build_response_from_quote(
 ) -> Result<oracle::OracleResponse, AppError> {
     let publish_time = publish_time_from_quote(quote)?;
 
-    let price_bytes = pick_rate_bytes(quote, pair.direction);
+    let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
 
     tracing::info!(
         symbol = %pair.symbol,
@@ -652,7 +673,7 @@ async fn build_response_from_quote_session(
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
 
-    let price_bytes = pick_rate_bytes(quote, pair.direction);
+    let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
 
     tracing::info!(
         symbol = %pair.symbol,
@@ -709,10 +730,9 @@ async fn build_response_from_quote_v4(
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
 
-    // Same as v3: the pricing service publishes both swap directions
-    // pre-spread, so we pick the direction-correct rate slot straight
-    // through — no f64 inversion in the oracle.
-    let price_bytes = pick_rate_bytes(quote, pair.direction);
+    // Same as v1-v3: pick the directional rate and invert it into
+    // Raindex ratio units (Rain-Float precision) — see `pick_rate_bytes`.
+    let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
 
     tracing::info!(
         symbol = %pair.symbol,
