@@ -119,6 +119,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/context/v2", post(post_signed_context_v2))
         .route("/context/v3", post(post_signed_context_v3))
         .route("/context/v4", post(post_signed_context_v4))
+        .route("/context/v5", post(post_signed_context_v5))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -351,6 +352,55 @@ async fn post_signed_context_v4(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
+    let result = post_signed_context_pair_bound(state, body, PairSchema::V4).await;
+    record_request_outcome("v4", &result);
+    result
+}
+
+/// v5 handler — `/context/v5` endpoint. Identical request shape,
+/// resolution and batching to v4; the response additionally signs the
+/// pricing model's own expiry at slot 8.
+///
+/// The property v5 adds: a strategy no longer has to guess how long a
+/// signed price is good for. `max-staleness` is a constant baked in when
+/// the strategy was written, while the producer's binding horizon moves
+/// with the asset, the session and the calibrated model. v5 lets the
+/// strategy assert against the producer's own answer. See
+/// `oracle::SCHEMA_VERSION_V5` for the full layout.
+async fn post_signed_context_v5(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let result = post_signed_context_pair_bound(state, body, PairSchema::V5).await;
+    record_request_outcome("v5", &result);
+    result
+}
+
+/// Which pair-bound schema a `/context/v4` or `/context/v5` request is
+/// being served under. Both share request decoding, registry
+/// resolution, snapshot-once batching and the session snapshot; they
+/// differ only in whether the model's expiry is signed into slot 8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairSchema {
+    V4,
+    V5,
+}
+
+impl PairSchema {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::V4 => "v4",
+            Self::V5 => "v5",
+        }
+    }
+}
+
+/// Shared body for `/context/v4` and `/context/v5`.
+async fn post_signed_context_pair_bound(
+    state: Arc<AppState>,
+    body: Bytes,
+    schema: PairSchema,
+) -> Result<axum::Json<Vec<oracle::OracleResponse>>, AppError> {
     let requests = decode_request_body(&body)?;
 
     if requests.is_empty() {
@@ -372,7 +422,7 @@ async fn post_signed_context_v4(
             direction = pair.direction.as_str(),
             input = %input_token,
             output = %output_token,
-            schema = "v4",
+            schema = schema.tag(),
             "Oracle request"
         );
         resolved.push((input_token, output_token, pair));
@@ -393,13 +443,14 @@ async fn post_signed_context_v4(
                 pair.symbol
             ))
         })?;
-        let resp = build_response_from_quote_v4(
+        let resp = build_response_from_quote_pair_bound(
             &state,
             pair,
             &quote,
             *input_token,
             *output_token,
             &session_info,
+            schema,
         )
         .await?;
         responses.push(resp);
@@ -619,6 +670,21 @@ fn publish_time_from_quote(quote: &Quote) -> Result<u64, AppError> {
         .map_err(|_| AppError::Internal(anyhow::anyhow!("source_ts out of range")))
 }
 
+/// The model's binding horizon for this quote, in whole Unix seconds.
+///
+/// Integer division floors for the non-negative values that survive the
+/// conversion (for negatives it truncates toward zero, but `try_from`
+/// rejects those first) — the safe direction: the signed expiry can
+/// only ever land at or before the model's real one, never
+/// past it. A negative or out-of-range value fails the request rather
+/// than clamping — a defaulted expiry is a defaulted licence to keep
+/// trading on a price the model has disowned, and the whole point of v5
+/// is that this number is trustworthy.
+fn expiry_from_quote(quote: &Quote) -> Result<u64, AppError> {
+    u64::try_from(quote.expiry_unix_ms / 1000)
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("quote expiry out of range")))
+}
+
 async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
@@ -707,13 +773,15 @@ async fn build_response_from_quote_session(
 /// as v3's `build_response_from_quote_session`, plus the caller's raw
 /// input/output token addresses stamped into signed-context slots 6 and
 /// 7 (see `oracle::build_context_v4` for the layout).
-async fn build_response_from_quote_v4(
+#[allow(clippy::too_many_arguments)]
+async fn build_response_from_quote_pair_bound(
     state: &AppState,
     pair: &ResolvedPair,
     quote: &Quote,
     input_token: Address,
     output_token: Address,
     session_info: &crate::market_hours::SessionInfo,
+    schema: PairSchema,
 ) -> Result<oracle::OracleResponse, AppError> {
     // publish_time is the pricing quote's source_ts (see
     // `build_response_from_quote`); session slots come from the oracle's
@@ -737,7 +805,7 @@ async fn build_response_from_quote_v4(
     tracing::info!(
         symbol = %pair.symbol,
         direction = pair.direction.as_str(),
-        schema = "v4",
+        schema = schema.tag(),
         input = %input_token,
         output = %output_token,
         publish_time = publish_time,
@@ -745,18 +813,31 @@ async fn build_response_from_quote_v4(
         session_start = session_start,
         session_end = session_end,
         source_ts_unix_ms = quote.source_ts_unix_ms,
-        "Building v4 signed context from live pricing quote"
+        expiry_unix_ms = quote.expiry_unix_ms,
+        "Building pair-bound signed context from live pricing quote"
     );
 
-    let context = oracle::build_context_v4(
-        price_bytes,
-        publish_time,
-        session_info.session.to_bytes32_v3(),
-        session_start,
-        session_end,
-        input_token,
-        output_token,
-    )?;
+    let context = match schema {
+        PairSchema::V4 => oracle::build_context_v4(
+            price_bytes,
+            publish_time,
+            session_info.session.to_bytes32_v3(),
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+        )?,
+        PairSchema::V5 => oracle::build_context_v5(
+            price_bytes,
+            publish_time,
+            session_info.session.to_bytes32_v3(),
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+            expiry_from_quote(quote)?,
+        )?,
+    };
     let (signature, signer) = state.signer.sign_context(&context).await?;
 
     Ok(oracle::OracleResponse {
