@@ -7,27 +7,12 @@ use serde::{Deserialize, Serialize};
 /// understand.
 pub const SCHEMA_VERSION: u64 = 1;
 
-/// Schema version emitted by `/context/v2`. The v2 context extends v1
-/// with three additional fields describing the current market session:
-/// a bytes32 ASCII tag plus the UTC `start` and `end` of that session.
-/// v1 stays unchanged and is still served on `/context/v1`.
-///
-/// `/context/v2` signs slot 3 as `Session::to_bytes32_v1` (byte-0
-/// length, `0x80 | len`) to match the hex presets baked into live v2
-/// strategies.
-pub const SCHEMA_VERSION_V2: u64 = 2;
-
-/// Schema version emitted by `/context/v3`. Same six-element layout
-/// as v2; the only difference is slot 3 is signed with
-/// `Session::to_bytes32_v3` (byte-31 length, `0xe0 | len`) so that v3
-/// strategies can compare against Rainlang `"…"` string literals
-/// directly (the parser produces the same V3 bytes via
-/// `LibIntOrAString::fromStringV3`).
-pub const SCHEMA_VERSION_V3: u64 = 3;
-
-/// Schema version emitted by `/context/v4`. Extends v3 by binding the
-/// signed price to the specific `(input_token, output_token)` pair the
-/// caller requested it for. Appends two extra slots after the v3 shape:
+/// Schema version emitted by `/context/v4`. The retired v2/v3 schemas
+/// extended v1 with three session slots (a bytes32 ASCII tag plus the
+/// UTC `start` and `end` of the current session); v4 keeps that
+/// six-element shape and additionally binds the signed price to the
+/// specific `(input_token, output_token)` pair the caller requested it
+/// for, appending two extra slots:
 ///
 /// - `context[6]`: input token address (bytes32, Address left-padded)
 /// - `context[7]`: output token address (bytes32, Address left-padded)
@@ -130,27 +115,19 @@ pub fn build_context(
     ])
 }
 
-/// Build a session-aware signed-context array. Layout:
+/// Build the six session-aware slots shared by the pair-bound schemas
+/// (v4 and v5). Layout:
 ///
 /// - `context[0]`: schema version (Rain Float)
 /// - `context[1]`: price (Rain Float; maker-side for the request's
 ///   direction, spread included — see `pick_rate_bytes`)
 /// - `context[2]`: publish_time (Rain Float, Unix seconds — `now`
 ///   in-session, `last_session_close` out-of-session per RAI-693)
-/// - `context[3]`: session tag (Rain IntOrAString bytes32 in whatever
-///   layout the caller supplies — `to_bytes32_v1` for `/context/v2`,
-///   `to_bytes32_v3` for `/context/v3`)
+/// - `context[3]`: session tag (Rain IntOrAString bytes32; callers
+///   supply `Session::to_bytes32_v3`)
 /// - `context[4]`: start of the CURRENT session (Rain Float, Unix sec)
 /// - `context[5]`: end of the CURRENT session (Rain Float, Unix sec)
-///
-/// Both `/context/v2` and `/context/v3` use this shared body. They
-/// differ only in:
-/// - `schema_version` (slot 0): `SCHEMA_VERSION_V2` vs
-///   `SCHEMA_VERSION_V3`
-/// - `session_bytes` (slot 3): V1 byte-0 vs V3 byte-31 IntOrAString
-///   layout — chosen by the caller via `Session::to_bytes32_v1` /
-///   `to_bytes32_v3`
-pub fn build_session_context(
+fn build_session_context(
     schema_version: u64,
     price_bytes: [u8; 32],
     publish_time: u64,
@@ -183,46 +160,8 @@ pub fn build_session_context(
     ])
 }
 
-/// Thin wrapper that pins schema_version = 2 for `/context/v2`.
-/// Caller supplies `session_bytes` from `Session::to_bytes32_v1`.
-pub fn build_context_v2(
-    price_bytes: [u8; 32],
-    publish_time: u64,
-    session_bytes: [u8; 32],
-    session_start: u64,
-    session_end: u64,
-) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
-    build_session_context(
-        SCHEMA_VERSION_V2,
-        price_bytes,
-        publish_time,
-        session_bytes,
-        session_start,
-        session_end,
-    )
-}
-
-/// Thin wrapper that pins schema_version = 3 for `/context/v3`.
-/// Caller supplies `session_bytes` from `Session::to_bytes32_v3`.
-pub fn build_context_v3(
-    price_bytes: [u8; 32],
-    publish_time: u64,
-    session_bytes: [u8; 32],
-    session_start: u64,
-    session_end: u64,
-) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
-    build_session_context(
-        SCHEMA_VERSION_V3,
-        price_bytes,
-        publish_time,
-        session_bytes,
-        session_start,
-        session_end,
-    )
-}
-
-/// Build the v4 signed-context array. Same first six slots as v3,
-/// plus the caller-supplied `input_token` / `output_token` at slots
+/// Build the v4 signed-context array. The six session slots, plus
+/// the caller-supplied `input_token` / `output_token` at slots
 /// 6 and 7 respectively. Both addresses are the exact bytes the
 /// caller sent in `validInputs[input_io_index].token` /
 /// `validOutputs[output_io_index].token` — no server-side rewriting,
@@ -231,7 +170,7 @@ pub fn build_context_v3(
 ///
 /// `price_bytes` is the 32-byte packed Rain Float the caller already
 /// picked for this request's swap direction (via `pick_rate_bytes`),
-/// exactly as for v2/v3 — the pricing service emits both directional
+/// exactly as for v1 — the pricing service emits both directional
 /// rates directionally (each carrying its own spread); the caller
 /// (`pick_rate_bytes`) inverts the directional rate into Raindex ratio
 /// units, and this function signs that maker-side price.
@@ -240,7 +179,7 @@ pub fn build_context_v3(
 /// - `context[0]`: schema version (= 4)
 /// - `context[1]`: price (Rain Float; maker-side, spread included)
 /// - `context[2]`: publish_time (Rain Float, Unix seconds)
-/// - `context[3]`: session tag (Rain IntOrAString V3 — same encoding as v3)
+/// - `context[3]`: session tag (Rain IntOrAString V3)
 /// - `context[4]`: session_start (Rain Float, Unix seconds)
 /// - `context[5]`: session_end (Rain Float, Unix seconds)
 /// - `context[6]`: input_token address (bytes32, Address left-padded)
@@ -394,93 +333,6 @@ mod tests {
         // pricing-client integration.
         let bytes = price_bytes_of("0.005");
         let ctx = build_context(bytes, 1).unwrap();
-        assert_eq!(ctx[1].as_slice(), &bytes[..]);
-    }
-
-    #[test]
-    fn test_build_context_v2_layout_and_session_encoding() {
-        // Synthetic bytes32 — `build_context_v2` is encoding-agnostic;
-        // the V3 vs old-V1 layout choice happens in
-        // `market_hours::Session::to_bytes32` and is exercised there.
-        // Here we just confirm slot 3 passes through unchanged.
-        let mut sess = [0u8; 32];
-        sess[..3].copy_from_slice(b"rth");
-
-        let ctx = build_context_v2(
-            price_bytes_of("185.42"),
-            1_700_000_000,
-            sess,
-            1_700_000_000,
-            1_700_023_400,
-        )
-        .unwrap();
-        assert_eq!(ctx.len(), 6, "schema v2 must emit 6 elements");
-
-        let version = Float::from(alloy::primitives::B256::from(ctx[0]));
-        assert_eq!(version.format().unwrap(), "2");
-
-        let price = Float::from(alloy::primitives::B256::from(ctx[1]));
-        assert_eq!(price.format().unwrap(), "185.42");
-
-        let publish = Float::from(alloy::primitives::B256::from(ctx[2]));
-        assert_eq!(publish.format().unwrap(), float_string_of(1_700_000_000));
-
-        // Session lives raw in the bytes32, not as a Float.
-        assert_eq!(ctx[3].as_slice(), sess.as_slice());
-
-        let start = Float::from(alloy::primitives::B256::from(ctx[4]));
-        assert_eq!(start.format().unwrap(), float_string_of(1_700_000_000));
-        let end = Float::from(alloy::primitives::B256::from(ctx[5]));
-        assert_eq!(end.format().unwrap(), float_string_of(1_700_023_400));
-    }
-
-    #[test]
-    fn test_build_context_v2_passes_price_bytes_through_unchanged() {
-        let mut sess = [0u8; 32];
-        sess[..3].copy_from_slice(b"rth");
-        let bytes = price_bytes_of("0.005");
-        let ctx = build_context_v2(bytes, 1, sess, 1, 2).unwrap();
-        assert_eq!(ctx[1].as_slice(), &bytes[..]);
-    }
-
-    #[test]
-    fn test_build_context_v3_layout_and_session_encoding() {
-        // /context/v3 differs from /context/v2 only in slot 0 (schema
-        // version constant) and the IntOrAString encoding the caller
-        // chose for slot 3. Here we just confirm slot 0 is 3 and slot
-        // 3 passes through unchanged.
-        let mut sess = [0u8; 32];
-        // V3 IntOrAString puts length in byte 31, not byte 0.
-        sess[31] = 0xe0 | 3;
-        sess[..3].copy_from_slice(b"rth");
-
-        let ctx = build_context_v3(
-            price_bytes_of("185.42"),
-            1_700_000_000,
-            sess,
-            1_700_000_000,
-            1_700_023_400,
-        )
-        .unwrap();
-        assert_eq!(ctx.len(), 6, "schema v3 must emit 6 elements");
-
-        let version = Float::from(alloy::primitives::B256::from(ctx[0]));
-        assert_eq!(version.format().unwrap(), "3");
-
-        let price = Float::from(alloy::primitives::B256::from(ctx[1]));
-        assert_eq!(price.format().unwrap(), "185.42");
-
-        // Session lives raw in the bytes32, not as a Float.
-        assert_eq!(ctx[3].as_slice(), sess.as_slice());
-    }
-
-    #[test]
-    fn test_build_context_v3_passes_price_bytes_through_unchanged() {
-        let mut sess = [0u8; 32];
-        sess[31] = 0xe0 | 3;
-        sess[..3].copy_from_slice(b"rth");
-        let bytes = price_bytes_of("0.005");
-        let ctx = build_context_v3(bytes, 1, sess, 1, 2).unwrap();
         assert_eq!(ctx[1].as_slice(), &bytes[..]);
     }
 

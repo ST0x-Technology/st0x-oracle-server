@@ -77,7 +77,7 @@ pub struct AppState {
     /// against the pricing cache to surface the partial-serving set.
     configured_symbols: Vec<String>,
     /// Market-hours source from Alpaca's calendar, used ONLY to classify
-    /// the current session for the v2/v3/v4 session slots (tag +
+    /// the current session for the v4/v5 session slots (tag +
     /// start/end bounds). `publish_time` comes from the pricing quote's
     /// own `source_ts_unix_ms`, not from this cache.
     market_hours: Arc<MarketHoursCache>,
@@ -116,8 +116,6 @@ pub fn create_app(state: AppState) -> Router {
         .route("/status", get(status))
         .route("/metrics", get(metrics))
         .route("/context/v1", post(post_signed_context_v1))
-        .route("/context/v2", post(post_signed_context_v2))
-        .route("/context/v3", post(post_signed_context_v3))
         .route("/context/v4", post(post_signed_context_v4))
         .route("/context/v5", post(post_signed_context_v5))
         .layer(CorsLayer::permissive())
@@ -234,86 +232,6 @@ async fn post_signed_context_v1_inner(
     Ok(Json(responses))
 }
 
-/// Pick which signed-context shape an endpoint emits. The two
-/// shapes share everything except the schema-version constant in
-/// slot 0 and the IntOrAString layout in slot 3:
-///
-/// - `V2` → `SCHEMA_VERSION_V2 = 2` + `Session::to_bytes32_v1`
-///   (byte-0 length). What live v2 strategies are bound to.
-/// - `V3` → `SCHEMA_VERSION_V3 = 3` + `Session::to_bytes32_v3`
-///   (byte-31 length). Matches Rainlang `"…"` string literals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionSchema {
-    V2,
-    V3,
-}
-
-impl SessionSchema {
-    fn encode_session(self, session: crate::market_hours::Session) -> [u8; 32] {
-        match self {
-            Self::V2 => session.to_bytes32_v1(),
-            Self::V3 => session.to_bytes32_v3(),
-        }
-    }
-
-    fn build_context(
-        self,
-        price_bytes: [u8; 32],
-        publish_time: u64,
-        session_bytes: [u8; 32],
-        session_start: u64,
-        session_end: u64,
-    ) -> Result<Vec<alloy::primitives::FixedBytes<32>>, anyhow::Error> {
-        match self {
-            Self::V2 => oracle::build_context_v2(
-                price_bytes,
-                publish_time,
-                session_bytes,
-                session_start,
-                session_end,
-            ),
-            Self::V3 => oracle::build_context_v3(
-                price_bytes,
-                publish_time,
-                session_bytes,
-                session_start,
-                session_end,
-            ),
-        }
-    }
-
-    fn tag(self) -> &'static str {
-        match self {
-            Self::V2 => "v2",
-            Self::V3 => "v3",
-        }
-    }
-}
-
-/// v2 handler — `/context/v2` endpoint. See [`SessionSchema`] for
-/// what makes v2 different from v3.
-async fn post_signed_context_v2(
-    State(state): State<Arc<AppState>>,
-    body: Bytes,
-) -> Result<impl IntoResponse, AppError> {
-    let result = post_signed_context_session(state, body, SessionSchema::V2).await;
-    record_request_outcome("v2", &result);
-    result
-}
-
-/// v3 handler — `/context/v3` endpoint. Same request shape and
-/// snapshot-once batching as v2; the only difference from the
-/// caller's perspective is slot 3 carries V3 IntOrAString (matches
-/// Rainlang `"…"` literals) and slot 0 carries schema version 3.
-async fn post_signed_context_v3(
-    State(state): State<Arc<AppState>>,
-    body: Bytes,
-) -> Result<impl IntoResponse, AppError> {
-    let result = post_signed_context_session(state, body, SessionSchema::V3).await;
-    record_request_outcome("v3", &result);
-    result
-}
-
 /// Record a `/context/v{N}` request's outcome on the `oracle_context_request_total`
 /// counter. `outcome` labels split into `ok` (signed responses returned),
 /// `empty` (no requests in the body — Raindex's quote crate posts an empty
@@ -337,7 +255,7 @@ fn record_request_outcome(
 }
 
 /// v4 handler — `/context/v4` endpoint. Same request shape and
-/// snapshot-once batching as v2/v3, plus the caller's raw
+/// snapshot-once batching as v1, plus the caller's raw
 /// `validInputs[input_io_index].token` /
 /// `validOutputs[output_io_index].token` addresses are stamped into
 /// signed-context slots 6 and 7 respectively.
@@ -407,7 +325,7 @@ async fn post_signed_context_pair_bound(
         return Ok(Json(Vec::<oracle::OracleResponse>::new()));
     }
 
-    // Same resolution + batching shape as v2/v3, but also keep the raw
+    // Same resolution + batching shape as v1, but also keep the raw
     // input_token/output_token per request so we can bind them into the
     // signed context — that binding is the whole point of v4.
     let mut resolved: Vec<(Address, Address, ResolvedPair)> = Vec::with_capacity(requests.len());
@@ -497,52 +415,6 @@ fn io_tokens_for(
         .token;
 
     Ok((input_token, output_token))
-}
-
-/// Shared body for `/context/v2` and `/context/v3`. Same orderbook
-/// request decoding, same cache snapshot-once batching, same
-/// market-hours snapshot-once-per-batch. The `schema` arg picks
-/// which schema-version constant and IntOrAString layout we emit.
-async fn post_signed_context_session(
-    state: Arc<AppState>,
-    body: Bytes,
-    schema: SessionSchema,
-) -> Result<axum::Json<Vec<oracle::OracleResponse>>, AppError> {
-    let requests = decode_request_body(&body)?;
-
-    if requests.is_empty() {
-        return Ok(Json(Vec::<oracle::OracleResponse>::new()));
-    }
-
-    let mut resolved: Vec<(OrderV4, ResolvedPair)> = Vec::with_capacity(requests.len());
-    for (order, input_io_index, output_io_index, _counterparty) in requests {
-        let pair = resolve_pair_for_order(&state, &order, input_io_index, output_io_index)?;
-        resolved.push((order, pair));
-    }
-
-    let needed_symbols: Vec<&str> = resolved.iter().map(|(_, p)| p.symbol.as_str()).collect();
-    let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
-
-    // Snapshot the session classification once for the whole batch so
-    // every signed context in this response agrees on which session
-    // we're in, even across a phase boundary mid-iteration. publish_time
-    // is per-quote (the pricing quote's own source_ts), read in the builder.
-    let session_info = state.market_hours.session_info_for(Utc::now()).await;
-
-    let mut responses = Vec::with_capacity(resolved.len());
-    for (_, pair) in &resolved {
-        let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
-            AppError::Unavailable(format!(
-                "No live quote for {} yet. The pricing WS has not delivered a frame since startup.",
-                pair.symbol
-            ))
-        })?;
-        let resp =
-            build_response_from_quote_session(&state, pair, &quote, &session_info, schema).await?;
-        responses.push(resp);
-    }
-
-    Ok(Json(responses))
 }
 
 /// Decode a request's IO indices into the actual input/output addresses
@@ -660,7 +532,7 @@ fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> Result<[u8; 32],
 /// frozen pricing feed surfaces directly — `source_ts` stops advancing,
 /// the signed timestamp goes stale, and the strategy's `max-staleness`
 /// rejects. The oracle's own `MarketHoursCache` is used only for the
-/// v2/v3/v4 session slots, never for `publish_time`.
+/// v4/v5 session slots, never for `publish_time`.
 /// Derive the signed `publish_time` (Unix seconds) from a pricing-service
 /// `Quote.source_ts_unix_ms` (Unix milliseconds). st0x.pricing already
 /// stamps `source_ts` with the mark's honest as-of instant (RAI-732), so
@@ -712,67 +584,10 @@ async fn build_response_from_quote(
     })
 }
 
-/// Shared response builder for `/context/v2` and `/context/v3`.
-/// Same price + publish_time + session-bounds logic as the v2-only
-/// helper this replaces; the `schema` arg picks which IntOrAString
-/// layout slot 3 uses and which schema-version constant slot 0
-/// carries.
-async fn build_response_from_quote_session(
-    state: &AppState,
-    pair: &ResolvedPair,
-    quote: &Quote,
-    session_info: &crate::market_hours::SessionInfo,
-    schema: SessionSchema,
-) -> Result<oracle::OracleResponse, AppError> {
-    // publish_time is the pricing quote's source_ts (see
-    // `build_response_from_quote`); session slots come from the oracle's
-    // own market-hours classification.
-    let publish_time = publish_time_from_quote(quote)?;
-    let session_start: u64 = session_info
-        .start
-        .timestamp()
-        .try_into()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("session_start out of range")))?;
-    let session_end: u64 = session_info
-        .end
-        .timestamp()
-        .try_into()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
-
-    let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
-
-    tracing::info!(
-        symbol = %pair.symbol,
-        direction = pair.direction.as_str(),
-        schema = schema.tag(),
-        publish_time = publish_time,
-        session = session_info.session.as_str(),
-        session_start = session_start,
-        session_end = session_end,
-        source_ts_unix_ms = quote.source_ts_unix_ms,
-        "Building session signed context from live pricing quote"
-    );
-
-    let context = schema.build_context(
-        price_bytes,
-        publish_time,
-        schema.encode_session(session_info.session),
-        session_start,
-        session_end,
-    )?;
-    let (signature, signer) = state.signer.sign_context(&context).await?;
-
-    Ok(oracle::OracleResponse {
-        signer,
-        context,
-        signature,
-    })
-}
-
-/// v4 response builder. Same price + publish_time + session-bounds logic
-/// as v3's `build_response_from_quote_session`, plus the caller's raw
-/// input/output token addresses stamped into signed-context slots 6 and
-/// 7 (see `oracle::build_context_v4` for the layout).
+/// v4 response builder. Same price + publish_time logic as v1's
+/// `build_response_from_quote`, plus the session slots and the caller's
+/// raw input/output token addresses stamped into signed-context slots 6
+/// and 7 (see `oracle::build_context_v4` for the layout).
 #[allow(clippy::too_many_arguments)]
 async fn build_response_from_quote_pair_bound(
     state: &AppState,
@@ -798,7 +613,7 @@ async fn build_response_from_quote_pair_bound(
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
 
-    // Same as v1-v3: pick the directional rate and invert it into
+    // Same as v1: pick the directional rate and invert it into
     // Raindex ratio units (Rain-Float precision) — see `pick_rate_bytes`.
     let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
 
