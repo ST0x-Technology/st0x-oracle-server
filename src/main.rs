@@ -20,7 +20,8 @@ const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 #[derive(Parser)]
 #[command(name = "st0x-oracle-server")]
-#[command(about = "Signed context oracle server for st0x tokenized equities")]
+#[command(about = "Signed context oracle server for st0x tokenized equities.\n\
+    Run `st0x-oracle-server validate [path]` to check a config file and exit.")]
 struct Cli {
     /// Path to config.toml. Contains port, pricing connection, and the
     /// token registry — everything except secrets.
@@ -74,6 +75,23 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `st0x-oracle-server validate [path]` — parse + validate a config file
+    // with the real Config::load rules and exit. Dispatched before clap so
+    // the serve-only required flags (pricing/Alpaca creds) are not needed:
+    // CI validates candidate configs by running the shipped image with no
+    // env at all. Path resolution mirrors --config: positional arg, then
+    // CONFIG_PATH, then ./config.toml.
+    let mut argv = std::env::args();
+    if argv.nth(1).as_deref() == Some("validate") {
+        let path = argv
+            .next()
+            .or_else(|| std::env::var("CONFIG_PATH").ok())
+            .unwrap_or_else(|| "config.toml".to_string());
+        let config = Config::load(std::path::Path::new(&path))?;
+        println!("{path}: OK ({} tokens)", config.tokens.len());
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
