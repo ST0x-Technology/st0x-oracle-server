@@ -3,7 +3,7 @@ version: 6
 orders:
   base:
     raindex: base
-    oracle-url: https://st0x-oracle-server.fly.dev/context/v4
+    oracle-url: https://oracle.t0trade.com/context/v4
     inputs:
       - token: token1
     outputs:
@@ -16,7 +16,7 @@ scenarios:
     runs: 1
     bindings:
       raindex-subparser: 0x22839F16281E67E5Fd395fAFd1571e820CbD46cB
-      oracle-signer: 0x8Ff1CA8ED2e98f693A3eA16b3EBE44FE90500A43
+      oracle-signer: 0xdB665B5ef8Bd04Fd977bB3A64790eaa52749ACcc
       oracle-schema-version: 4
 
 deployments:
@@ -144,11 +144,11 @@ oracle-output-token: signed-context<0 7>(),
  * expose the current order's IO addresses at execution time. */
 :ensure(
   equal-to(oracle-input-token input-token())
-  "Oracle input token does not match order input"
+  "Oracle input token mismatch"
 ),
 :ensure(
   equal-to(oracle-output-token output-token())
-  "Oracle output token does not match order output"
+  "Oracle output token mismatch"
 ),
 
 /* Session guard. Strategy only operates in the deployer-chosen session.
