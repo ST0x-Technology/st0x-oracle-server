@@ -238,6 +238,65 @@ async fn fetch_id_token(audience: &str) -> Result<String, ClientError> {
     Ok(token.trim().to_string())
 }
 
+/// Apply one decoded inbound `ServerFrame` to the quote cache and
+/// return the reply frame to send, if the frame demands one (Ping →
+/// Pong). Split out of the socket loop so the cache semantics are unit
+/// testable:
+///
+/// - `Price` stores the whole frame as one `Quote` — the rates, expiry,
+///   source_ts and NAV ratio of a cached observation always come from
+///   the same frame, so a signed context can never pair a rate from one
+///   frame with a NAV ratio from another.
+/// - `Halt` fails closed: `halted = true` evicts the cached quote so
+///   every subsequent request for the asset 503s instead of serving a
+///   price the producer has disowned (the wrapped vault NAV can step on
+///   a dividend deposit; the producer halts around the step). Resume
+///   (`halted = false`) needs no action — the next price frame
+///   repopulates the cache.
+async fn apply_server_frame(
+    cache: &Arc<RwLock<HashMap<Symbol, Quote>>>,
+    frame: ServerFrame,
+) -> Option<ClientFrame> {
+    match frame {
+        ServerFrame::Price(p) => {
+            let q = Quote {
+                asset: p.asset.clone(),
+                chain_id: p.chain_id,
+                base: p.base,
+                quote: p.quote,
+                rate_base_to_quote: p.rate_base_to_quote,
+                rate_quote_to_base: p.rate_quote_to_base,
+                expiry_unix_ms: p.expiry_unix_ms,
+                source_ts_unix_ms: p.source_ts_unix_ms,
+                nav_ratio: p.nav_ratio,
+            };
+            cache.write().await.insert(p.asset, q);
+            None
+        }
+        ServerFrame::Error(e) => {
+            tracing::warn!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
+            ::metrics::counter!(
+                "oracle_upstream_failure_total",
+                "kind" => "pricing_error_frame",
+            )
+            .increment(1);
+            None
+        }
+        ServerFrame::Halt(h) => {
+            if h.halted {
+                cache.write().await.remove(&h.asset);
+                tracing::warn!(asset = %h.asset, reason = ?h.reason, "Asset halted by pricing server; quote evicted");
+            } else {
+                tracing::info!(asset = %h.asset, "Asset halt lifted; awaiting next price frame");
+            }
+            None
+        }
+        ServerFrame::Ping(p) => Some(ClientFrame::Pong(PongFrame {
+            ts_unix_ms: p.ts_unix_ms,
+        })),
+    }
+}
+
 async fn connect_and_run(
     cfg: &LiveClientConfig,
     cache: &Arc<RwLock<HashMap<Symbol, Quote>>>,
@@ -306,35 +365,9 @@ async fn connect_and_run(
                         continue;
                     }
                 };
-                match frame {
-                    ServerFrame::Price(p) => {
-                        let q = Quote {
-                            asset: p.asset.clone(),
-                            chain_id: p.chain_id,
-                            base: p.base,
-                            quote: p.quote,
-                            rate_base_to_quote: p.rate_base_to_quote,
-                            rate_quote_to_base: p.rate_quote_to_base,
-                            expiry_unix_ms: p.expiry_unix_ms,
-                            source_ts_unix_ms: p.source_ts_unix_ms,
-                        };
-                        cache.write().await.insert(p.asset, q);
-                    }
-                    ServerFrame::Error(e) => {
-                        tracing::warn!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
-                        ::metrics::counter!(
-                            "oracle_upstream_failure_total",
-                            "kind" => "pricing_error_frame",
-                        )
-                        .increment(1);
-                    }
-                    ServerFrame::Ping(p) => {
-                        let pong = ClientFrame::Pong(PongFrame {
-                            ts_unix_ms: p.ts_unix_ms,
-                        });
-                        if let Ok(buf) = encode_cbor(&pong) {
-                            let _ = socket.send(WsMessage::Binary(buf)).await;
-                        }
+                if let Some(reply) = apply_server_frame(cache, frame).await {
+                    if let Ok(buf) = encode_cbor(&reply) {
+                        let _ = socket.send(WsMessage::Binary(buf)).await;
                     }
                 }
             }
@@ -352,6 +385,88 @@ async fn connect_and_run(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use st0x_pricing_types::{HaltFrame, PriceFrame, Venue, WireAddress, WireFloat, WireU256};
+
+    fn price_frame(asset: &str, nav_ratio: WireU256) -> ServerFrame {
+        ServerFrame::Price(PriceFrame {
+            asset: asset.to_string(),
+            venue: Venue::Raindex,
+            chain_id: 8453,
+            base: WireAddress::from_bytes([0x11; 20]),
+            quote: WireAddress::from_bytes([0x22; 20]),
+            rate_base_to_quote: WireFloat::from_bytes([0x42; 32]),
+            rate_quote_to_base: WireFloat::from_bytes([0x43; 32]),
+            expiry_unix_ms: 1_715_000_030_000,
+            model_version: "0.1.0".into(),
+            source_ts_unix_ms: 1_714_999_970_000,
+            nav_ratio,
+        })
+    }
+
+    fn halt_frame(asset: &str, halted: bool) -> ServerFrame {
+        ServerFrame::Halt(HaltFrame {
+            asset: asset.to_string(),
+            chain_id: 8453,
+            base: WireAddress::from_bytes([0x11; 20]),
+            quote: WireAddress::from_bytes([0x22; 20]),
+            halted,
+            reason: None,
+        })
+    }
+
+    /// The cached `Quote` must carry the frame's NAV ratio bit-for-bit
+    /// alongside its rates: one frame in, one coherent observation out.
+    #[tokio::test]
+    async fn price_frame_stores_nav_ratio_with_the_same_observation() {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        let mut nav = [0u8; 32];
+        let mut v: u8 = 5;
+        for b in &mut nav {
+            *b = v;
+            v = v.wrapping_add(29);
+        }
+
+        let reply =
+            apply_server_frame(&cache, price_frame("COIN", WireU256::from_bytes(nav))).await;
+        assert!(reply.is_none());
+
+        let q = cache.read().await.get("COIN").cloned().unwrap();
+        assert_eq!(q.nav_ratio.0, nav, "NAV ratio must be bit-for-bit");
+        assert_eq!(q.rate_quote_to_base, WireFloat::from_bytes([0x43; 32]));
+    }
+
+    /// A halt fails closed: the cached quote is evicted immediately, so
+    /// requests for the asset 503 instead of serving a price the
+    /// producer has disowned. A resume frame does NOT resurrect the old
+    /// quote — only the next price frame repopulates the cache.
+    #[tokio::test]
+    async fn halt_evicts_cached_quote_and_resume_does_not_restore_it() {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        apply_server_frame(&cache, price_frame("COIN", WireU256::ZERO)).await;
+        apply_server_frame(&cache, price_frame("TSLA", WireU256::ZERO)).await;
+
+        apply_server_frame(&cache, halt_frame("COIN", true)).await;
+        assert!(
+            cache.read().await.get("COIN").is_none(),
+            "halted asset must be evicted"
+        );
+        assert!(
+            cache.read().await.get("TSLA").is_some(),
+            "halt must only evict the named asset"
+        );
+
+        apply_server_frame(&cache, halt_frame("COIN", false)).await;
+        assert!(
+            cache.read().await.get("COIN").is_none(),
+            "resume must not resurrect the pre-halt quote"
+        );
+
+        apply_server_frame(&cache, price_frame("COIN", WireU256::ZERO)).await;
+        assert!(
+            cache.read().await.get("COIN").is_some(),
+            "next price frame repopulates the cache"
+        );
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]

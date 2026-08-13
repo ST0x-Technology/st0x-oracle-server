@@ -118,6 +118,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/context/v1", post(post_signed_context_v1))
         .route("/context/v4", post(post_signed_context_v4))
         .route("/context/v5", post(post_signed_context_v5))
+        .route("/context/v6", post(post_signed_context_v6))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -294,14 +295,40 @@ async fn post_signed_context_v5(
     result
 }
 
-/// Which pair-bound schema a `/context/v4` or `/context/v5` request is
-/// being served under. Both share request decoding, registry
-/// resolution, snapshot-once batching and the session snapshot; they
-/// differ only in whether the model's expiry is signed into slot 8.
+/// v6 handler — `/context/v6` endpoint. Identical request shape,
+/// resolution and batching to v4/v5; the response additionally signs
+/// the vault NAV ratio the pricing model priced this quote against, as
+/// a Rain Float at slot 9.
+///
+/// The property v6 adds: the base token is a share in a wrapped-token
+/// vault whose NAV can step (e.g. on a dividend deposit), and a price
+/// signed against one NAV but settled against another is stale in a
+/// way no timestamp check can see. Slot 9 carries the on-chain
+/// `convertToAssets(1e18)` value the model priced against, losslessly
+/// packed as a Rain Float, so a v6 strategy can assert numeric equality
+/// against the `erc4626-convert-to-assets` word at settlement. See
+/// `oracle::SCHEMA_VERSION_V6` for the full layout, the encoding
+/// rationale and the zero sentinel.
+async fn post_signed_context_v6(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let result = post_signed_context_pair_bound(state, body, PairSchema::V6).await;
+    record_request_outcome("v6", &result);
+    result
+}
+
+/// Which pair-bound schema a `/context/v4`, `/context/v5` or
+/// `/context/v6` request is being served under. All three share request
+/// decoding, registry resolution, snapshot-once batching and the
+/// session snapshot; they differ only in whether the model's expiry is
+/// signed into slot 8 (v5, v6) and the vault NAV ratio into slot 9
+/// (v6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairSchema {
     V4,
     V5,
+    V6,
 }
 
 impl PairSchema {
@@ -309,11 +336,12 @@ impl PairSchema {
         match self {
             Self::V4 => "v4",
             Self::V5 => "v5",
+            Self::V6 => "v6",
         }
     }
 }
 
-/// Shared body for `/context/v4` and `/context/v5`.
+/// Shared body for `/context/v4`, `/context/v5` and `/context/v6`.
 async fn post_signed_context_pair_bound(
     state: Arc<AppState>,
     body: Bytes,
@@ -584,10 +612,12 @@ async fn build_response_from_quote(
     })
 }
 
-/// v4 response builder. Same price + publish_time logic as v1's
-/// `build_response_from_quote`, plus the session slots and the caller's
-/// raw input/output token addresses stamped into signed-context slots 6
-/// and 7 (see `oracle::build_context_v4` for the layout).
+/// Pair-bound response builder (v4/v5/v6). Same price + publish_time
+/// logic as v1's `build_response_from_quote`, plus the session slots
+/// and the caller's raw input/output token addresses stamped into
+/// signed-context slots 6 and 7; v5 adds the quote expiry at slot 8 and
+/// v6 the vault NAV ratio at slot 9 (see the `oracle::build_context_v*`
+/// builders for the layouts).
 #[allow(clippy::too_many_arguments)]
 async fn build_response_from_quote_pair_bound(
     state: &AppState,
@@ -651,6 +681,22 @@ async fn build_response_from_quote_pair_bound(
             input_token,
             output_token,
             expiry_from_quote(quote)?,
+        )?,
+        // The NAV ratio is read off the SAME `quote` as the rate at
+        // slot 1 — both came out of one `snapshot_many` entry, and the
+        // pricing client only ever stores whole frames — so the signed
+        // context can never pair a rate from one frame with a ratio
+        // from another.
+        PairSchema::V6 => oracle::build_context_v6(
+            price_bytes,
+            publish_time,
+            session_info.session.to_bytes32_v3(),
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+            expiry_from_quote(quote)?,
+            quote.nav_ratio.0,
         )?,
     };
     let (signature, signer) = state.signer.sign_context(&context).await?;
