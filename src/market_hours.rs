@@ -42,7 +42,8 @@ pub struct SessionWindow {
 }
 
 /// The market-session classification at a given instant. The bytes32
-/// ASCII encoding is what `/context/v2` signs at context slot 3.
+/// ASCII encoding is what `/context/v4` and `/context/v5` sign at
+/// context slot 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Session {
     Rth,
@@ -63,33 +64,13 @@ impl Session {
         }
     }
 
-    /// Encode the session tag as the **V1** IntOrAString shape used
-    /// by `/context/v2`: byte 0 = `(len & 0x1f) | 0x80`, ASCII data
-    /// at bytes `1..1+len`, tail zero-padded.
-    ///
-    /// This is what live v2 orders bind `allowed-session` to via the
-    /// hex presets in `st0x-fixed-spread-v2.rain` /
-    /// `st0x-oracle-limit-v2.rain` (e.g.
-    /// `0x8372746800…` for "rth"). The Rainlang parser does **not**
-    /// emit this shape from a `"…"` string literal — see
-    /// `to_bytes32_v3` for that — so v2 strategies have to compare
-    /// against the hex preset bytes32 directly.
-    pub fn to_bytes32_v1(self) -> [u8; 32] {
-        let bytes = self.as_str().as_bytes();
-        assert!(bytes.len() < 32, "session name must fit in 31 bytes");
-        let mut out = [0u8; 32];
-        out[0] = 0x80 | (bytes.len() as u8);
-        out[1..=bytes.len()].copy_from_slice(bytes);
-        out
-    }
-
     /// Encode the session tag as Rain `IntOrAString` **V3** bytes32 —
     /// the exact byte layout the Rainlang parser produces for a `"…"`
     /// string literal via `LibIntOrAString::fromStringV3`. Byte 31 =
     /// `(len & 0x1f) | 0xe0`, ASCII data at bytes `(31-len)..31`, head
     /// zero-padded.
     ///
-    /// Used by `/context/v3`. v3 strategies compare
+    /// Used by `/context/v4` and `/context/v5`. Strategies compare
     /// `equal-to(signed-context<0 3>() "rth")` directly — both sides
     /// resolve to the same V3 bytes32 and the equality holds
     /// byte-for-byte.
@@ -104,9 +85,9 @@ impl Session {
     }
 }
 
-/// The session-level info `/context/v2` exposes at slots 3-5: which
-/// session we're in, and the UTC bounds of *that current* session
-/// (not the next).
+/// The session-level info `/context/v4` and `/context/v5` expose at
+/// slots 3-5: which session we're in, and the UTC bounds of *that
+/// current* session (not the next).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub session: Session,
@@ -176,8 +157,8 @@ impl MarketHoursCache {
     }
 
     /// Return the current signed session start, using the same
-    /// premarket/RTH/afterhours boundaries that `/context/v3` and
-    /// `/context/v4` sign into slot 4.
+    /// premarket/RTH/afterhours boundaries that `/context/v4` and
+    /// `/context/v5` sign into slot 4.
     pub async fn active_signed_session_start_for(
         &self,
         now: DateTime<Utc>,
@@ -509,48 +490,13 @@ mod tests {
     }
 
     #[test]
-    fn session_bytes32_v1_matches_byte0_layout() {
-        // V1 IntOrAString: byte 0 = (len & 0x1f) | 0x80; bytes
-        // 1..1+len = ASCII; bytes 1+len..32 = 0. Used by `/context/v2`
-        // — matches the hex presets baked into deployed v2 strategies.
-        for sess in [
-            Session::Rth,
-            Session::Premarket,
-            Session::Afterhours,
-            Session::OvernightClosed,
-            Session::WeekendClosed,
-        ] {
-            let b = sess.to_bytes32_v1();
-            let name = sess.as_str().as_bytes();
-            let len = name.len();
-            assert_eq!(
-                b[0],
-                0x80 | len as u8,
-                "{}: byte 0 must be 0x80 | length",
-                sess.as_str()
-            );
-            assert_eq!(
-                &b[1..=len],
-                name,
-                "{}: ASCII data must immediately follow the length byte",
-                sess.as_str()
-            );
-            assert!(
-                b[1 + len..].iter().all(|&x| x == 0),
-                "{}: tail must be zero-padded",
-                sess.as_str()
-            );
-        }
-    }
-
-    #[test]
     fn session_bytes32_v3_matches_rain_intorastring_v3_format() {
         // V3 IntOrAString: byte 31 = (len & 0x1f) | 0xe0; bytes
         // (31-len)..31 = ASCII; bytes 0..(31-len) = 0. This is what
         // `LibIntOrAString::fromStringV3` produces and what the
         // Rainlang parser emits for a `"…"` string literal — used by
-        // `/context/v3` so v3 strategies can compare against string
-        // literals without inline hex.
+        // `/context/v4` and `/context/v5` so strategies can compare
+        // against string literals without inline hex.
         for sess in [
             Session::Rth,
             Session::Premarket,
@@ -579,16 +525,6 @@ mod tests {
                 sess.as_str()
             );
         }
-    }
-
-    #[test]
-    fn session_bytes32_v1_known_rth_value() {
-        // Spot-check the exact V1 bytes for "rth". This is the value
-        // hex-baked into `st0x-fixed-spread-v2.rain`'s preset.
-        let b = Session::Rth.to_bytes32_v1();
-        let mut expected = [0u8; 32];
-        expected[..4].copy_from_slice(&[0x83, b'r', b't', b'h']);
-        assert_eq!(b, expected);
     }
 
     #[test]

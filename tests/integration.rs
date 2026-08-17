@@ -95,7 +95,7 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
 /// carry `source_ts_unix_ms = FIXED_PUBLISH_TIME * 1000`, and since the
 /// oracle signs the quote's source_ts as publish_time, tests assert the
 /// signed publish_time against `FIXED_PUBLISH_TIME`. The market-hours
-/// cache only affects the v2/v3/v4 session slots, not publish_time.
+/// cache only affects the v4/v5 session slots, not publish_time.
 async fn test_app() -> axum::Router {
     test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await
 }
@@ -180,7 +180,7 @@ async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::
 }
 
 /// Cache with one prior session window in the past, so the app classifies
-/// as "out of session" for the v2/v3/v4 session slots. publish_time is
+/// as "out of session" for the v4/v5 session slots. publish_time is
 /// unaffected (it's the quote's source_ts); this just makes the session
 /// classification deterministic.
 async fn fixed_close_market_hours() -> Arc<MarketHoursCache> {
@@ -207,7 +207,7 @@ async fn always_in_session_market_hours() -> Arc<MarketHoursCache> {
     let window = SessionWindow {
         date: now.date_naive(),
         session_open: now - ChronoDuration::hours(8),
-        // Bracket `now` in the middle of the RTH sub-window too, so a v2
+        // Bracket `now` in the middle of the RTH sub-window too, so a
         // session_info_for(now) classifies as Rth.
         rth_open: now - ChronoDuration::hours(2),
         rth_close: now + ChronoDuration::hours(2),
@@ -297,32 +297,24 @@ async fn weekend_closed_market_hours() -> Arc<MarketHoursCache> {
     mh
 }
 
-/// Decode a session tag from slot 3 of the v2 context. The on-the-wire
-/// format is Rain's `IntOrAString` V1: byte 0 holds `(len & 0x1f) | 0x80`,
-/// ASCII data lives in bytes `1..=len`, tail zero-padded.
-fn decode_session_tag_v1(b: alloy::primitives::FixedBytes<32>) -> String {
-    let bytes: [u8; 32] = b.into();
-    let len = (bytes[0] & 0x1f) as usize;
-    String::from_utf8(bytes[1..=len].to_vec()).unwrap()
-}
-
-/// Decode a session tag from slot 3 of the v3 context. The on-the-wire
-/// format is Rain's `IntOrAString` V3: byte 31 holds `(len & 0x1f) | 0xe0`,
-/// ASCII data lives in bytes `(31-len)..31`, head zero-padded.
+/// Decode a session tag from slot 3 of the signed context. The
+/// on-the-wire format is Rain's `IntOrAString` V3: byte 31 holds
+/// `(len & 0x1f) | 0xe0`, ASCII data lives in bytes `(31-len)..31`,
+/// head zero-padded.
 fn decode_session_tag_v3(b: alloy::primitives::FixedBytes<32>) -> String {
     let bytes: [u8; 32] = b.into();
     let len = (bytes[31] & 0x1f) as usize;
     String::from_utf8(bytes[31 - len..31].to_vec()).unwrap()
 }
 
-/// Send a single buy through `/context/v2` and return the decoded
+/// Send a single buy through `/context/v5` and return the decoded
 /// session tag from the response. Used by the phase-coverage tests.
-async fn v2_session_tag_for(app: axum::Router) -> String {
+async fn v5_session_tag_for(app: axum::Router) -> String {
     let response = app
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v2")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -332,7 +324,7 @@ async fn v2_session_tag_for(app: axum::Router) -> String {
     assert_eq!(response.status(), 200);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    decode_session_tag_v1(responses[0].context[3])
+    decode_session_tag_v3(responses[0].context[3])
 }
 
 #[tokio::test]
@@ -545,113 +537,6 @@ async fn test_v1_publish_time_is_quote_source_ts_even_when_in_session() {
 }
 
 #[tokio::test]
-async fn test_v2_single_returns_v2_schema_with_session() {
-    // In-session market_hours -> /context/v2 should return a 6-element
-    // context with schema version 2, fresh publish_time, "rth" session
-    // tag, and the session bounds we put in the cache.
-    let mh = always_in_session_market_hours().await;
-    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
-
-    let response = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v2")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(responses.len(), 1);
-    let resp = &responses[0];
-    assert_eq!(resp.context.len(), 6, "v2 must emit 6 context elements");
-
-    // schema_version
-    let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
-    assert_eq!(version.format().unwrap(), "2");
-
-    // price (broker mark)
-    let price = Float::from(alloy::primitives::B256::from(resp.context[1]));
-    assert_eq!(price.format().unwrap(), "100");
-
-    // session tag — Rain IntOrAString V1 encoding of "rth" (what
-    // `/context/v2` emits for live v2 strategies):
-    // byte 0 = 0x83 (0x80 | 3), bytes 1..4 = "rth", tail zero-padded.
-    let sess = resp.context[3].as_slice();
-    assert_eq!(sess[0], 0x83, "byte 0 must be 0x80 | 3");
-    assert_eq!(&sess[1..4], b"rth");
-    assert!(
-        sess[4..].iter().all(|&b| b == 0),
-        "session tag must be zero-padded after the data: {:?}",
-        sess
-    );
-
-    // session_start, session_end - non-zero and ordered
-    let start = Float::from(alloy::primitives::B256::from(resp.context[4]))
-        .format()
-        .unwrap()
-        .parse::<f64>()
-        .unwrap() as i64;
-    let end = Float::from(alloy::primitives::B256::from(resp.context[5]))
-        .format()
-        .unwrap()
-        .parse::<f64>()
-        .unwrap() as i64;
-    assert!(
-        start > 0 && end > start,
-        "session bounds: start={start} end={end}"
-    );
-}
-
-#[tokio::test]
-async fn test_v3_single_returns_v3_schema_with_v3_session_encoding() {
-    // /context/v3 mirrors /context/v2 except slot 0 = 3 and slot 3 is
-    // V3 IntOrAString (matches what the Rainlang parser emits for a
-    // `"…"` string literal in a v3 strategy).
-    let mh = always_in_session_market_hours().await;
-    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
-
-    let response = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v3")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(responses.len(), 1);
-    let resp = &responses[0];
-    assert_eq!(resp.context.len(), 6, "v3 must emit 6 context elements");
-
-    // schema_version
-    let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
-    assert_eq!(version.format().unwrap(), "3");
-
-    // session tag — V3 IntOrAString for "rth":
-    // byte 31 = 0xe3 (0xe0 | 3), bytes 28..31 = "rth", head zero-padded.
-    let sess = resp.context[3].as_slice();
-    assert_eq!(sess[31], 0xe3, "byte 31 must be 0xe0 | 3");
-    assert_eq!(&sess[28..31], b"rth");
-    assert!(
-        sess[..28].iter().all(|&b| b == 0),
-        "session tag must be zero-padded before the data: {:?}",
-        sess
-    );
-}
-
-#[tokio::test]
 async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
     // /context/v4's whole reason for existing: the signed context binds
     // the raw input/output token addresses so an attacker can't reuse a
@@ -792,142 +677,79 @@ async fn test_v4_rejects_the_swapped_token_attack() {
 }
 
 #[tokio::test]
-async fn test_v2_and_v3_session_slot_differ_byte_for_byte() {
-    // Same request hitting both endpoints with the same session must
-    // produce different slot-3 layouts: V1 byte-0 vs V3 byte-31. This
-    // is the whole point of having two endpoints.
-    let mh = always_in_session_market_hours().await;
-    let app_v2 = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh.clone()).await;
-    let app_v3 = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
-
-    let v2_resp = app_v2
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v2")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let v3_resp = app_v3
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v3")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    let v2_bytes = v2_resp.into_body().collect().await.unwrap().to_bytes();
-    let v3_bytes = v3_resp.into_body().collect().await.unwrap().to_bytes();
-    let v2: Vec<OracleResponse> = serde_json::from_slice(&v2_bytes).unwrap();
-    let v3: Vec<OracleResponse> = serde_json::from_slice(&v3_bytes).unwrap();
-
-    let v2_sess = v2[0].context[3];
-    let v3_sess = v3[0].context[3];
-    assert_ne!(v2_sess, v3_sess, "v2 and v3 session encodings must differ");
-    assert_eq!(decode_session_tag_v1(v2_sess), "rth");
-    assert_eq!(decode_session_tag_v3(v3_sess), "rth");
-}
-
-#[tokio::test]
-async fn test_v2_handler_signs_rth_when_now_inside_rth() {
+async fn test_v5_handler_signs_rth_when_now_inside_rth() {
     let app = test_app_full(
         &[(WCOIN, "COIN", Some(100.0))],
         always_in_session_market_hours().await,
     )
     .await;
-    assert_eq!(v2_session_tag_for(app).await, "rth");
+    assert_eq!(v5_session_tag_for(app).await, "rth");
 }
 
 #[tokio::test]
-async fn test_v2_handler_signs_premarket_when_now_before_rth_open() {
+async fn test_v5_handler_signs_premarket_when_now_before_rth_open() {
     let app = test_app_full(
         &[(WCOIN, "COIN", Some(100.0))],
         premarket_market_hours().await,
     )
     .await;
-    assert_eq!(v2_session_tag_for(app).await, "premarket");
+    assert_eq!(v5_session_tag_for(app).await, "premarket");
 }
 
 #[tokio::test]
-async fn test_v2_handler_signs_afterhours_when_now_past_rth_close() {
+async fn test_v5_handler_signs_afterhours_when_now_past_rth_close() {
     let app = test_app_full(
         &[(WCOIN, "COIN", Some(100.0))],
         afterhours_market_hours().await,
     )
     .await;
-    assert_eq!(v2_session_tag_for(app).await, "afterhours");
+    assert_eq!(v5_session_tag_for(app).await, "afterhours");
 }
 
 #[tokio::test]
-async fn test_v2_handler_signs_overnight_closed_for_short_gap() {
+async fn test_v5_handler_signs_overnight_closed_for_short_gap() {
     let app = test_app_full(
         &[(WCOIN, "COIN", Some(100.0))],
         overnight_closed_market_hours().await,
     )
     .await;
-    assert_eq!(v2_session_tag_for(app).await, "overnight_closed");
+    assert_eq!(v5_session_tag_for(app).await, "overnight_closed");
 }
 
 #[tokio::test]
-async fn test_v2_handler_signs_weekend_closed_for_long_gap() {
+async fn test_v5_handler_signs_weekend_closed_for_long_gap() {
     let app = test_app_full(
         &[(WCOIN, "COIN", Some(100.0))],
         weekend_closed_market_hours().await,
     )
     .await;
-    assert_eq!(v2_session_tag_for(app).await, "weekend_closed");
+    assert_eq!(v5_session_tag_for(app).await, "weekend_closed");
 }
 
 #[tokio::test]
-async fn test_v2_session_tag_reflects_market_phase() {
+async fn test_v5_session_tag_reflects_market_phase() {
     // Out-of-session market_hours (fixed_close_market_hours pins us
     // outside any active window) -> session tag should be a closed
-    // variant, not "rth".
+    // variant, not "rth". With only a single window in the cache and
+    // `now` after it, the cache returns OvernightClosed (no
+    // `next_open` to widen the gap).
     let app = test_app_full(
         &[(WCOIN, "COIN", Some(100.0))],
         fixed_close_market_hours().await,
     )
     .await;
-    let response = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v2")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    let sess = responses[0].context[3].as_slice();
-    // Decode the IntOrAString V1 format (what `/context/v2` emits):
-    // length = byte 0 & 0x1f, ASCII data starts at byte 1. With only
-    // a single window in the cache and `now` after it, the cache
-    // returns OvernightClosed (no `next_open` to widen the gap).
-    let len = (sess[0] & 0x1f) as usize;
-    let name = std::str::from_utf8(&sess[1..=len]).unwrap();
-    assert_eq!(name, "overnight_closed");
+    assert_eq!(v5_session_tag_for(app).await, "overnight_closed");
 }
 
 #[tokio::test]
-async fn test_v2_batch_returns_length_matching_array_with_session() {
+async fn test_v5_batch_returns_length_matching_array_with_session() {
     let mh = always_in_session_market_hours().await;
     let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
     let response = app
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v2")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_batch(&[
                     (USDC, WCOIN),
@@ -954,7 +776,7 @@ async fn test_v2_batch_returns_length_matching_array_with_session() {
 }
 
 #[tokio::test]
-async fn test_v2_empty_batch_returns_empty_array() {
+async fn test_v5_empty_batch_returns_empty_array() {
     let empty: Vec<(OrderV4, U256, U256, Address)> = Vec::new();
     let body = Bytes::from(empty.abi_encode());
     let app = test_app().await;
@@ -962,7 +784,7 @@ async fn test_v2_empty_batch_returns_empty_array() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v2")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(body))
                 .unwrap(),
@@ -1139,16 +961,11 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
     //                         maker ask = inv(0.01) = 100)
     let app = test_app_asymmetric("0.01", "99").await;
 
-    // v4 is what production signs; v1-v3 share pick_rate_bytes but each
-    // handler carries its own code path and its own comments — the exact
-    // divergence surface that produced this bug — so pin all four.
-    for endpoint in [
-        "/context/v1",
-        "/context/v2",
-        "/context/v3",
-        "/context/v4",
-        "/context/v5",
-    ] {
+    // v5 is what production signs; v1 and v4 share pick_rate_bytes but
+    // each handler carries its own code path and its own comments — the
+    // exact divergence surface that produced this bug — so pin all
+    // remaining endpoints.
+    for endpoint in ["/context/v1", "/context/v4", "/context/v5"] {
         // Sell-side order (input=USDC, output=tStock): must serve the ASK
         // in quote-per-base units = inv(quote_to_base) = 100.
         let sell_resp = app
