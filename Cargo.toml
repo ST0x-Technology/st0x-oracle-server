@@ -1,6 +1,6 @@
 [package]
 name = "st0x-oracle-server"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Signed context oracle server for st0x tokenized equities on Raindex"
 license = "CAL-1.0-Combined-Work-Exception"
