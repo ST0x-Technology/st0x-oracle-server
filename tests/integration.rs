@@ -11,7 +11,7 @@ use st0x_oracle_server::pricing_client::LiveClient;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::{create_app, AppState, EvaluableV4, OrderV4, IOV2};
-use st0x_pricing_types::{Quote, WireAddress, WireFloat};
+use st0x_pricing_types::{Quote, WireAddress, WireFloat, WireU256};
 use std::str::FromStr;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -88,7 +88,20 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
         rate_quote_to_base: wire_float_of(quote_to_base),
         expiry_unix_ms: i64::MAX,
         source_ts_unix_ms: FIXED_PUBLISH_TIME * 1000,
+        // Zero = the "no ratio" sentinel. Tests that exercise the v6
+        // NAV-ratio slot overwrite this with a full-entropy pattern.
+        nav_ratio: WireU256::ZERO,
     }
+}
+
+/// A full-entropy 18-decimal fixed-point NAV ratio — every decimal
+/// digit populated, no trailing zeros — so a lossy (f64 / truncating)
+/// packing cannot round-trip by accident. Represents the numeric value
+/// 1.007813592910771427.
+const NAV_RATIO_RAW: u64 = 1_007_813_592_910_771_427;
+
+fn nav_ratio_pattern() -> WireU256 {
+    WireU256::from_bytes(U256::from(NAV_RATIO_RAW).to_be_bytes())
 }
 
 /// Build a test app with a pre-populated pricing cache. Seeded quotes
@@ -961,11 +974,11 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
     //                         maker ask = inv(0.01) = 100)
     let app = test_app_asymmetric("0.01", "99").await;
 
-    // v5 is what production signs; v1 and v4 share pick_rate_bytes but
-    // each handler carries its own code path and its own comments — the
-    // exact divergence surface that produced this bug — so pin all
+    // v5 is what production signs; v1, v4 and v6 share pick_rate_bytes
+    // but each handler carries its own code path and its own comments —
+    // the exact divergence surface that produced this bug — so pin all
     // remaining endpoints.
-    for endpoint in ["/context/v1", "/context/v4", "/context/v5"] {
+    for endpoint in ["/context/v1", "/context/v4", "/context/v5", "/context/v6"] {
         // Sell-side order (input=USDC, output=tStock): must serve the ASK
         // in quote-per-base units = inv(quote_to_base) = 100.
         let sell_resp = app
@@ -1094,4 +1107,123 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
         .format()
         .unwrap();
     assert_eq!(expiry.format().unwrap(), expected);
+}
+
+/// Build a test app whose single COIN quote carries the given NAV
+/// ratio and a realistic expiry. Used by the /context/v6 route tests.
+async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> axum::Router {
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
+    let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+    quote.expiry_unix_ms = 1_700_000_020_500;
+    quote.nav_ratio = nav_ratio;
+    let pricing = LiveClient::with_seeded(vec![quote]).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        pricing,
+        vec!["COIN".to_string()],
+        fixed_close_market_hours().await,
+        metrics,
+    );
+    create_app(state)
+}
+
+/// POST a single (USDC -> WCOIN) request to `endpoint` and return the
+/// signed context of the one response.
+async fn context_of(app: axum::Router, endpoint: &str) -> Vec<FixedBytes<32>> {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(responses.len(), 1);
+    responses[0].context.clone()
+}
+
+#[tokio::test]
+async fn test_v6_endpoint_signs_nav_ratio_at_slot_9() {
+    // Route-level pin for /context/v6: the full ten-slot shape, with
+    // the quote's NAV ratio at slot 9 as a Rain Float — the lossless
+    // packing of the raw 18-decimal fixed-point uint256 off the pricing
+    // wire, never through an f64 or a decimal string.
+    let nav = nav_ratio_pattern();
+    let app = test_app_with_nav_ratio(nav).await;
+    let ctx = context_of(app, "/context/v6").await;
+
+    assert_eq!(ctx.len(), 10, "v6 endpoint must emit 10 context elements");
+
+    let version = Float::from(alloy::primitives::B256::from(ctx[0]));
+    assert_eq!(version.format().unwrap(), "6", "slot 0 must be schema v6");
+
+    // Slot 8 keeps the v5 expiry semantics: ms floored to whole seconds.
+    let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
+    let expected = Float::parse("1700000020".to_string())
+        .unwrap()
+        .format()
+        .unwrap();
+    assert_eq!(expiry.format().unwrap(), expected);
+
+    // Slot 9: numerically equal to raw / 10^18 with all 18 fractional
+    // digits intact — the same value model as the on-chain
+    // `erc4626-convert-to-assets` word the strategy compares against...
+    let nav_float = Float::from(alloy::primitives::B256::from(ctx[9]));
+    let expected_nav = Float::parse("1.007813592910771427".to_string()).unwrap();
+    assert!(
+        nav_float.eq(expected_nav).unwrap(),
+        "slot 9 must equal 1.007813592910771427, got {}",
+        nav_float.format().unwrap()
+    );
+
+    // ...and losslessly so: unpacking back to 18-decimal fixed point
+    // recovers the exact uint256 the pricing quote carried.
+    assert_eq!(
+        nav_float.to_fixed_decimal(18).unwrap(),
+        U256::from(NAV_RATIO_RAW),
+        "slot 9 must round-trip to the exact raw ratio"
+    );
+}
+
+#[tokio::test]
+async fn test_v6_zero_nav_ratio_signs_float_zero() {
+    // Zero is the "no ratio" sentinel (non-vault base token / producer
+    // predates nav_ratio): the carrier packs it as Float zero instead
+    // of erroring, and no downstream settlement assertion applies.
+    let app = test_app_with_nav_ratio(WireU256::ZERO).await;
+    let ctx = context_of(app, "/context/v6").await;
+    assert_eq!(ctx.len(), 10);
+    let nav_float = Float::from(alloy::primitives::B256::from(ctx[9]));
+    assert!(
+        nav_float.is_zero().unwrap(),
+        "zero sentinel must sign as Float zero, got {}",
+        nav_float.format().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_v5_response_is_v6_minus_nav_ratio() {
+    // v5 must be untouched by the v6 addition even when the underlying
+    // quote carries a NAV ratio: same nine slots as before, and every
+    // slot except the schema version identical to the v6 response built
+    // from the same cached quote. Anyone diffing the two endpoints sees
+    // one appended slot and nothing else.
+    let app = test_app_with_nav_ratio(nav_ratio_pattern()).await;
+    let v5 = context_of(app.clone(), "/context/v5").await;
+    let v6 = context_of(app, "/context/v6").await;
+
+    assert_eq!(v5.len(), 9, "v5 must still emit 9 context elements");
+    assert_eq!(v6.len(), 10);
+    let v5_version = Float::from(alloy::primitives::B256::from(v5[0]));
+    assert_eq!(v5_version.format().unwrap(), "5");
+    assert_eq!(&v5[1..9], &v6[1..9], "v6 must extend v5 without changes");
 }

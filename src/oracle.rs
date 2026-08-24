@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, FixedBytes, B256};
+use alloy::primitives::{Address, Bytes, FixedBytes, B256, U256};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,54 @@ pub const SCHEMA_VERSION_V4: u64 = 4;
 ///
 /// v4 stays unchanged and is still served on `/context/v4`.
 pub const SCHEMA_VERSION_V5: u64 = 5;
+
+/// Schema version emitted by `/context/v6`. Extends v5 by signing the
+/// vault NAV ratio the pricing model priced this quote against
+/// (RAI-1479 / RAI-1720):
+///
+/// - `context[9]`: NAV ratio (Rain Float — the lossless packing of the
+///   raw 18-decimal fixed-point `uint256`)
+///
+/// The base token of a pair is a share in a wrapped-token vault whose
+/// NAV can step (e.g. on a dividend deposit). A price signed against
+/// one NAV and settled against another is stale in a way no timestamp
+/// check can see. st0x.pricing publishes the exact on-chain
+/// `convertToAssets(1e18)` value it priced each quote against, as a raw
+/// `uint256`; the oracle packs that value as a Rain Float — losslessly,
+/// never through any binary-float or decimal-string detour — so a v6
+/// strategy can assert numeric equality between the signed ratio and
+/// the vault's live answer at settlement, rejecting any fill that
+/// straddles a NAV step.
+///
+/// A Rain Float (not the raw uint256) because of what the strategy
+/// compares against: the `erc4626-convert-to-assets` word
+/// (rainlanguage/rain.erc4626.words) returns the vault's answer as a
+/// Rain Float via `fromFixedDecimalLosslessPacked`, and the
+/// interpreter's standard word set has no raw↔Float conversion — the
+/// signed slot must speak the word's value model for `equal-to` to be
+/// meaningful. Both sides pack losslessly, so numeric equality holds
+/// exactly when the underlying uint256 values are equal.
+///
+/// Zero is the sentinel for "no ratio": the pricing model published no
+/// NAV ratio for this asset (a real vault NAV ratio is never zero),
+/// and no settlement assertion applies. The oracle packs the sentinel
+/// as Float zero rather than failing the request — whether zero is
+/// acceptable is the strategy's decision, not the carrier's.
+///
+/// v5 stays unchanged and is still served on `/context/v5`.
+pub const SCHEMA_VERSION_V6: u64 = 6;
+
+/// Fixed-point scale of the NAV ratio signed into v6 slot 9.
+///
+/// 18 is correct for every ST0x wt vault by construction of the
+/// issuance system: wt-vault shares are 18-decimal AND the underlying
+/// asset is 18-decimal, so `convertToAssets(1e18)` is an 18-decimal
+/// fixed-point number. The on-chain `erc4626-convert-to-assets` word
+/// packs at the vault's LIVE asset decimals, so a non-18-decimal
+/// underlying would break the strategy's equality against this slot —
+/// the invariant lives in the issuance system, and this constant
+/// depends on it.
+const NAV_RATIO_DECIMALS: u8 = 18;
 
 /// Oracle response matching Rain's SignedContextV1 format.
 /// The JSON array shape of this struct is what upstream
@@ -273,8 +321,35 @@ pub fn build_context_v5(
     output_token: Address,
     quote_expiry: u64,
 ) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
-    let mut ctx = build_pair_bound_context(
+    build_expiry_bound_context(
         SCHEMA_VERSION_V5,
+        price_bytes,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        input_token,
+        output_token,
+        quote_expiry,
+    )
+}
+
+/// Shared body for the expiry-bound schemas (v5 and v6): the pair-bound
+/// v4 shape plus the model's expiry at slot 8.
+#[allow(clippy::too_many_arguments)]
+fn build_expiry_bound_context(
+    schema_version: u64,
+    price_bytes: [u8; 32],
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    input_token: Address,
+    output_token: Address,
+    quote_expiry: u64,
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    let mut ctx = build_pair_bound_context(
+        schema_version,
         price_bytes,
         publish_time,
         session_bytes,
@@ -287,6 +362,69 @@ pub fn build_context_v5(
         .map_err(|e| anyhow::anyhow!("Failed to parse quote_expiry as Rain float: {:?}", e))?;
     let expiry_b: B256 = expiry_float.into();
     ctx.push(expiry_b);
+    Ok(ctx)
+}
+
+/// Build the v6 signed-context array — the v5 shape plus the vault NAV
+/// ratio at slot 9.
+///
+/// `nav_ratio` is the raw big-endian `uint256` bytes from the pricing
+/// quote's `nav_ratio` — the exact on-chain `convertToAssets(1e18)`
+/// value the model priced this rate against. It is packed as a Rain
+/// Float at [`NAV_RATIO_DECIMALS`] via `Float::from_fixed_decimal`,
+/// the Rust binding of the same Solidity `fromFixedDecimalLossless`
+/// the on-chain `erc4626-convert-to-assets` word uses — exact for any
+/// value the vault can return, never through an `f64` or a decimal
+/// string — so a strategy's numeric `equal-to` against the word's
+/// answer holds exactly when the underlying uint256 values are equal.
+/// A value too large to pack losslessly fails the request rather than
+/// rounding: a rounded ratio is a licence to settle against a NAV the
+/// model never priced. A zero value is the "no ratio" sentinel and
+/// packs to Float zero (see [`SCHEMA_VERSION_V6`]).
+///
+/// Layout:
+/// - `context[0]`: schema version (= 6)
+/// - `context[1]`: price (Rain Float; the rate for this request's
+///   direction, spread included — see `pick_rate_bytes`)
+/// - `context[2]`: publish_time (Rain Float, Unix seconds)
+/// - `context[3]`: session tag (Rain IntOrAString V3)
+/// - `context[4]`: session_start (Rain Float, Unix seconds)
+/// - `context[5]`: session_end (Rain Float, Unix seconds)
+/// - `context[6]`: input_token address (bytes32, Address left-padded)
+/// - `context[7]`: output_token address (bytes32, Address left-padded)
+/// - `context[8]`: quote expiry (Rain Float, Unix seconds; the
+///   less-than consumer assert makes the expiry second itself
+///   EXCLUSIVE — already rejected)
+/// - `context[9]`: vault NAV ratio (Rain Float, lossless from the raw
+///   18-decimal fixed-point uint256; Float zero = no ratio)
+#[allow(clippy::too_many_arguments)]
+pub fn build_context_v6(
+    price_bytes: [u8; 32],
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    input_token: Address,
+    output_token: Address,
+    quote_expiry: u64,
+    nav_ratio: [u8; 32],
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    let mut ctx = build_expiry_bound_context(
+        SCHEMA_VERSION_V6,
+        price_bytes,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        input_token,
+        output_token,
+        quote_expiry,
+    )?;
+    let nav_float =
+        Float::from_fixed_decimal(U256::from_be_bytes(nav_ratio), NAV_RATIO_DECIMALS)
+            .map_err(|e| anyhow::anyhow!("Failed to pack nav_ratio as a Rain float: {e:?}"))?;
+    let nav_b: B256 = nav_float.into();
+    ctx.push(nav_b);
     Ok(ctx)
 }
 
@@ -420,6 +558,167 @@ mod tests {
         let bytes = price_bytes_of("0.005");
         let ctx =
             build_context_v5(bytes, 1, v3_session_bytes(), 1, 2, IN_TOKEN, OUT_TOKEN, 3).unwrap();
+        assert_eq!(ctx[1].as_slice(), &bytes[..]);
+    }
+
+    /// A full-entropy 18-decimal fixed-point NAV ratio — every decimal
+    /// digit populated, no trailing zeros — so a lossy (f64 / truncating)
+    /// packing cannot round-trip by accident. Represents the numeric
+    /// value 1.007813592910771427.
+    const NAV_RATIO_RAW: u64 = 1_007_813_592_910_771_427;
+
+    fn nav_ratio_bytes() -> [u8; 32] {
+        U256::from(NAV_RATIO_RAW).to_be_bytes()
+    }
+
+    #[test]
+    fn test_build_context_v6_layout() {
+        let nav = nav_ratio_bytes();
+        let ctx = build_context_v6(
+            price_bytes_of("185.42"),
+            1_700_000_000,
+            v3_session_bytes(),
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+            nav,
+        )
+        .unwrap();
+        assert_eq!(ctx.len(), 10, "schema v6 must emit 10 elements");
+
+        let version = Float::from(alloy::primitives::B256::from(ctx[0]));
+        assert_eq!(version.format().unwrap(), "6");
+
+        let price = Float::from(alloy::primitives::B256::from(ctx[1]));
+        assert_eq!(price.format().unwrap(), "185.42");
+
+        // Slots 6/7 keep the v4 pair binding.
+        assert_eq!(&ctx[6].as_slice()[12..], IN_TOKEN.as_slice());
+        assert_eq!(&ctx[7].as_slice()[12..], OUT_TOKEN.as_slice());
+
+        // Slot 8 keeps the v5 expiry.
+        let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
+        assert_eq!(expiry.format().unwrap(), float_string_of(1_700_000_020));
+
+        // Slot 9 is the NAV ratio as a Rain Float: numerically equal to
+        // raw / 10^18 with all 18 fractional digits intact...
+        let nav_float = Float::from(alloy::primitives::B256::from(ctx[9]));
+        let expected = Float::parse("1.007813592910771427".to_string()).unwrap();
+        assert!(
+            nav_float.eq(expected).unwrap(),
+            "slot 9 must equal 1.007813592910771427, got {}",
+            nav_float.format().unwrap()
+        );
+
+        // ...and losslessly so: unpacking back to 18-decimal fixed point
+        // recovers the exact uint256 the vault reported.
+        assert_eq!(
+            nav_float.to_fixed_decimal(18).unwrap(),
+            U256::from(NAV_RATIO_RAW),
+            "slot 9 must round-trip to the exact raw ratio"
+        );
+    }
+
+    #[test]
+    fn test_build_context_v6_is_v5_plus_nav_ratio() {
+        // v6 must be a strict extension: slots 1..9 identical to v5 for
+        // the same inputs. A v6 strategy that ignores slot 9 has to
+        // behave exactly like a v5 one, and anyone diffing the two
+        // schemas should see one appended slot and nothing else.
+        let price = price_bytes_of("185.42");
+        let sess = v3_session_bytes();
+        let v5 = build_context_v5(
+            price,
+            1_700_000_000,
+            sess,
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+        )
+        .unwrap();
+        let v6 = build_context_v6(
+            price,
+            1_700_000_000,
+            sess,
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+            nav_ratio_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(v6.len(), v5.len() + 1);
+        // Slot 0 is the schema version and is expected to differ.
+        assert_eq!(&v6[1..9], &v5[1..9]);
+    }
+
+    #[test]
+    fn test_build_context_v6_zero_nav_ratio_packs_to_float_zero() {
+        // Zero is the "no ratio" sentinel: the carrier packs it as Float
+        // zero rather than erroring, and the downstream strategy decides
+        // whether to accept a frame with no settlement assertion.
+        let ctx = build_context_v6(
+            price_bytes_of("185.42"),
+            1,
+            v3_session_bytes(),
+            1,
+            2,
+            IN_TOKEN,
+            OUT_TOKEN,
+            3,
+            [0u8; 32],
+        )
+        .unwrap();
+        assert_eq!(ctx.len(), 10);
+        let nav_float = Float::from(alloy::primitives::B256::from(ctx[9]));
+        assert!(
+            nav_float.is_zero().unwrap(),
+            "zero sentinel must pack to Float zero, got {}",
+            nav_float.format().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_build_context_v6_unpackable_nav_ratio_fails_closed() {
+        // A ratio too large for lossless Float packing must fail the
+        // request, not round: a rounded ratio would sign a NAV the model
+        // never priced. u256::MAX is far past the packable coefficient
+        // range (and past anything a real vault can return).
+        let result = build_context_v6(
+            price_bytes_of("185.42"),
+            1,
+            v3_session_bytes(),
+            1,
+            2,
+            IN_TOKEN,
+            OUT_TOKEN,
+            3,
+            [0xffu8; 32],
+        );
+        assert!(result.is_err(), "unpackable nav_ratio must fail closed");
+    }
+
+    #[test]
+    fn test_build_context_v6_passes_price_bytes_through_unchanged() {
+        let bytes = price_bytes_of("0.005");
+        let ctx = build_context_v6(
+            bytes,
+            1,
+            v3_session_bytes(),
+            1,
+            2,
+            IN_TOKEN,
+            OUT_TOKEN,
+            3,
+            nav_ratio_bytes(),
+        )
+        .unwrap();
         assert_eq!(ctx[1].as_slice(), &bytes[..]);
     }
 }
