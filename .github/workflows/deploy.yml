@@ -43,7 +43,9 @@ concurrency:
 
 permissions:
   id-token: write
-  contents: read
+  # write: the version-tag step publishes a git tag + GitHub release when a
+  # new version is minted (read covered everything else).
+  contents: write
   # GitHub/Sigstore provenance attestation on every pushed digest.
   attestations: write
 
@@ -160,6 +162,8 @@ jobs:
       # builds" structurally.
       - name: Tag release version (main only)
         if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
@@ -171,6 +175,18 @@ jobs:
           fi
           gcloud artifacts docker tags add "${{ steps.push.outputs.digest }}" "${IMAGE}:${TAG}"
           echo "Tagged ${TAG} -> ${{ steps.push.outputs.digest }}"
+          # Same name on the repo: a git tag + GitHub release at this commit,
+          # so the releases page and the registry agree. Never fails the
+          # deploy over the label (the digest is already shipped + attested).
+          printf '%s\n\n%s\n' \
+            "Image digest (attested): \`${{ steps.push.outputs.digest }}\`" \
+            "The Artifact Registry tag \`${TAG}\` points at exactly this digest. t0.devops release manifests pin the pair (\`version:\` + digest) and CI fails if they disagree; deploys always roll the digest." \
+            > /tmp/release-notes.md
+          gh release create "${TAG}" \
+            --target "${GITHUB_SHA}" \
+            --title "${TAG}" \
+            --notes-file /tmp/release-notes.md \
+            || echo "::warning::gh release create ${TAG} failed (release may already exist); registry tag is minted."
 
   deploy-staging:
     needs: build-push
