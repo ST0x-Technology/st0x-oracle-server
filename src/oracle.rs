@@ -92,6 +92,31 @@ pub const SCHEMA_VERSION_V5: u64 = 5;
 /// v5 stays unchanged and is still served on `/context/v5`.
 pub const SCHEMA_VERSION_V6: u64 = 6;
 
+/// Schema version emitted by `/context/v7`. Extends v6 by signing the
+/// chain id this oracle deployment serves (RAI-1991):
+///
+/// - `context[10]`: chain id (Rain Float)
+///
+/// The signature over the context is chain-agnostic EIP-191 and no
+/// earlier slot names a chain, so a v6-and-below payload binds only to
+/// the token address pair. Token contracts are deterministic clones
+/// across ST0x chains — the SAME addresses can exist on two chains — so
+/// a signed context produced for chain A verifies byte-for-byte inside
+/// an order on chain B. Today that is mitigated operationally (the
+/// oracle URL is a per-order deploy-time binding and the server is
+/// Base-only), not cryptographically.
+///
+/// v7 closes it in the signed payload: the deployment's chain id rides
+/// slot 10, covered by the existing signature over all slots. A v7
+/// strategy MUST assert
+/// `equal-to(signed-context<0 10> expected-chain-id)` where
+/// `expected-chain-id` is a per-deployment binding (the same pattern as
+/// the oracle-signer binding) — the wrong-chain payload then fails the
+/// strategy's own assert regardless of URL wiring.
+///
+/// v6 stays unchanged and is still served on `/context/v6`.
+pub const SCHEMA_VERSION_V7: u64 = 7;
+
 /// Fixed-point scale of the NAV ratio signed into v6 slot 9.
 ///
 /// 18 is correct for every ST0x wt vault by construction of the
@@ -409,8 +434,37 @@ pub fn build_context_v6(
     quote_expiry: u64,
     nav_ratio: [u8; 32],
 ) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
-    let mut ctx = build_expiry_bound_context(
+    build_nav_bound_context(
         SCHEMA_VERSION_V6,
+        price_bytes,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        input_token,
+        output_token,
+        quote_expiry,
+        nav_ratio,
+    )
+}
+
+/// Shared body for the NAV-bound schemas (v6 and v7): the expiry-bound
+/// v5 shape plus the vault NAV ratio at slot 9.
+#[allow(clippy::too_many_arguments)]
+fn build_nav_bound_context(
+    schema_version: u64,
+    price_bytes: [u8; 32],
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    input_token: Address,
+    output_token: Address,
+    quote_expiry: u64,
+    nav_ratio: [u8; 32],
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    let mut ctx = build_expiry_bound_context(
+        schema_version,
         price_bytes,
         publish_time,
         session_bytes,
@@ -425,6 +479,51 @@ pub fn build_context_v6(
             .map_err(|e| anyhow::anyhow!("Failed to pack nav_ratio as a Rain float: {e:?}"))?;
     let nav_b: B256 = nav_float.into();
     ctx.push(nav_b);
+    Ok(ctx)
+}
+
+/// Build the v7 signed-context array — the v6 shape plus the
+/// deployment's chain id at slot 10.
+///
+/// `chain_id` comes from config (the server is single-chain by design;
+/// a multichain deployment would surface it per path segment instead —
+/// the builder doesn't care where the caller got it). Encoded as a Rain
+/// Float like the other numeric slots so a strategy's `equal-to`
+/// against a rainlang `expected-chain-id` binding literal compares in
+/// the word's value model.
+///
+/// Layout: slots 0–9 exactly as [`SCHEMA_VERSION_V6`] (with slot 0 = 7),
+/// then:
+/// - `context[10]`: chain id (Rain Float)
+#[allow(clippy::too_many_arguments)]
+pub fn build_context_v7(
+    price_bytes: [u8; 32],
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    input_token: Address,
+    output_token: Address,
+    quote_expiry: u64,
+    nav_ratio: [u8; 32],
+    chain_id: u64,
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    let mut ctx = build_nav_bound_context(
+        SCHEMA_VERSION_V7,
+        price_bytes,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        input_token,
+        output_token,
+        quote_expiry,
+        nav_ratio,
+    )?;
+    let chain_float = Float::parse(chain_id.to_string())
+        .map_err(|e| anyhow::anyhow!("Failed to parse chain_id as Rain float: {:?}", e))?;
+    let chain_b: B256 = chain_float.into();
+    ctx.push(chain_b);
     Ok(ctx)
 }
 
@@ -702,6 +801,99 @@ mod tests {
             [0xffu8; 32],
         );
         assert!(result.is_err(), "unpackable nav_ratio must fail closed");
+    }
+
+    #[test]
+    fn test_build_context_v7_layout() {
+        let ctx = build_context_v7(
+            price_bytes_of("185.42"),
+            1_700_000_000,
+            v3_session_bytes(),
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+            nav_ratio_bytes(),
+            8453,
+        )
+        .unwrap();
+        assert_eq!(ctx.len(), 11, "schema v7 must emit 11 elements");
+
+        let version = Float::from(alloy::primitives::B256::from(ctx[0]));
+        assert_eq!(version.format().unwrap(), "7");
+
+        // Slot 10 is the chain id as a Rain Float — the value a
+        // strategy's `equal-to` compares against its per-deployment
+        // `expected-chain-id` binding literal.
+        let chain = Float::from(alloy::primitives::B256::from(ctx[10]));
+        let expected = Float::parse("8453".to_string()).unwrap();
+        assert!(
+            chain.eq(expected).unwrap(),
+            "slot 10 must equal 8453, got {}",
+            chain.format().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_build_context_v7_is_v6_plus_chain_id() {
+        // v7 must be a strict extension: slots 1..10 identical to v6
+        // for the same inputs. A v7 strategy that ignores slot 10 has
+        // to behave exactly like a v6 one.
+        let price = price_bytes_of("185.42");
+        let sess = v3_session_bytes();
+        let nav = nav_ratio_bytes();
+        let v6 = build_context_v6(
+            price,
+            1_700_000_000,
+            sess,
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+            nav,
+        )
+        .unwrap();
+        let v7 = build_context_v7(
+            price,
+            1_700_000_000,
+            sess,
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+            nav,
+            8453,
+        )
+        .unwrap();
+        assert_eq!(v7.len(), v6.len() + 1);
+        assert_eq!(&v7[1..10], &v6[1..10]);
+    }
+
+    #[test]
+    fn test_build_context_v7_carries_arbitrary_chain_ids() {
+        // The builder must not bake in Base: a HyperEVM (999) or
+        // Ethereum (1) deployment signs its own chain id.
+        for chain_id in [1u64, 999, 42161] {
+            let ctx = build_context_v7(
+                price_bytes_of("1"),
+                1_700_000_000,
+                v3_session_bytes(),
+                1_700_000_000,
+                1_700_023_400,
+                IN_TOKEN,
+                OUT_TOKEN,
+                1_700_000_020,
+                nav_ratio_bytes(),
+                chain_id,
+            )
+            .unwrap();
+            let slot = Float::from(alloy::primitives::B256::from(ctx[10]));
+            let expected = Float::parse(chain_id.to_string()).unwrap();
+            assert!(slot.eq(expected).unwrap());
+        }
     }
 
     #[test]

@@ -18,6 +18,9 @@ use tower::ServiceExt;
 
 const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+/// Chain id every test app signs for — Base, matching the config default.
+const TEST_CHAIN_ID: u64 = 8453;
+
 // Token addresses for testing
 const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x1111111111111111111111111111111111111111";
@@ -158,6 +161,7 @@ async fn test_app_full(
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         configured_symbols,
         market_hours,
@@ -184,6 +188,7 @@ async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
         fixed_close_market_hours().await,
@@ -978,7 +983,13 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
     // but each handler carries its own code path and its own comments —
     // the exact divergence surface that produced this bug — so pin all
     // remaining endpoints.
-    for endpoint in ["/context/v1", "/context/v4", "/context/v5", "/context/v6"] {
+    for endpoint in [
+        "/context/v1",
+        "/context/v4",
+        "/context/v5",
+        "/context/v6",
+        "/context/v7",
+    ] {
         // Sell-side order (input=USDC, output=tStock): must serve the ASK
         // in quote-per-base units = inv(quote_to_base) = 100.
         let sell_resp = app
@@ -1071,6 +1082,7 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
         fixed_close_market_hours().await,
@@ -1122,6 +1134,7 @@ async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> axum::Router {
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
         fixed_close_market_hours().await,
@@ -1208,6 +1221,42 @@ async fn test_v6_zero_nav_ratio_signs_float_zero() {
         "zero sentinel must sign as Float zero, got {}",
         nav_float.format().unwrap()
     );
+}
+
+#[tokio::test]
+async fn test_v7_endpoint_signs_chain_id_at_slot_10() {
+    // Route-level pin for /context/v7: eleven slots, with the
+    // deployment's configured chain id at slot 10 as a Rain Float —
+    // the value a strategy's `equal-to` compares against its
+    // per-deployment `expected-chain-id` binding.
+    let app = test_app_with_nav_ratio(nav_ratio_pattern()).await;
+    let ctx = context_of(app, "/context/v7").await;
+
+    assert_eq!(ctx.len(), 11, "v7 endpoint must emit 11 context elements");
+
+    let version = Float::from(alloy::primitives::B256::from(ctx[0]));
+    assert_eq!(version.format().unwrap(), "7", "slot 0 must be schema v7");
+
+    let chain = Float::from(alloy::primitives::B256::from(ctx[10]));
+    let expected = Float::parse(TEST_CHAIN_ID.to_string()).unwrap();
+    assert!(
+        chain.eq(expected).unwrap(),
+        "slot 10 must equal the configured chain id, got {}",
+        chain.format().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_v6_response_is_v7_minus_chain_id() {
+    // v6 must be untouched by the v7 addition: same ten slots, and
+    // every slot except the schema version identical to the v7
+    // response built from the same cached quote.
+    let app = test_app_with_nav_ratio(nav_ratio_pattern()).await;
+    let v6 = context_of(app.clone(), "/context/v6").await;
+    let v7 = context_of(app, "/context/v7").await;
+    assert_eq!(v6.len(), 10);
+    assert_eq!(v7.len(), 11);
+    assert_eq!(&v7[1..10], &v6[1..10]);
 }
 
 #[tokio::test]
