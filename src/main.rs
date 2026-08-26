@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
             cli.pricing_api_key.clone(),
             config.pricing.consumer.clone(),
             symbols.clone(),
+            config.chain_id,
         )
         .with_iam_auth(cli.pricing_iam_auth),
     );

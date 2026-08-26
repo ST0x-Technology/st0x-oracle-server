@@ -84,7 +84,7 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
     let usdc_bytes: [u8; 20] = Address::from_str(USDC).unwrap().into();
     Quote {
         asset: symbol.to_string(),
-        chain_id: 8453,
+        chain_id: TEST_CHAIN_ID,
         base: WireAddress::from(base_bytes),
         quote: WireAddress::from(usdc_bytes),
         rate_base_to_quote: wire_float_of(base_to_quote),
@@ -154,7 +154,7 @@ async fn test_app_full(
             quotes.push(fake_quote(sym, addr, &inv, &s));
         }
     }
-    let pricing = LiveClient::with_seeded(quotes).await;
+    let pricing = LiveClient::with_seeded(quotes, TEST_CHAIN_ID).await;
 
     let configured_symbols: Vec<String> = entries.iter().map(|(_, s, _)| s.to_string()).collect();
     let metrics = MetricsHandle::install().expect("metrics install");
@@ -177,12 +177,10 @@ async fn test_app_full(
 async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
-    let pricing = LiveClient::with_seeded(vec![fake_quote(
-        "COIN",
-        WCOIN,
-        quote_to_base,
-        base_to_quote,
-    )])
+    let pricing = LiveClient::with_seeded(
+        vec![fake_quote("COIN", WCOIN, quote_to_base, base_to_quote)],
+        TEST_CHAIN_ID,
+    )
     .await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
@@ -1077,7 +1075,7 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
     // 1_700_000_020_500 ms floors to 1_700_000_020 s — the trailing
     // 500ms must be dropped, never rounded up past the model's horizon.
     quote.expiry_unix_ms = 1_700_000_020_500;
-    let pricing = LiveClient::with_seeded(vec![quote]).await;
+    let pricing = LiveClient::with_seeded(vec![quote], TEST_CHAIN_ID).await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
         signer,
@@ -1129,7 +1127,7 @@ async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> axum::Router {
     let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
     quote.expiry_unix_ms = 1_700_000_020_500;
     quote.nav_ratio = nav_ratio;
-    let pricing = LiveClient::with_seeded(vec![quote]).await;
+    let pricing = LiveClient::with_seeded(vec![quote], TEST_CHAIN_ID).await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
         signer,

@@ -3,7 +3,7 @@
 //! Wire types come from the public
 //! [`st0x-pricing-types`](https://github.com/ST0x-Technology/st0x.pricing-types)
 //! crate; this file holds only the consumer-side glue (auto-reconnecting
-//! WS session that stashes the latest `Quote` per asset). Mirror of
+//! WS session that stashes the latest `Quote` per chain and asset). Mirror of
 //! st0x.bebop's `src/pricing_client.rs` — same shape, same retries.
 //!
 //! We can't depend on `st0x.pricing/crates/pricing-client` directly —
@@ -54,6 +54,10 @@ pub struct LiveClientConfig {
     /// where pricing checks the API key itself. No secret either way — the ID
     /// token is fetched on the fly from the metadata server.
     pub iam_auth: bool,
+    /// The chain this deployment serves, from `config.chain_id`. Frames for
+    /// other chains stay in the cache — the subscription is per-symbol, not
+    /// per-chain — but only this chain's quotes are ever handed out.
+    pub chain_id: u64,
 }
 
 impl LiveClientConfig {
@@ -62,6 +66,7 @@ impl LiveClientConfig {
         api_key: impl Into<String>,
         consumer: impl Into<String>,
         assets: Vec<Symbol>,
+        chain_id: u64,
     ) -> Self {
         Self {
             ws_url: ws_url.into(),
@@ -71,6 +76,7 @@ impl LiveClientConfig {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             iam_auth: false,
+            chain_id,
         }
     }
 
@@ -82,84 +88,105 @@ impl LiveClientConfig {
     }
 }
 
+/// Latest quote per `(chain_id, asset)`. st0x.pricing publishes one frame
+/// per chain and symbol, so a symbol-only key makes two chains' frames for
+/// the same asset last-write-wins and lets this server sign a context
+/// against another chain's rate. Nothing else catches that: both frames are
+/// individually fresh, in-expiry and correctly signed, so the difference is
+/// invisible to every staleness and expiry check downstream.
+type QuoteCache = Arc<RwLock<HashMap<(u64, Symbol), Quote>>>;
+
 /// Background subscriber. Spawns one task that connects, subscribes,
-/// reads price frames, and stashes the latest per-asset `Quote` in a
-/// shared `RwLock<HashMap>`. Auto-reconnects with exponential backoff.
+/// reads price frames, and stashes the latest per-chain-and-asset `Quote`
+/// in a shared `RwLock<HashMap>`. Auto-reconnects with exponential backoff.
 #[derive(Clone)]
 pub struct LiveClient {
-    cache: Arc<RwLock<HashMap<Symbol, Quote>>>,
+    cache: QuoteCache,
+    /// Chain this deployment serves; every read below is keyed by it.
+    chain_id: u64,
 }
 
 impl LiveClient {
     pub fn spawn(cfg: LiveClientConfig) -> Self {
         let cache = Arc::new(RwLock::new(HashMap::new()));
+        let chain_id = cfg.chain_id;
         let task_cache = cache.clone();
         tokio::spawn(async move { run_loop(cfg, task_cache).await });
-        Self { cache }
+        Self { cache, chain_id }
     }
 
     /// Test-only constructor that builds a `LiveClient` with a
     /// pre-populated cache and no background task. The integration
     /// tests seed deterministic `Quote`s here instead of standing up
-    /// a real pricing WS server.
-    pub async fn with_seeded(quotes: Vec<Quote>) -> Self {
+    /// a real pricing WS server. Each quote is seeded under its own
+    /// `chain_id`, exactly as the WS ingest path would.
+    pub async fn with_seeded(quotes: Vec<Quote>, chain_id: u64) -> Self {
         let mut map = HashMap::with_capacity(quotes.len());
         for q in quotes {
-            map.insert(q.asset.clone(), q);
+            map.insert((q.chain_id, q.asset.clone()), q);
         }
         Self {
             cache: Arc::new(RwLock::new(map)),
+            chain_id,
         }
     }
 
     pub async fn latest(&self, symbol: &str) -> Option<Quote> {
-        self.cache.read().await.get(symbol).cloned()
+        self.cache
+            .read()
+            .await
+            .get(&(self.chain_id, symbol.to_string()))
+            .cloned()
     }
 
     /// Snapshot multiple symbols under a single read lock so every
     /// element of a batch HTTP response is built from a coherent view
     /// of the WS cache. Mirrors `cache::QuoteCache::snapshot_many` from
-    /// the pre-pricing-client world. Symbols missing from the cache are
-    /// simply absent in the returned map.
+    /// the pre-pricing-client world. Symbols missing from the cache — or
+    /// cached only for another chain — are simply absent in the returned map.
     pub async fn snapshot_many(&self, symbols: &[&str]) -> HashMap<String, Quote> {
         let guard = self.cache.read().await;
         let mut out = HashMap::with_capacity(symbols.len());
         for sym in symbols {
-            if let Some(q) = guard.get(*sym) {
+            if let Some(q) = guard.get(&(self.chain_id, (*sym).to_string())) {
                 out.insert((*sym).to_string(), q.clone());
             }
         }
         out
     }
 
-    /// Newest `source_ts_unix_ms` across all cached quotes. `None` if
-    /// the cache is empty (no `Price` frame received yet). Used by the
+    /// Newest `source_ts_unix_ms` across this chain's cached quotes.
+    /// `None` if none have arrived yet. Used by the
     /// `oracle_cache_freshness_seconds` gauge: dashboard wants seconds
     /// since the most-recently-refreshed quote, so the caller does
-    /// `now_ms - newest_source_ts` and divides by 1000.
+    /// `now_ms - newest_source_ts` and divides by 1000. Other chains are
+    /// excluded — a fresh frame we would never serve must not mask a
+    /// frozen feed on the chain we do.
     pub async fn newest_source_ts_ms(&self) -> Option<i64> {
         self.cache
             .read()
             .await
-            .values()
-            .map(|q| q.source_ts_unix_ms)
+            .iter()
+            .filter(|((chain, _), _)| *chain == self.chain_id)
+            .map(|(_, q)| q.source_ts_unix_ms)
             .max()
     }
 
-    /// Returns the set of subscribed symbols not yet seen on the wire.
-    /// Used by /status so an operator can spot a half-warm cache without
-    /// parsing logs.
+    /// Returns the set of subscribed symbols not yet seen on the wire for
+    /// this chain. Used by /status so an operator can spot a half-warm
+    /// cache without parsing logs. A symbol cached only for another chain
+    /// counts as missing — we cannot serve it.
     pub async fn missing(&self, symbols: &[String]) -> Vec<String> {
         let guard = self.cache.read().await;
         symbols
             .iter()
-            .filter(|s| !guard.contains_key(s.as_str()))
+            .filter(|s| !guard.contains_key(&(self.chain_id, (*s).clone())))
             .cloned()
             .collect()
     }
 }
 
-async fn run_loop(cfg: LiveClientConfig, cache: Arc<RwLock<HashMap<Symbol, Quote>>>) {
+async fn run_loop(cfg: LiveClientConfig, cache: QuoteCache) {
     let mut backoff = cfg.initial_backoff;
     loop {
         match connect_and_run(&cfg, &cache).await {
@@ -243,20 +270,19 @@ async fn fetch_id_token(audience: &str) -> Result<String, ClientError> {
 /// Pong). Split out of the socket loop so the cache semantics are unit
 /// testable:
 ///
-/// - `Price` stores the whole frame as one `Quote` — the rates, expiry,
-///   source_ts and NAV ratio of a cached observation always come from
-///   the same frame, so a signed context can never pair a rate from one
-///   frame with a NAV ratio from another.
+/// - `Price` stores the whole frame as one `Quote`, under the frame's own
+///   `chain_id` — the rates, expiry, source_ts and NAV ratio of a cached
+///   observation always come from the same frame, so a signed context can
+///   never pair a rate from one frame with a NAV ratio from another, nor a
+///   rate from one chain with a request on another.
 /// - `Halt` fails closed: `halted = true` evicts the cached quote so
 ///   every subsequent request for the asset 503s instead of serving a
 ///   price the producer has disowned (the wrapped vault NAV can step on
 ///   a dividend deposit; the producer halts around the step). Resume
 ///   (`halted = false`) needs no action — the next price frame
-///   repopulates the cache.
-async fn apply_server_frame(
-    cache: &Arc<RwLock<HashMap<Symbol, Quote>>>,
-    frame: ServerFrame,
-) -> Option<ClientFrame> {
+///   repopulates the cache. Both are scoped to the frame's chain: a halt
+///   elsewhere must not evict the quote this deployment serves.
+async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<ClientFrame> {
     match frame {
         ServerFrame::Price(p) => {
             let q = Quote {
@@ -270,7 +296,7 @@ async fn apply_server_frame(
                 source_ts_unix_ms: p.source_ts_unix_ms,
                 nav_ratio: p.nav_ratio,
             };
-            cache.write().await.insert(p.asset, q);
+            cache.write().await.insert((p.chain_id, p.asset), q);
             None
         }
         ServerFrame::Error(e) => {
@@ -284,7 +310,7 @@ async fn apply_server_frame(
         }
         ServerFrame::Halt(h) => {
             if h.halted {
-                cache.write().await.remove(&h.asset);
+                cache.write().await.remove(&(h.chain_id, h.asset.clone()));
                 tracing::warn!(asset = %h.asset, reason = ?h.reason, "Asset halted by pricing server; quote evicted");
             } else {
                 tracing::info!(asset = %h.asset, "Asset halt lifted; awaiting next price frame");
@@ -297,10 +323,7 @@ async fn apply_server_frame(
     }
 }
 
-async fn connect_and_run(
-    cfg: &LiveClientConfig,
-    cache: &Arc<RwLock<HashMap<Symbol, Quote>>>,
-) -> Result<(), ClientError> {
+async fn connect_and_run(cfg: &LiveClientConfig, cache: &QuoteCache) -> Result<(), ClientError> {
     let mut req = cfg
         .ws_url
         .as_str()
@@ -387,11 +410,18 @@ mod tests {
     use proptest::prelude::*;
     use st0x_pricing_types::{HaltFrame, PriceFrame, Venue, WireAddress, WireFloat, WireU256};
 
+    /// Base (8453) is what these tests treat as the configured chain.
+    const CONFIGURED: u64 = 8453;
+
     fn price_frame(asset: &str, nav_ratio: WireU256) -> ServerFrame {
+        price_frame_on(asset, CONFIGURED, nav_ratio)
+    }
+
+    fn price_frame_on(asset: &str, chain_id: u64, nav_ratio: WireU256) -> ServerFrame {
         ServerFrame::Price(PriceFrame {
             asset: asset.to_string(),
             venue: Venue::Raindex,
-            chain_id: 8453,
+            chain_id,
             base: WireAddress::from_bytes([0x11; 20]),
             quote: WireAddress::from_bytes([0x22; 20]),
             rate_base_to_quote: WireFloat::from_bytes([0x42; 32]),
@@ -404,9 +434,13 @@ mod tests {
     }
 
     fn halt_frame(asset: &str, halted: bool) -> ServerFrame {
+        halt_frame_on(asset, CONFIGURED, halted)
+    }
+
+    fn halt_frame_on(asset: &str, chain_id: u64, halted: bool) -> ServerFrame {
         ServerFrame::Halt(HaltFrame {
             asset: asset.to_string(),
-            chain_id: 8453,
+            chain_id,
             base: WireAddress::from_bytes([0x11; 20]),
             quote: WireAddress::from_bytes([0x22; 20]),
             halted,
@@ -430,7 +464,7 @@ mod tests {
             apply_server_frame(&cache, price_frame("COIN", WireU256::from_bytes(nav))).await;
         assert!(reply.is_none());
 
-        let q = cache.read().await.get("COIN").cloned().unwrap();
+        let q = cached(&cache, CONFIGURED, "COIN").await.unwrap();
         assert_eq!(q.nav_ratio.0, nav, "NAV ratio must be bit-for-bit");
         assert_eq!(q.rate_quote_to_base, WireFloat::from_bytes([0x43; 32]));
     }
@@ -447,24 +481,133 @@ mod tests {
 
         apply_server_frame(&cache, halt_frame("COIN", true)).await;
         assert!(
-            cache.read().await.get("COIN").is_none(),
+            cached(&cache, CONFIGURED, "COIN").await.is_none(),
             "halted asset must be evicted"
         );
         assert!(
-            cache.read().await.get("TSLA").is_some(),
+            cached(&cache, CONFIGURED, "TSLA").await.is_some(),
             "halt must only evict the named asset"
         );
 
         apply_server_frame(&cache, halt_frame("COIN", false)).await;
         assert!(
-            cache.read().await.get("COIN").is_none(),
+            cached(&cache, CONFIGURED, "COIN").await.is_none(),
             "resume must not resurrect the pre-halt quote"
         );
 
         apply_server_frame(&cache, price_frame("COIN", WireU256::ZERO)).await;
         assert!(
-            cache.read().await.get("COIN").is_some(),
+            cached(&cache, CONFIGURED, "COIN").await.is_some(),
             "next price frame repopulates the cache"
+        );
+    }
+
+    async fn cached(cache: &QuoteCache, chain_id: u64, asset: &str) -> Option<Quote> {
+        cache
+            .read()
+            .await
+            .get(&(chain_id, asset.to_string()))
+            .cloned()
+    }
+
+    /// st0x.pricing publishes one frame per (chain, symbol). Two frames for
+    /// the same symbol on different chains are distinct observations and
+    /// must both survive ingest — keyed by symbol alone they were
+    /// last-write-wins, and the loser vanished without a trace.
+    #[tokio::test]
+    async fn frames_for_one_symbol_on_two_chains_do_not_clobber_each_other() {
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        let (base_nav, other_nav) = ([0x01u8; 32], [0x02u8; 32]);
+
+        apply_server_frame(
+            &cache,
+            price_frame_on("COIN", CONFIGURED, WireU256::from_bytes(base_nav)),
+        )
+        .await;
+        apply_server_frame(
+            &cache,
+            price_frame_on("COIN", 1, WireU256::from_bytes(other_nav)),
+        )
+        .await;
+
+        assert_eq!(cache.read().await.len(), 2, "one entry per (chain, symbol)");
+        assert_eq!(
+            cached(&cache, CONFIGURED, "COIN")
+                .await
+                .unwrap()
+                .nav_ratio
+                .0,
+            base_nav
+        );
+        assert_eq!(
+            cached(&cache, 1, "COIN").await.unwrap().nav_ratio.0,
+            other_nav
+        );
+    }
+
+    /// Reads serve the configured chain, never whichever frame landed last.
+    /// A quote cached only for another chain reads as absent everywhere:
+    /// signing a context off it would bind another chain's rate, and no
+    /// staleness or expiry check downstream would notice.
+    #[tokio::test]
+    async fn reads_serve_the_configured_chain_not_the_latest_frame() {
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        let (base_nav, other_nav) = ([0x01u8; 32], [0x02u8; 32]);
+
+        apply_server_frame(
+            &cache,
+            price_frame_on("COIN", CONFIGURED, WireU256::from_bytes(base_nav)),
+        )
+        .await;
+        // Arrives last and would win under a symbol-only key.
+        apply_server_frame(
+            &cache,
+            price_frame_on("COIN", 1, WireU256::from_bytes(other_nav)),
+        )
+        .await;
+        // Only ever seen on another chain.
+        apply_server_frame(&cache, price_frame_on("TSLA", 1, WireU256::ZERO)).await;
+
+        let client = LiveClient {
+            cache,
+            chain_id: CONFIGURED,
+        };
+
+        assert_eq!(client.latest("COIN").await.unwrap().nav_ratio.0, base_nav);
+        let snapshot = client.snapshot_many(&["COIN", "TSLA"]).await;
+        assert_eq!(snapshot.get("COIN").unwrap().nav_ratio.0, base_nav);
+        assert!(
+            !snapshot.contains_key("TSLA"),
+            "another chain's quote is never served"
+        );
+        assert!(client.latest("TSLA").await.is_none());
+        assert_eq!(
+            client
+                .missing(&["COIN".to_string(), "TSLA".to_string()])
+                .await,
+            vec!["TSLA".to_string()],
+            "a symbol cached only for another chain is missing"
+        );
+    }
+
+    /// Halts are chain-scoped too: the producer halts an asset on the chain
+    /// it repriced, and that must not fail-closed a deployment serving the
+    /// same symbol elsewhere.
+    #[tokio::test]
+    async fn halt_on_another_chain_does_not_evict_our_quote() {
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        apply_server_frame(&cache, price_frame_on("COIN", CONFIGURED, WireU256::ZERO)).await;
+        apply_server_frame(&cache, price_frame_on("COIN", 1, WireU256::ZERO)).await;
+
+        apply_server_frame(&cache, halt_frame_on("COIN", 1, true)).await;
+
+        assert!(
+            cached(&cache, 1, "COIN").await.is_none(),
+            "halt evicts the quote on its own chain"
+        );
+        assert!(
+            cached(&cache, CONFIGURED, "COIN").await.is_some(),
+            "halt must not reach across chains"
         );
     }
 
