@@ -9,9 +9,9 @@ name: deploy
 # in t0.devops: promote the staging-verified digest into
 # terraform/production-oracle/images.yaml — merging that fires the
 # release-oracle workflow (PAM-approved apply + image roll). Versions are
-# labels on top of that: the first main build after a Cargo.toml version
-# bump also gets a vX.Y.Z registry tag on its digest (see the last
-# build-push step), which the manifest pins alongside the digest. This repo's
+# labels on top of that: pushing git tag vX.Y.Z runs release-tag.yml
+# (promote-on-tag, the org-standard flow), which labels the digest this
+# workflow already built and attested for that commit. This repo's
 # deployer SAs hold no rights in st0x-production (revoked 2026-07-24,
 # t0.devops#93), so a prod-deploy job here could only 403.
 #
@@ -43,9 +43,7 @@ concurrency:
 
 permissions:
   id-token: write
-  # write: the version-tag step publishes a git tag + GitHub release when a
-  # new version is minted (read covered everything else).
-  contents: write
+  contents: read
   # GitHub/Sigstore provenance attestation on every pushed digest.
   attestations: write
 
@@ -150,43 +148,6 @@ jobs:
             --artifact-url="${{ steps.push.outputs.digest }}" \
             --attestor="projects/t0-artifacts/attestors/oracle-image" \
             --keyversion="projects/t0-artifacts/locations/${REGION}/keyRings/attestors/cryptoKeys/oracle-image-attestor/cryptoKeyVersions/1"
-
-      # Version tag: the FIRST main build after a Cargo.toml version bump
-      # gets vX.Y.Z added to its (already attested) digest. That tag is the
-      # human-readable name t0.devops release manifests pin next to the
-      # digest; deploys still roll the digest, and t0.devops CI fails any
-      # manifest PR where tag and digest disagree. Later main builds without
-      # a bump leave the tag where it is, so a version never silently moves.
-      # Runs on main only: the deployer SA is impersonable from
-      # refs/heads/main alone, which also enforces "versions are main
-      # builds" structurally.
-      - name: Tag release version (main only)
-        if: github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
-          TAG="v${VERSION}"
-          if EXISTING=$(gcloud artifacts docker images describe "${IMAGE}:${TAG}" \
-              --format='value(image_summary.digest)' 2>/dev/null); then
-            echo "${TAG} already points at ${EXISTING} and stays there (bump Cargo.toml to cut a new version)."
-            exit 0
-          fi
-          gcloud artifacts docker tags add "${{ steps.push.outputs.digest }}" "${IMAGE}:${TAG}"
-          echo "Tagged ${TAG} -> ${{ steps.push.outputs.digest }}"
-          # Same name on the repo: a git tag + GitHub release at this commit,
-          # so the releases page and the registry agree. Never fails the
-          # deploy over the label (the digest is already shipped + attested).
-          printf '%s\n\n%s\n' \
-            "Image digest (attested): \`${{ steps.push.outputs.digest }}\`" \
-            "The Artifact Registry tag \`${TAG}\` points at exactly this digest. t0.devops release manifests pin the pair (\`version:\` + digest) and CI fails if they disagree; deploys always roll the digest." \
-            > /tmp/release-notes.md
-          gh release create "${TAG}" \
-            --target "${GITHUB_SHA}" \
-            --title "${TAG}" \
-            --notes-file /tmp/release-notes.md \
-            || echo "::warning::gh release create ${TAG} failed (release may already exist); registry tag is minted."
 
   deploy-staging:
     needs: build-push
