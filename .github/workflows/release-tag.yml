@@ -1,0 +1,27 @@
+name: release-tag
+
+# Promote-on-tag, the org-standard release flow (settled in
+# st0x.liquidity#1289): pushing git tag vX.Y.Z labels the images main
+# CI already built and attested for that commit, then cuts the GitHub
+# release. It does not build and does not deploy. The full contract
+# (refusals, idempotence, prerequisites) lives in the reusable workflow
+# below; the identity is minted by t0.devops production-artifacts
+# (modules/ar-labeler). Only the values in `with:` are this repo's own.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  label:
+    permissions:
+      id-token: write
+      # write: release-label cuts the GitHub release for the tag.
+      contents: write
+    uses: ST0x-Technology/.github/.github/workflows/release-label.yml@abdcdba03715f9165c8562d8060a8e4c17ab7cc8 # release-label, bump via PR
+    with:
+      service_account: oracle-labeler@t0-artifacts.iam.gserviceaccount.com
+      ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-oracle
+      images: t0-oracle-server
+      attestor: projects/t0-artifacts/attestors/oracle-image
