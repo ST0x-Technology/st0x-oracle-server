@@ -209,7 +209,15 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(3600),
     );
 
-    let state = AppState::new(signer, registry, pricing, symbols, market_hours, metrics);
+    let state = AppState::new(
+        signer,
+        registry,
+        config.chain_id,
+        pricing,
+        symbols,
+        market_hours,
+        metrics,
+    );
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));

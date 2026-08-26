@@ -8,6 +8,16 @@ use std::str::FromStr;
 pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// The chain this deployment signs prices for, carried at slot 10 of
+    /// `/context/v7` so per-deployment rainlang can assert it against an
+    /// `expected-chain-id` binding. The server is single-chain by design:
+    /// the oracle URL is a per-order deploy-time binding, so the chain
+    /// rides the URL, and each deployment states its chain here. Defaults
+    /// to Base (8453).
+    #[serde(default = "default_chain_id")]
+    pub chain_id: u64,
+
     pub tokens: Vec<TokenEntry>,
     pub pricing: PricingConfig,
 }
@@ -30,6 +40,10 @@ pub struct PricingConfig {
 
 fn default_port() -> u16 {
     3000
+}
+
+fn default_chain_id() -> u64 {
+    8453
 }
 
 impl Config {

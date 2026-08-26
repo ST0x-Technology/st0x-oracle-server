@@ -69,6 +69,9 @@ type OracleRequestTuple = (
 pub struct AppState {
     signer: Signer,
     registry: TokenRegistry,
+    /// The chain this deployment signs prices for — carried at slot 10
+    /// of `/context/v7` (see `oracle::SCHEMA_VERSION_V7`). From config.
+    chain_id: u64,
     /// Live WS subscription to st0x.pricing. Background-tasked, holds
     /// the latest `Quote` per symbol in an RwLock<HashMap>. Replaces
     /// the Alpaca polling cache (pre-RAI-360).
@@ -86,9 +89,11 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         signer: Signer,
         registry: TokenRegistry,
+        chain_id: u64,
         pricing: LiveClient,
         configured_symbols: Vec<String>,
         market_hours: Arc<MarketHoursCache>,
@@ -97,6 +102,7 @@ impl AppState {
         Self {
             signer,
             registry,
+            chain_id,
             pricing,
             configured_symbols,
             market_hours,
@@ -119,6 +125,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/context/v4", post(post_signed_context_v4))
         .route("/context/v5", post(post_signed_context_v5))
         .route("/context/v6", post(post_signed_context_v6))
+        .route("/context/v7", post(post_signed_context_v7))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -318,17 +325,37 @@ async fn post_signed_context_v6(
     result
 }
 
-/// Which pair-bound schema a `/context/v4`, `/context/v5` or
-/// `/context/v6` request is being served under. All three share request
-/// decoding, registry resolution, snapshot-once batching and the
+/// v7 handler — `/context/v7` endpoint. Identical request shape,
+/// resolution and batching to v4–v6; the response additionally signs
+/// the chain id this deployment serves at slot 10.
+///
+/// The property v7 adds: the EIP-191 signature is chain-agnostic and no
+/// earlier slot names a chain, while ST0x token addresses are
+/// deterministic clones across chains — so a v6 payload for chain A
+/// verifies unchanged inside an order on chain B. Slot 10 + a
+/// per-deployment `expected-chain-id` rainlang binding close that in
+/// the signed payload itself. See `oracle::SCHEMA_VERSION_V7`.
+async fn post_signed_context_v7(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let result = post_signed_context_pair_bound(state, body, PairSchema::V7).await;
+    record_request_outcome("v7", &result);
+    result
+}
+
+/// Which pair-bound schema a `/context/v4`, `/context/v5`, `/context/v6`
+/// or `/context/v7` request is being served under. All four share
+/// request decoding, registry resolution, snapshot-once batching and the
 /// session snapshot; they differ only in whether the model's expiry is
-/// signed into slot 8 (v5, v6) and the vault NAV ratio into slot 9
-/// (v6).
+/// signed into slot 8 (v5+), the vault NAV ratio into slot 9 (v6+) and
+/// the deployment's chain id into slot 10 (v7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairSchema {
     V4,
     V5,
     V6,
+    V7,
 }
 
 impl PairSchema {
@@ -337,6 +364,7 @@ impl PairSchema {
             Self::V4 => "v4",
             Self::V5 => "v5",
             Self::V6 => "v6",
+            Self::V7 => "v7",
         }
     }
 }
@@ -697,6 +725,18 @@ async fn build_response_from_quote_pair_bound(
             output_token,
             expiry_from_quote(quote)?,
             quote.nav_ratio.0,
+        )?,
+        PairSchema::V7 => oracle::build_context_v7(
+            price_bytes,
+            publish_time,
+            session_info.session.to_bytes32_v3(),
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+            expiry_from_quote(quote)?,
+            quote.nav_ratio.0,
+            state.chain_id,
         )?,
     };
     let (signature, signer) = state.signer.sign_context(&context).await?;
