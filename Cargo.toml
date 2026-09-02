@@ -47,9 +47,12 @@ base64 = "0.22"
 # stashes the latest `Quote` per asset. Wire types come from the
 # st0x-pricing-types crate; the consumer-side glue is ~150 lines of
 # auto-reconnecting WS plumbing in src/pricing_client.rs. Same
-# crates + versions as st0x.bebop / st0x.pricing. Pinned to the v0.6.0
-# tag (`nav_ratio` on PriceFrame/Quote + ServerFrame::Halt).
-st0x-pricing-types = { git = "https://github.com/ST0x-Technology/st0x.pricing-types", tag = "v0.6.0" }
+# crates + versions as st0x.bebop / st0x.pricing. Pinned to the rev that
+# added `underlying_rate_base_to_quote` / `underlying_rate_quote_to_base`
+# on PriceFrame/Quote (the directional underlying-asset rates `/context/v7`
+# signs). Re-pin to `tag = "v0.7.0"` once st0x.pricing-types #4 merges and
+# is tagged; this rev IS that PR's head.
+st0x-pricing-types = { git = "https://github.com/ST0x-Technology/st0x.pricing-types", rev = "7794ed474dd032a927c5b51a8b32c28259f4eb82" }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 ciborium = "0.2"
 futures-util = "0.3"

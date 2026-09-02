@@ -91,6 +91,13 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
         // Zero = the "no ratio" sentinel. Tests that exercise the v6
         // NAV-ratio slot overwrite this with a full-entropy pattern.
         nav_ratio: WireU256::ZERO,
+        // By default the underlying rates mirror the vault rates — the
+        // "base is not a vault token, underlying == vault rate" case — so
+        // existing schema/orientation tests behave identically on /context/v7.
+        // The v7 slot-1 tests below seed DISTINCT underlying rates to prove
+        // v7 signs the underlying, not the vault rate.
+        underlying_rate_base_to_quote: wire_float_of(base_to_quote),
+        underlying_rate_quote_to_base: wire_float_of(quote_to_base),
     }
 }
 
@@ -977,8 +984,16 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
     // v5 is what production signs; v1, v4 and v6 share pick_rate_bytes
     // but each handler carries its own code path and its own comments —
     // the exact divergence surface that produced this bug — so pin all
-    // remaining endpoints.
-    for endpoint in ["/context/v1", "/context/v4", "/context/v5", "/context/v6"] {
+    // remaining endpoints. v7 uses `pick_underlying_rate_bytes` (a distinct
+    // picker), and since this app's underlying rates mirror the vault rates
+    // it must pick the SAME direction and orient identically.
+    for endpoint in [
+        "/context/v1",
+        "/context/v4",
+        "/context/v5",
+        "/context/v6",
+        "/context/v7",
+    ] {
         // Sell-side order (input=USDC, output=tStock): must serve the ASK
         // in quote-per-base units = inv(quote_to_base) = 100.
         let sell_resp = app
@@ -1226,4 +1241,145 @@ async fn test_v5_response_is_v6_minus_nav_ratio() {
     let v5_version = Float::from(alloy::primitives::B256::from(v5[0]));
     assert_eq!(v5_version.format().unwrap(), "5");
     assert_eq!(&v5[1..9], &v6[1..9], "v6 must extend v5 without changes");
+}
+
+/// Build a test app whose single COIN quote prices the vault share at
+/// `vault_px` USDC and the underlying stock at a DISTINCT `underlying_px`,
+/// so v7's slot 1 (underlying) can be told apart from v5/v6's slot 1
+/// (vault rate). Per the pricing-types contract each directional rate is
+/// seeded so a QuoteToBase (sell-side, USDC->WCOIN) request serves the
+/// price back after the oracle's `inv`: `quote_to_base = 1/px`,
+/// `base_to_quote = px`.
+async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> axum::Router {
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
+
+    let vault_inv = Float::parse(vault_px.to_string())
+        .unwrap()
+        .inv()
+        .unwrap()
+        .format()
+        .unwrap();
+    let mut quote = fake_quote("COIN", WCOIN, &vault_inv, vault_px);
+    quote.expiry_unix_ms = 1_700_000_020_500;
+
+    let under_inv = Float::parse(underlying_px.to_string())
+        .unwrap()
+        .inv()
+        .unwrap()
+        .format()
+        .unwrap();
+    quote.underlying_rate_quote_to_base = wire_float_of(&under_inv);
+    quote.underlying_rate_base_to_quote = wire_float_of(underlying_px);
+
+    let pricing = LiveClient::with_seeded(vec![quote]).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        pricing,
+        vec!["COIN".to_string()],
+        fixed_close_market_hours().await,
+        metrics,
+    );
+    create_app(state)
+}
+
+#[tokio::test]
+async fn test_v7_endpoint_signs_underlying_price_at_slot_1() {
+    // Route-level pin for /context/v7: the v5 nine-slot shape (no NAV
+    // ratio at slot 9), with slot 1 carrying the UNDERLYING price (90),
+    // NOT the vault-share rate (100). Sell-side request (USDC->WCOIN).
+    let app = test_app_with_underlying("100", "90").await;
+    let ctx = context_of(app, "/context/v7").await;
+
+    assert_eq!(
+        ctx.len(),
+        9,
+        "v7 endpoint must emit 9 context elements — no NAV-ratio slot"
+    );
+
+    let version = Float::from(alloy::primitives::B256::from(ctx[0]));
+    assert_eq!(version.format().unwrap(), "7", "slot 0 must be schema v7");
+
+    let price = Float::from(alloy::primitives::B256::from(ctx[1]));
+    assert_eq!(
+        price.format().unwrap(),
+        "90",
+        "slot 1 must be the underlying price, not the vault rate (100)"
+    );
+
+    // Slot 8 keeps the v5 expiry semantics: ms floored to whole seconds.
+    let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
+    let expected = Float::parse("1700000020".to_string())
+        .unwrap()
+        .format()
+        .unwrap();
+    assert_eq!(expiry.format().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_v5_v6_still_sign_vault_rate_when_underlying_differs() {
+    // The v7 underlying path must not leak into v4/v5/v6: with the
+    // underlying (90) distinct from the vault rate (100), the vault-rate
+    // endpoints must still serve 100 at slot 1. Regression pin proving
+    // slot 1's meaning is per-schema.
+    let app = test_app_with_underlying("100", "90").await;
+    let v5 = context_of(app.clone(), "/context/v5").await;
+    let v6 = context_of(app, "/context/v6").await;
+
+    let v5_price = Float::from(alloy::primitives::B256::from(v5[1]));
+    assert_eq!(
+        v5_price.format().unwrap(),
+        "100",
+        "v5 slot 1 is the vault rate"
+    );
+    let v6_price = Float::from(alloy::primitives::B256::from(v6[1]));
+    assert_eq!(
+        v6_price.format().unwrap(),
+        "100",
+        "v6 slot 1 is the vault rate"
+    );
+}
+
+#[tokio::test]
+async fn test_v7_fails_closed_on_absent_underlying_rate() {
+    // A quote from a producer predating the underlying_rate_* fields
+    // decodes them to the all-zero sentinel. v7 must refuse to sign a
+    // zero underlying price — one bad symbol 500s the request — rather
+    // than hand the strategy a garbage mark. The vault rate is present and
+    // valid, so v5/v6 would happily serve; only v7 fails closed.
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
+    let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+    quote.underlying_rate_quote_to_base = WireFloat::from_bytes([0u8; 32]);
+    quote.underlying_rate_base_to_quote = WireFloat::from_bytes([0u8; 32]);
+    let pricing = LiveClient::with_seeded(vec![quote]).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        pricing,
+        vec!["COIN".to_string()],
+        fixed_close_market_hours().await,
+        metrics,
+    );
+    let app = create_app(state);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v7")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        500,
+        "absent underlying rate must fail closed, not sign a zero price"
+    );
 }

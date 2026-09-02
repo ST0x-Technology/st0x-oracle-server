@@ -119,6 +119,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/context/v4", post(post_signed_context_v4))
         .route("/context/v5", post(post_signed_context_v5))
         .route("/context/v6", post(post_signed_context_v6))
+        .route("/context/v7", post(post_signed_context_v7))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -318,17 +319,45 @@ async fn post_signed_context_v6(
     result
 }
 
-/// Which pair-bound schema a `/context/v4`, `/context/v5` or
-/// `/context/v6` request is being served under. All three share request
-/// decoding, registry resolution, snapshot-once batching and the
-/// session snapshot; they differ only in whether the model's expiry is
-/// signed into slot 8 (v5, v6) and the vault NAV ratio into slot 9
-/// (v6).
+/// v7 handler — `/context/v7` endpoint. Identical request shape,
+/// resolution and batching to v4/v5/v6; the signed price at slot 1 is the
+/// vault's UNDERLYING asset rate rather than the vault-share rate, and no
+/// NAV ratio is signed (the v5 nine-slot shape, no slot 9).
+///
+/// The property v7 changes: v6 signs the NAV ratio and forces a strategy
+/// to assert exact equality against the vault's live answer at settlement
+/// — a DoS surface (audit H03), because the NAV can step between sign and
+/// settle for reasons outside any attacker's control and every step bricks
+/// otherwise-valid frames. v7 signs only the underlying price and leaves
+/// the ratio UNSIGNED; the consuming strategy (RAI-2199) reads the vault's
+/// live `erc4626-convert-to-assets` on-chain and DERIVES the vault price
+/// (`underlying × convertToAssets(1 share)`) atomically — nothing to
+/// straddle. The underlying is the one quantity the chain can re-derive
+/// the vault price from, so it is what must be signed. See
+/// `oracle::SCHEMA_VERSION_V7` for the full layout and the fail-closed
+/// handling of an absent underlying rate.
+async fn post_signed_context_v7(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let result = post_signed_context_pair_bound(state, body, PairSchema::V7).await;
+    record_request_outcome("v7", &result);
+    result
+}
+
+/// Which pair-bound schema a `/context/v4`, `/context/v5`, `/context/v6`
+/// or `/context/v7` request is being served under. All four share request
+/// decoding, registry resolution, snapshot-once batching and the session
+/// snapshot; they differ in whether the model's expiry is signed into slot
+/// 8 (v5, v6, v7), whether the vault NAV ratio is signed into slot 9 (v6
+/// only), and WHICH price is signed into slot 1 — the vault-share rate for
+/// v4/v5/v6, the vault's UNDERLYING asset rate for v7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairSchema {
     V4,
     V5,
     V6,
+    V7,
 }
 
 impl PairSchema {
@@ -337,11 +366,21 @@ impl PairSchema {
             Self::V4 => "v4",
             Self::V5 => "v5",
             Self::V6 => "v6",
+            Self::V7 => "v7",
         }
+    }
+
+    /// v7 signs the vault's UNDERLYING asset rate at slot 1; every other
+    /// pair-bound schema signs the vault-share rate. This selects which of
+    /// the cached quote's directional rate pairs the response is built
+    /// from.
+    fn signs_underlying(self) -> bool {
+        matches!(self, Self::V7)
     }
 }
 
-/// Shared body for `/context/v4`, `/context/v5` and `/context/v6`.
+/// Shared body for `/context/v4`, `/context/v5`, `/context/v6` and
+/// `/context/v7`.
 async fn post_signed_context_pair_bound(
     state: Arc<AppState>,
     body: Bytes,
@@ -540,6 +579,58 @@ fn pick_rate_bytes(quote: &Quote, direction: PriceDirection) -> Result<[u8; 32],
     Ok(B256::from(inverted).0)
 }
 
+/// Pick the maker-side UNDERLYING rate for this request's swap direction
+/// from a live pricing-service `Quote` — the v7 analogue of
+/// `pick_rate_bytes`.
+///
+/// The underlying rate prices the vault's ERC4626 underlying asset (the
+/// offchain stock) rather than the vault share. It is DIRECTIONAL and
+/// spread-carrying exactly like the vault rate, and is picked by the same
+/// input/output orientation and inverted into Raindex ratio units the same
+/// way — so slot 1 of a v7 context is the underlying-price counterpart of
+/// slot 1 of a v5/v6 context. The consuming strategy multiplies this by
+/// the vault's LIVE NAV ratio on-chain to derive the vault price, so the
+/// oracle never signs the ratio.
+///
+/// Fail-closed on the all-zero sentinel: a pricing producer predating the
+/// `underlying_rate_*` fields decodes them to the zero Float via
+/// `#[serde(default)]`, and a real stock rate is never zero. Signing (or
+/// inverting) a zero underlying price would hand the strategy a garbage
+/// mark, so the request is refused. This mirrors how the server treats any
+/// other unusable rate — an internal error, fail-closed — rather than the
+/// v6 NAV-ratio path, where zero is a legitimate "no assertion" sentinel
+/// the strategy is free to accept; a zero underlying price is never usable.
+fn pick_underlying_rate_bytes(
+    quote: &Quote,
+    direction: PriceDirection,
+) -> Result<[u8; 32], anyhow::Error> {
+    let (directional_rate, name) = match direction {
+        PriceDirection::QuoteToBase => (
+            quote.underlying_rate_quote_to_base.0,
+            "underlying_rate_quote_to_base",
+        ),
+        PriceDirection::BaseToQuote => (
+            quote.underlying_rate_base_to_quote.0,
+            "underlying_rate_base_to_quote",
+        ),
+    };
+    let rate = Float::from_raw(B256::new(directional_rate));
+    if rate
+        .is_zero()
+        .map_err(|e| anyhow::anyhow!("Failed to test {name} for zero: {e:?}"))?
+    {
+        return Err(anyhow::anyhow!(
+            "{name} is the zero sentinel: the pricing producer carried no underlying rate for \
+             this quote (it predates underlying pricing, or the pair is misconfigured); refusing \
+             to sign a zero underlying price"
+        ));
+    }
+    let inverted = rate
+        .inv()
+        .map_err(|e| anyhow::anyhow!("Failed to invert {name} into ratio units: {e:?}"))?;
+    Ok(B256::from(inverted).0)
+}
+
 /// Build a signed response from a pre-resolved pair and a snapshotted
 /// `Quote`. All `Quote`s for one batch must come from a single
 /// `LiveClient::snapshot_many` so a concurrent WS push can't mix prices
@@ -612,11 +703,12 @@ async fn build_response_from_quote(
     })
 }
 
-/// Pair-bound response builder (v4/v5/v6). Same price + publish_time
-/// logic as v1's `build_response_from_quote`, plus the session slots
-/// and the caller's raw input/output token addresses stamped into
-/// signed-context slots 6 and 7; v5 adds the quote expiry at slot 8 and
-/// v6 the vault NAV ratio at slot 9 (see the `oracle::build_context_v*`
+/// Pair-bound response builder (v4/v5/v6/v7). Same publish_time logic as
+/// v1's `build_response_from_quote`, plus the session slots and the
+/// caller's raw input/output token addresses stamped into signed-context
+/// slots 6 and 7; v5/v6/v7 add the quote expiry at slot 8 and v6 the vault
+/// NAV ratio at slot 9. Slot 1 is the vault-share rate for v4/v5/v6 and the
+/// vault's underlying rate for v7 (see the `oracle::build_context_v*`
 /// builders for the layouts).
 #[allow(clippy::too_many_arguments)]
 async fn build_response_from_quote_pair_bound(
@@ -643,9 +735,17 @@ async fn build_response_from_quote_pair_bound(
         .try_into()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
 
-    // Same as v1: pick the directional rate and invert it into
-    // Raindex ratio units (Rain-Float precision) — see `pick_rate_bytes`.
-    let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
+    // Pick the directional rate and invert it into Raindex ratio units
+    // (Rain-Float precision). v4/v5/v6 sign the vault-share rate
+    // (`pick_rate_bytes`); v7 signs the vault's UNDERLYING asset rate
+    // (`pick_underlying_rate_bytes`), which fails closed on the absent-rate
+    // sentinel. Both come off the SAME cached quote.
+    let price_bytes = if schema.signs_underlying() {
+        pick_underlying_rate_bytes(quote, pair.direction)
+    } else {
+        pick_rate_bytes(quote, pair.direction)
+    }
+    .map_err(AppError::Internal)?;
 
     tracing::info!(
         symbol = %pair.symbol,
@@ -697,6 +797,19 @@ async fn build_response_from_quote_pair_bound(
             output_token,
             expiry_from_quote(quote)?,
             quote.nav_ratio.0,
+        )?,
+        // v7 signs the UNDERLYING price at slot 1 (already selected into
+        // `price_bytes` above) and NO NAV ratio — the strategy derives the
+        // vault price on-chain from the live ratio (RAI-2198).
+        PairSchema::V7 => oracle::build_context_v7(
+            price_bytes,
+            publish_time,
+            session_info.session.to_bytes32_v3(),
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+            expiry_from_quote(quote)?,
         )?,
     };
     let (signature, signer) = state.signer.sign_context(&context).await?;
