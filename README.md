@@ -14,6 +14,20 @@ Serves `SignedContextV1` data using real-time Alpaca NBBO quotes, enabling Raind
 
 If Alpaca is temporarily unreachable, the poll loop logs the error and leaves the previous cached quote in place. The Rainlang strategy bounds freshness via a `max-staleness` guard against `block.timestamp`.
 
+### Signature cache
+
+Every slot the oracle signs (price, publish time, session window, token
+addresses, quote expiry) comes from the pricing frame and the requested
+pair, never from the wall clock or the caller. Two requests for the same
+pair inside one price frame therefore sign byte-identical data, and the
+server keeps a content-addressed cache (`keccak256` of the packed context
+→ signature, 2-minute TTL, 16k entries) so the second request reuses the
+first signature instead of paying for another KMS operation. Concurrent
+identical requests coalesce onto one sign call. Consumers see nothing
+different: same bytes, a valid signature, the same expiry.
+`oracle_signature_cache_hits_total` / `_misses_total` and
+`oracle_signature_cache_entries` on `/metrics` show the effect.
+
 ## Usage
 
 ```bash
