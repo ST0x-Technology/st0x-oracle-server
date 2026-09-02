@@ -38,8 +38,8 @@ struct Cli {
 
     /// GCP Cloud KMS key VERSION resource name for EIP-191 signing
     /// (projects/…/locations/…/keyRings/…/cryptoKeys/…/cryptoKeyVersions/N).
-    /// The key never leaves KMS; each signature is an AsymmetricSign call
-    /// authenticated via ADC (native on GCP runtimes such as Cloud Run;
+    /// The key never leaves KMS; each signature-cache miss is one
+    /// AsymmetricSign call authenticated via ADC (native on GCP runtimes such as Cloud Run;
     /// elsewhere provide GOOGLE_APPLICATION_CREDENTIALS).
     #[arg(long, env = "SIGNER_KMS_KEY")]
     signer_kms_key: Option<String>,

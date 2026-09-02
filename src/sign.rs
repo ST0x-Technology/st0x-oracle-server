@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, FixedBytes};
+use alloy::primitives::{Address, Bytes, FixedBytes, Keccak256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer as AlloySigner;
 use alloy_signer_gcp::{GcpKeyRingRef, GcpSigner, KeySpecifier};
@@ -6,96 +6,192 @@ use gcloud_sdk::google::cloud::kms::v1::key_management_service_client::KeyManage
 use gcloud_sdk::GoogleApi;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 // EIP-191 signing for Rain signed context
 
 /// Upper bound on a single sign attempt. Only meaningful for the KMS
 /// backend, where signing is a network RPC.
 const SIGN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a cached signature is kept. Cache validity is not the
-/// question here — a signature over given bytes is valid forever, and the
-/// key IS the bytes — the TTL only bounds memory: an entry that nobody has
-/// asked for in this long belongs to a superseded price frame. Pricing
-/// frames arrive every ~5s, so 2 minutes is ~24 frames of headroom.
-const SIGNATURE_CACHE_TTL: Duration = Duration::from_secs(120);
+/// How long a request waits on a signature another request is already
+/// producing: the full attempt-plus-retry budget of that sign, with slack.
+/// Waiters never sign themselves, so this is also the worst case a caller
+/// can spend inside `sign_context`.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(2 * 5 + 1);
 
-/// Hard cap on cached entries; a safety net if the TTL sweep ever falls
-/// behind (78 live inputs per frame today, ~1,900 entries in a 2-minute
-/// window). When exceeded the whole cache is dropped — cheap, and the next
-/// frame refills the live set in one round of misses.
+/// Idle time after which a cached signature is dropped. Validity is not the
+/// question (a signature over given bytes is valid for as long as the quote
+/// it carries, and the key IS the bytes); the TTL only bounds memory. An
+/// entry nobody has asked for in two minutes belongs to a price frame that
+/// was superseded ~24 frames ago. Measured from the last hit, so a frozen
+/// price that takers keep polling is never re-signed.
+const SIGNATURE_CACHE_IDLE_TTL: Duration = Duration::from_secs(120);
+
+/// Hard cap on cached entries, a backstop for the sweep below (78 live
+/// inputs per frame today, well under 2,000 live entries in a two-minute
+/// window). Past the cap every finished entry is dropped; in-flight signs
+/// are kept so no KMS call is ever orphaned.
 const SIGNATURE_CACHE_MAX_ENTRIES: usize = 16_384;
 
-/// One cache slot. `sig` is a tokio mutex so that concurrent requests for
-/// the same not-yet-signed bytes coalesce: the first locker signs, the
-/// rest wait on the lock and read its result instead of each paying for a
-/// KMS call. A failed sign leaves `None`, so the next caller retries.
+/// Expired entries are swept on every N-th insert (a full scan of a
+/// ~2,000-entry map every ~15 seconds at today's miss rate), so the map
+/// tracks the live set instead of growing to the cap.
+const SWEEP_EVERY_INSERTS: u64 = 256;
+
+/// Outcome of one sign, broadcast to every request waiting on it.
+#[derive(Clone, Debug)]
+enum SignState {
+    Pending,
+    Done(Bytes),
+    Failed(String),
+}
+
+/// One cache slot. The signature is produced by a detached task that owns
+/// the `watch::Sender`; every request for these bytes, the one that
+/// started the task included, just waits on the receiver. So a client that
+/// disconnects mid-sign cannot abort the KMS call it started, and a failed
+/// sign fails all current waiters at once instead of letting each retry
+/// in turn.
 struct CacheEntry {
-    inserted: Instant,
-    sig: tokio::sync::Mutex<Option<Bytes>>,
+    /// Millis since `SignatureCache::epoch` at the last hit or insert.
+    last_used: AtomicU64,
+    state: watch::Receiver<SignState>,
+}
+
+impl CacheEntry {
+    fn is_pending(&self) -> bool {
+        matches!(*self.state.borrow(), SignState::Pending)
+    }
+}
+
+struct CacheMap {
+    entries: HashMap<FixedBytes<32>, Arc<CacheEntry>>,
+    inserts_since_sweep: u64,
 }
 
 /// Content-addressed signature cache: `keccak256(abi.encodePacked(context))`
-/// → signature. Every signed slot (price, publish_time, session, tokens,
-/// expiry) is derived from the pricing frame and the pair, never from the
-/// wall clock or the caller, so two requests inside one frame sign
-/// byte-identical data. Measured 2026-09-01: 58% of KMS signatures were
-/// re-signing bytes already signed seconds earlier, at ~£0.11 per 10k HSM
-/// operations. Consumers see no difference — same bytes, a valid signature.
+/// to signature. The signed slots (price, publish_time, expiry) derive from
+/// the pricing frame and the pair, and the session slots from the
+/// market-hours cache, which changes only at session boundaries. Two
+/// requests for one pair inside one price frame therefore sign
+/// byte-identical data, and the second reuses the first signature.
+/// Consumers see no difference: same bytes, a valid signature.
+///
+/// Caveat: with an EMPTY market-hours cache (initial calendar fetch failed;
+/// retried hourly by `main.rs`) the session window degenerates to
+/// `start = end = now`, slots 4 and 5 change every second, and this cache
+/// stops helping until the calendar loads. It stays correct, just useless.
 struct SignatureCache {
-    entries: tokio::sync::Mutex<HashMap<FixedBytes<32>, Arc<CacheEntry>>>,
-    ttl: Duration,
+    map: Mutex<CacheMap>,
+    epoch: Instant,
+    idle_ttl: Duration,
     max_entries: usize,
-    hits: AtomicU64,
+    /// Signs started (one per distinct input actually sent to KMS).
     misses: AtomicU64,
+    /// Requests served from an existing slot, finished or in flight.
+    hits: AtomicU64,
+}
+
+enum Lookup {
+    /// An entry exists (finished or in flight); wait on it.
+    Existing(Arc<CacheEntry>),
+    /// No usable entry; the caller must start the sign that fills this one.
+    Fresh(Arc<CacheEntry>, watch::Sender<SignState>),
 }
 
 impl SignatureCache {
-    fn new(ttl: Duration, max_entries: usize) -> Self {
+    fn new(idle_ttl: Duration, max_entries: usize) -> Self {
         Self {
-            entries: tokio::sync::Mutex::new(HashMap::new()),
-            ttl,
+            map: Mutex::new(CacheMap {
+                entries: HashMap::new(),
+                inserts_since_sweep: 0,
+            }),
+            epoch: Instant::now(),
+            idle_ttl,
             max_entries,
-            hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
         }
     }
 
-    /// Return the live slot for `hash`, creating it (and sweeping expired
-    /// entries) as needed. The map lock is held only for the lookup; the
-    /// signing itself happens under the per-entry lock.
-    async fn slot(&self, hash: FixedBytes<32>) -> Arc<CacheEntry> {
-        let mut map = self.entries.lock().await;
-        let now = Instant::now();
-        if let Some(entry) = map.get(&hash) {
-            if now.duration_since(entry.inserted) < self.ttl {
-                return Arc::clone(entry);
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn is_live(&self, entry: &CacheEntry, now_ms: u64) -> bool {
+        entry.is_pending()
+            || now_ms.saturating_sub(entry.last_used.load(Ordering::Relaxed))
+                < u64::try_from(self.idle_ttl.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Find or create the slot for `hash`. Synchronous: the map lock never
+    /// spans an await, signing happens outside it.
+    fn lookup(&self, hash: FixedBytes<32>) -> Lookup {
+        let mut guard = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let now_ms = self.now_ms();
+
+        if let Some(entry) = guard.entries.get(&hash) {
+            if self.is_live(entry, now_ms) {
+                entry.last_used.store(now_ms, Ordering::Relaxed);
+                return Lookup::Existing(Arc::clone(entry));
             }
-            map.remove(&hash);
+            guard.entries.remove(&hash);
         }
-        if map.len() >= self.max_entries {
-            let ttl = self.ttl;
-            map.retain(|_, e| now.duration_since(e.inserted) < ttl);
-            if map.len() >= self.max_entries {
-                map.clear();
+
+        guard.inserts_since_sweep += 1;
+        if guard.inserts_since_sweep >= SWEEP_EVERY_INSERTS
+            || guard.entries.len() >= self.max_entries
+        {
+            guard.inserts_since_sweep = 0;
+            guard.entries.retain(|_, e| self.is_live(e, now_ms));
+            if guard.entries.len() >= self.max_entries {
+                // Still over: drop everything finished, keep in-flight signs.
+                guard.entries.retain(|_, e| e.is_pending());
             }
         }
+
+        let (tx, rx) = watch::channel(SignState::Pending);
         let entry = Arc::new(CacheEntry {
-            inserted: now,
-            sig: tokio::sync::Mutex::new(None),
+            last_used: AtomicU64::new(now_ms),
+            state: rx,
         });
-        map.insert(hash, Arc::clone(&entry));
-        ::metrics::gauge!("oracle_signature_cache_entries").set(map.len() as f64);
-        entry
+        guard.entries.insert(hash, Arc::clone(&entry));
+        ::metrics::gauge!("oracle_signature_cache_entries").set(guard.entries.len() as f64);
+        Lookup::Fresh(entry, tx)
+    }
+
+    /// Drop `entry` from the map if it is still the one registered for
+    /// `hash`, so the next request starts a fresh sign after a failure.
+    fn evict(&self, hash: FixedBytes<32>, entry: &Arc<CacheEntry>) {
+        let mut guard = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .entries
+            .get(&hash)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            guard.entries.remove(&hash);
+            ::metrics::gauge!("oracle_signature_cache_entries").set(guard.entries.len() as f64);
+        }
     }
 }
 
-/// Hit/miss counters, for tests and `/status`-style introspection.
+/// Hit/miss counters, read by the unit tests.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignatureCacheStats {
     pub hits: u64,
     pub misses: u64,
+}
+
+/// Test-only knobs on the detached sign task: an artificial delay so
+/// concurrent requests really overlap, and an injected failure.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct TestHook {
+    delay: Duration,
+    fail: bool,
 }
 
 /// EIP-191 signer for Rain signed context.
@@ -103,12 +199,17 @@ pub struct SignatureCacheStats {
 /// Two backends behind the same interface:
 /// - a local hex private key (tests / local dev), or
 /// - GCP Cloud KMS (production): the key is non-extractable and never enters
-///   this process; each signature is a KMS `AsymmetricSign` call authenticated
-///   via Application Default Credentials (on GCE, the VM's attached service
-///   account — no credential material on the box).
+///   this process; a cache miss is one KMS `AsymmetricSign` call
+///   authenticated via Application Default Credentials (on GCE, the VM's
+///   attached service account, so no credential material on the box).
+///
+/// Signatures are cached by content (see [`SignatureCache`]), so repeated
+/// requests for the same bytes cost one KMS operation.
 pub struct Signer {
-    inner: Box<dyn AlloySigner + Send + Sync>,
-    cache: SignatureCache,
+    inner: Arc<dyn AlloySigner + Send + Sync>,
+    cache: Arc<SignatureCache>,
+    #[cfg(test)]
+    test_hook: Option<TestHook>,
 }
 
 /// Components of a KMS key version resource name:
@@ -145,22 +246,72 @@ impl KmsKeyName {
     }
 }
 
+/// One EIP-191 sign of `hash` with the KMS timeout and single retry.
+///
+/// The Rain orderbook contract applies toEthSignedMessageHash(hash) before
+/// ecrecover, so we sign the raw hash with sign_message, which prefixes
+/// "\x19Ethereum Signed Message:\n32" internally.
+///
+/// On the KMS backend this is a remote AsymmetricSign RPC, so it is bounded
+/// by a timeout (a blackholed KMS connection must surface as an error, not
+/// hang the request handler while `/` stays green) and retried once for
+/// transient failures. The local backend signs in microseconds and never
+/// hits either path.
+async fn sign_hash_with_retry(
+    inner: &(dyn AlloySigner + Send + Sync),
+    hash: FixedBytes<32>,
+) -> anyhow::Result<Bytes> {
+    let signature =
+        match tokio::time::timeout(SIGN_TIMEOUT, inner.sign_message(hash.as_slice())).await {
+            Ok(Ok(sig)) => sig,
+            first_failure => {
+                match &first_failure {
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "sign_message failed; retrying once")
+                    }
+                    _ => tracing::warn!(
+                        timeout_secs = SIGN_TIMEOUT.as_secs(),
+                        "sign_message timed out; retrying once"
+                    ),
+                }
+                tokio::time::timeout(SIGN_TIMEOUT, inner.sign_message(hash.as_slice()))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "signing timed out after {}s (retry included)",
+                            SIGN_TIMEOUT.as_secs()
+                        )
+                    })??
+            }
+        };
+    Ok(Bytes::from(signature.as_bytes().to_vec()))
+}
+
 impl Signer {
+    fn with_inner(inner: Arc<dyn AlloySigner + Send + Sync>) -> Self {
+        Self {
+            inner,
+            cache: Arc::new(SignatureCache::new(
+                SIGNATURE_CACHE_IDLE_TTL,
+                SIGNATURE_CACHE_MAX_ENTRIES,
+            )),
+            #[cfg(test)]
+            test_hook: None,
+        }
+    }
+
     /// Create a new signer from a hex private key (with or without 0x prefix).
     pub fn new(private_key: &str) -> anyhow::Result<Self> {
         let key = private_key.strip_prefix("0x").unwrap_or(private_key);
         let signer: PrivateKeySigner = key.parse()?;
-        Ok(Self {
-            inner: Box::new(signer),
-            cache: SignatureCache::new(SIGNATURE_CACHE_TTL, SIGNATURE_CACHE_MAX_ENTRIES),
-        })
+        Ok(Self::with_inner(Arc::new(signer)))
     }
 
     /// Create a signer backed by a GCP Cloud KMS key version.
     ///
     /// `resource_name` is the full key version resource name (the Terraform
     /// stack's `signer_kms_key_version` output). Fails fast if the key is
-    /// unreachable, is not secp256k1, or ADC cannot authenticate — better a
+    /// unreachable, is not secp256k1, or ADC cannot authenticate: better a
     /// loud startup error than serving unsigned/failing requests.
     pub async fn from_gcp_kms(resource_name: &str) -> anyhow::Result<Self> {
         let name = KmsKeyName::parse(resource_name)?;
@@ -168,7 +319,7 @@ impl Signer {
         // Install a process-level rustls CryptoProvider before gcloud-sdk
         // builds its TLS client: both `ring` and `aws-lc-rs` are in the
         // dependency graph (reqwest vs gcloud-sdk/tonic), so rustls cannot
-        // auto-select one and panics at first TLS use. Idempotent — the
+        // auto-select one and panics at first TLS use. Idempotent: the
         // result is ignored if a provider is already installed.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -183,20 +334,24 @@ impl Signer {
         // No chain id: EIP-191 message signing is chain-agnostic.
         let signer = GcpSigner::new(client, specifier, None).await?;
 
-        Ok(Self {
-            inner: Box::new(signer),
-            cache: SignatureCache::new(SIGNATURE_CACHE_TTL, SIGNATURE_CACHE_MAX_ENTRIES),
-        })
+        Ok(Self::with_inner(Arc::new(signer)))
     }
 
-    /// Override the signature cache bounds (tests; also handy for a local
-    /// dev loop that wants to see every sign call).
-    pub fn with_cache_bounds(mut self, ttl: Duration, max_entries: usize) -> Self {
-        self.cache = SignatureCache::new(ttl, max_entries);
+    /// Override the cache bounds; a zero idle TTL disables caching.
+    #[cfg(test)]
+    pub fn with_cache_bounds(mut self, idle_ttl: Duration, max_entries: usize) -> Self {
+        self.cache = Arc::new(SignatureCache::new(idle_ttl, max_entries));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_hook(mut self, hook: TestHook) -> Self {
+        self.test_hook = Some(hook);
         self
     }
 
     /// Signature cache hit/miss counters since startup.
+    #[cfg(test)]
     pub fn cache_stats(&self) -> SignatureCacheStats {
         SignatureCacheStats {
             hits: self.cache.hits.load(Ordering::Relaxed),
@@ -218,64 +373,89 @@ impl Signer {
         &self,
         context: &[FixedBytes<32>],
     ) -> anyhow::Result<(Bytes, Address)> {
-        // abi.encodePacked(bytes32[]) — just concatenate the raw bytes
-        let packed: Vec<u8> = context.iter().flat_map(|b| b.as_slice().to_vec()).collect();
-
-        // keccak256 of the packed data — also the cache key: same bytes,
-        // same (still valid) signature, no second KMS call.
-        let hash = alloy::primitives::keccak256(&packed);
-
-        let entry = self.cache.slot(hash).await;
-        let mut cached = entry.sig.lock().await;
-        if let Some(sig) = cached.as_ref() {
-            self.cache.hits.fetch_add(1, Ordering::Relaxed);
-            ::metrics::counter!("oracle_signature_cache_hits_total").increment(1);
-            return Ok((sig.clone(), self.address()));
+        // abi.encodePacked(bytes32[]) is the raw concatenation, so hash the
+        // slots straight through without building the packed buffer. The
+        // hash is what gets signed and is therefore also the cache key:
+        // same bytes, same (still valid) signature, no second KMS call.
+        let mut hasher = Keccak256::new();
+        for slot in context {
+            hasher.update(slot);
         }
-        self.cache.misses.fetch_add(1, Ordering::Relaxed);
-        ::metrics::counter!("oracle_signature_cache_misses_total").increment(1);
+        let hash = hasher.finalize();
 
-        // Sign with EIP-191 prefix: the Rain orderbook contract applies
-        // toEthSignedMessageHash(hash) before ecrecover, so we must sign
-        // the raw hash using sign_message (which internally prefixes with
-        // "\x19Ethereum Signed Message:\n32" before signing).
-        //
-        // On the KMS backend this is a remote AsymmetricSign RPC, so it is
-        // bounded by a timeout (a blackholed KMS connection must surface as
-        // an error, not hang the request handler while `/` stays green) and
-        // retried once for transient failures. The local backend signs in
-        // microseconds and never hits either path.
-        let signature = match tokio::time::timeout(
-            SIGN_TIMEOUT,
-            self.inner.sign_message(hash.as_slice()),
-        )
-        .await
-        {
-            Ok(Ok(sig)) => sig,
-            first_failure => {
-                match &first_failure {
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "sign_message failed; retrying once")
-                    }
-                    _ => tracing::warn!(
-                        timeout_secs = SIGN_TIMEOUT.as_secs(),
-                        "sign_message timed out; retrying once"
-                    ),
-                }
-                tokio::time::timeout(SIGN_TIMEOUT, self.inner.sign_message(hash.as_slice()))
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "signing timed out after {}s (retry included)",
-                            SIGN_TIMEOUT.as_secs()
-                        )
-                    })??
+        let entry = match self.cache.lookup(hash) {
+            Lookup::Existing(entry) => {
+                self.cache.hits.fetch_add(1, Ordering::Relaxed);
+                ::metrics::counter!("oracle_signature_cache_hits_total").increment(1);
+                entry
+            }
+            Lookup::Fresh(entry, tx) => {
+                self.cache.misses.fetch_add(1, Ordering::Relaxed);
+                ::metrics::counter!("oracle_signature_cache_misses_total").increment(1);
+                self.spawn_sign(hash, Arc::clone(&entry), tx);
+                entry
             }
         };
 
-        let sig = Bytes::from(signature.as_bytes().to_vec());
-        *cached = Some(sig.clone());
-        Ok((sig, self.address()))
+        let mut rx = entry.state.clone();
+        let settled = tokio::time::timeout(
+            WAIT_TIMEOUT,
+            rx.wait_for(|s| !matches!(s, SignState::Pending)),
+        )
+        .await;
+        match settled {
+            Ok(Ok(state)) => match &*state {
+                SignState::Done(sig) => Ok((sig.clone(), self.address())),
+                SignState::Failed(msg) => Err(anyhow::anyhow!("{msg}")),
+                SignState::Pending => unreachable!("wait_for returned while pending"),
+            },
+            // Sender dropped without a result: the sign task panicked.
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "signing task aborted before producing a result"
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "timed out after {}s waiting for an in-flight signature",
+                WAIT_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    /// Run the KMS sign for `hash` on its own task so it completes even if
+    /// the request that triggered it goes away, then broadcast the result
+    /// to every waiter. On failure the entry is evicted so the next request
+    /// starts over instead of inheriting a dead slot.
+    fn spawn_sign(
+        &self,
+        hash: FixedBytes<32>,
+        entry: Arc<CacheEntry>,
+        tx: watch::Sender<SignState>,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let cache = Arc::clone(&self.cache);
+        #[cfg(test)]
+        let hook = self.test_hook;
+        tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(h) = hook {
+                tokio::time::sleep(h.delay).await;
+                if h.fail {
+                    cache.evict(hash, &entry);
+                    let _ = tx.send(SignState::Failed("injected test failure".into()));
+                    return;
+                }
+            }
+            let outcome = sign_hash_with_retry(inner.as_ref(), hash).await;
+            let state = match outcome {
+                Ok(sig) => SignState::Done(sig),
+                Err(e) => {
+                    cache.evict(hash, &entry);
+                    SignState::Failed(e.to_string())
+                }
+            };
+            // Evict BEFORE broadcasting a failure so a waiter that retries on
+            // error finds a fresh slot, never the dead one.
+            let _ = tx.send(state);
+        });
     }
 }
 
@@ -284,7 +464,7 @@ mod tests {
     use super::*;
     use alloy::primitives::U256;
 
-    // Test private key — DO NOT use in production
+    // Test private key. DO NOT use in production.
     const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     #[test]
@@ -312,7 +492,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_context_deterministic() {
-        let signer = Signer::new(TEST_KEY).unwrap();
+        // Zero idle TTL: every call signs, so this observes the local
+        // signer's determinism rather than a cache hit.
+        let signer = Signer::new(TEST_KEY)
+            .unwrap()
+            .with_cache_bounds(Duration::ZERO, 16);
         let context = vec![
             FixedBytes::<32>::from(U256::from(1000u64)),
             FixedBytes::<32>::from(U256::from(2000u64)),
@@ -324,6 +508,11 @@ mod tests {
         assert_eq!(sig1, sig2, "Same context should produce same signature");
         assert_eq!(addr1, addr2);
         assert_eq!(sig1.len(), 65, "EIP-191 signature should be 65 bytes");
+        assert_eq!(
+            signer.cache_stats().misses,
+            2,
+            "cache must be bypassed here"
+        );
     }
 
     #[tokio::test]
@@ -398,8 +587,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sign_context_idle_ttl_is_refreshed_by_hits() {
+        // Idle TTL: a key that keeps being asked for is never re-signed,
+        // however long ago it was first signed.
+        let signer = Signer::new(TEST_KEY)
+            .unwrap()
+            .with_cache_bounds(Duration::from_millis(60), 16);
+        let context = vec![FixedBytes::<32>::from(U256::from(7u64))];
+        signer.sign_context(&context).await.unwrap();
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            signer.sign_context(&context).await.unwrap();
+        }
+        assert_eq!(
+            signer.cache_stats(),
+            SignatureCacheStats { hits: 5, misses: 1 }
+        );
+    }
+
+    #[tokio::test]
     async fn test_sign_context_concurrent_identical_requests_sign_once() {
-        let signer = Arc::new(Signer::new(TEST_KEY).unwrap());
+        // The sign task sleeps, so all 32 requests genuinely overlap with
+        // the in-flight sign and must coalesce onto it.
+        let signer = Arc::new(Signer::new(TEST_KEY).unwrap().with_test_hook(TestHook {
+            delay: Duration::from_millis(50),
+            fail: false,
+        }));
         let context = vec![FixedBytes::<32>::from(U256::from(42u64))];
         let tasks: Vec<_> = (0..32)
             .map(|_| {
@@ -413,10 +626,65 @@ mod tests {
             sigs.push(t.await.unwrap());
         }
         assert!(sigs.iter().all(|s| s == &sigs[0]));
-        // Coalesced: exactly one miss did the signing, the rest waited on it.
-        let stats = signer.cache_stats();
-        assert_eq!(stats.misses, 1);
-        assert_eq!(stats.hits, 31);
+        assert_eq!(
+            signer.cache_stats(),
+            SignatureCacheStats {
+                hits: 31,
+                misses: 1
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_context_survives_caller_disconnect() {
+        // The request that started the sign is aborted mid-flight (what axum
+        // does when the client hangs up). The KMS call must still complete
+        // and the next request must reuse it rather than sign again.
+        let signer = Arc::new(Signer::new(TEST_KEY).unwrap().with_test_hook(TestHook {
+            delay: Duration::from_millis(80),
+            fail: false,
+        }));
+        let context = vec![FixedBytes::<32>::from(U256::from(9u64))];
+        let leader = {
+            let signer = Arc::clone(&signer);
+            let context = context.clone();
+            tokio::spawn(async move { signer.sign_context(&context).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        leader.abort();
+        let (sig, _) = signer.sign_context(&context).await.unwrap();
+        assert_eq!(sig.len(), 65);
+        assert_eq!(
+            signer.cache_stats().misses,
+            1,
+            "the orphaned sign was reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_context_failure_fails_all_waiters_then_retries_fresh() {
+        let signer = Arc::new(Signer::new(TEST_KEY).unwrap().with_test_hook(TestHook {
+            delay: Duration::from_millis(30),
+            fail: true,
+        }));
+        let context = vec![FixedBytes::<32>::from(U256::from(3u64))];
+        let started = std::time::Instant::now();
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let signer = Arc::clone(&signer);
+                let context = context.clone();
+                tokio::spawn(async move { signer.sign_context(&context).await.is_err() })
+            })
+            .collect();
+        for t in tasks {
+            assert!(t.await.unwrap(), "every coalesced waiter sees the failure");
+        }
+        // One failed sign, broadcast; nobody retried in series.
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(signer.cache_stats().misses, 1);
+        // The dead slot was evicted: the next request starts a fresh sign.
+        let _ = signer.sign_context(&context).await;
+        assert_eq!(signer.cache_stats().misses, 2);
     }
 
     #[tokio::test]
@@ -456,7 +724,7 @@ mod tests {
     #[test]
     fn test_kms_name_parse_rejects_garbage() {
         assert!(KmsKeyName::parse("not-a-resource-name").is_err());
-        // Key name without an explicit version must be rejected — a version
+        // Key name without an explicit version must be rejected: a version
         // bump changes the signer address, so it must be a deliberate,
         // reviewed config change, never an implicit "latest".
         assert!(KmsKeyName::parse("projects/p/locations/l/keyRings/r/cryptoKeys/k").is_err());
@@ -475,7 +743,7 @@ mod tests {
     ///    elements never panics and always emits a 65-byte EIP-191
     ///    signature plus the configured signer address.
     /// 2. Any two distinct contexts in the same proptest case
-    ///    produce distinct signatures — i.e. the signer can't
+    ///    produce distinct signatures, i.e. the signer can't
     ///    accidentally collapse different inputs onto a single
     ///    signature (which would let a strategy replay the wrong
     ///    price under a fresh hash).

@@ -16,17 +16,26 @@ If Alpaca is temporarily unreachable, the poll loop logs the error and leaves th
 
 ### Signature cache
 
-Every slot the oracle signs (price, publish time, session window, token
-addresses, quote expiry) comes from the pricing frame and the requested
-pair, never from the wall clock or the caller. Two requests for the same
-pair inside one price frame therefore sign byte-identical data, and the
-server keeps a content-addressed cache (`keccak256` of the packed context
-→ signature, 2-minute TTL, 16k entries) so the second request reuses the
-first signature instead of paying for another KMS operation. Concurrent
-identical requests coalesce onto one sign call. Consumers see nothing
+The price, publish time and quote expiry the oracle signs come from the
+pricing frame; the token addresses from the requested pair; the session
+window from the market-hours cache, which changes only at session
+boundaries. Two requests for one pair inside one price frame therefore
+sign byte-identical data, and the server keeps a content-addressed cache
+(`keccak256` of the packed context to signature) so the second request
+reuses the first signature instead of paying for another KMS operation.
+Concurrent requests for bytes already being signed wait on that one sign;
+it runs on its own task, so a client hanging up cannot abort it, and a
+failure fails all waiters at once. Entries live while used (idle TTL 2
+minutes, swept every 256 inserts, 16k hard cap). Consumers see nothing
 different: same bytes, a valid signature, the same expiry.
+
+One caveat: if the market-hours calendar failed to load (the server
+starts anyway and retries hourly) the session window is `now`, the bytes
+change every second and the cache stops helping until the calendar loads.
+
 `oracle_signature_cache_hits_total` / `_misses_total` and
-`oracle_signature_cache_entries` on `/metrics` show the effect.
+`oracle_signature_cache_entries` on `/metrics` show the effect; the KMS
+bill follows the misses.
 
 ## Usage
 
