@@ -5,9 +5,10 @@ pub mod metrics;
 pub mod oracle;
 pub mod pricing_client;
 pub mod registry;
+pub mod reuse;
 pub mod sign;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, FixedBytes, B256};
 use alloy::sol;
 use alloy::sol_types::SolValue;
 use axum::{
@@ -83,6 +84,8 @@ pub struct AppState {
     market_hours: Arc<MarketHoursCache>,
     /// Prometheus exposition format renderer for `/metrics`.
     metrics: MetricsHandle,
+    /// Cross-frame signature reuse for v5/v6 (see `reuse`).
+    reuse: reuse::ReuseCache,
 }
 
 impl AppState {
@@ -101,7 +104,16 @@ impl AppState {
             configured_symbols,
             market_hours,
             metrics,
+            reuse: reuse::ReuseCache::new(config::DEFAULT_REUSE_MIN_REMAINING_SECS),
         }
+    }
+
+    /// Set how many seconds a previous v5/v6 quote must still have before
+    /// its expiry to be served again instead of signing an unchanged price
+    /// under a new publish_time. Zero disables the reuse.
+    pub fn with_signature_reuse(mut self, min_remaining_secs: u64) -> Self {
+        self.reuse = reuse::ReuseCache::new(min_remaining_secs);
+        self
     }
 
     pub fn signer_address(&self) -> Address {
@@ -644,8 +656,45 @@ async fn build_response_from_quote_pair_bound(
         .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
 
     // Same as v1: pick the directional rate and invert it into
-    // Raindex ratio units (Rain-Float precision) — see `pick_rate_bytes`.
+    // Raindex ratio units (Rain-Float precision), see `pick_rate_bytes`.
     let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
+
+    // v5/v6: if the previous signature for this pair states the same price
+    // under the same session for the same tokens and is still good for the
+    // configured margin, serve it instead of signing an unchanged price
+    // under a new publish_time. See the `reuse` module.
+    let reuse_key = reuse::ReuseKey {
+        schema: schema.tag(),
+        symbol: pair.symbol.clone(),
+        direction: pair.direction.as_str(),
+    };
+    let fingerprint = reuse::Fingerprint {
+        price_bytes,
+        session_tag: FixedBytes::<32>::from(session_info.session.to_bytes32_v3()),
+        session_start,
+        session_end,
+        input_token,
+        output_token,
+        nav_ratio: match schema {
+            PairSchema::V6 => quote.nav_ratio.0.into(),
+            PairSchema::V4 | PairSchema::V5 => FixedBytes::<32>::ZERO,
+        },
+    };
+    let signs_expiry = matches!(schema, PairSchema::V5 | PairSchema::V6);
+    if signs_expiry {
+        let now_secs = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
+        if let Some(previous) = state.reuse.lookup(&reuse_key, &fingerprint, now_secs) {
+            ::metrics::counter!("oracle_signature_reuse_total").increment(1);
+            tracing::debug!(
+                symbol = %pair.symbol,
+                direction = pair.direction.as_str(),
+                schema = schema.tag(),
+                source_ts_unix_ms = quote.source_ts_unix_ms,
+                "Price unchanged and previous quote still valid; reusing its signature"
+            );
+            return Ok(previous);
+        }
+    }
 
     tracing::info!(
         symbol = %pair.symbol,
@@ -701,11 +750,20 @@ async fn build_response_from_quote_pair_bound(
     };
     let (signature, signer) = state.signer.sign_context(&context).await?;
 
-    Ok(oracle::OracleResponse {
+    let response = oracle::OracleResponse {
         signer,
         context,
         signature,
-    })
+    };
+    if signs_expiry {
+        state.reuse.store(
+            reuse_key,
+            fingerprint,
+            expiry_from_quote(quote)?,
+            response.clone(),
+        );
+    }
+    Ok(response)
 }
 
 pub enum AppError {

@@ -10,6 +10,36 @@ pub struct Config {
     pub port: u16,
     pub tokens: Vec<TokenEntry>,
     pub pricing: PricingConfig,
+    #[serde(default)]
+    pub signing: SigningConfig,
+}
+
+/// Default margin for cross-frame signature reuse (see `reuse`): a
+/// previous v5/v6 quote is served again only while it still has at least
+/// this many seconds before its expiry. Pricing stamps expiry 20 to 30s
+/// after the frame, so 10s leaves a taker a real settlement window.
+pub const DEFAULT_REUSE_MIN_REMAINING_SECS: u64 = 10;
+
+/// Signing economics. Optional `[signing]` table in the TOML.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SigningConfig {
+    /// Seconds a previous v5/v6 quote must still have before its expiry to
+    /// be reused instead of signing an unchanged price under a new
+    /// publish_time. 0 disables reuse (every new frame is signed).
+    #[serde(default = "default_reuse_min_remaining_secs")]
+    pub reuse_min_remaining_secs: u64,
+}
+
+impl Default for SigningConfig {
+    fn default() -> Self {
+        Self {
+            reuse_min_remaining_secs: DEFAULT_REUSE_MIN_REMAINING_SECS,
+        }
+    }
+}
+
+fn default_reuse_min_remaining_secs() -> u64 {
+    DEFAULT_REUSE_MIN_REMAINING_SECS
 }
 
 #[derive(Debug, Clone, Deserialize)]

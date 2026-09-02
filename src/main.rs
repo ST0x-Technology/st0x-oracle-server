@@ -209,7 +209,8 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(3600),
     );
 
-    let state = AppState::new(signer, registry, pricing, symbols, market_hours, metrics);
+    let state = AppState::new(signer, registry, pricing, symbols, market_hours, metrics)
+        .with_signature_reuse(config.signing.reuse_min_remaining_secs);
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));

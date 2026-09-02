@@ -37,6 +37,25 @@ change every second and the cache stops helping until the calendar loads.
 `oracle_signature_cache_entries` on `/metrics` show the effect; the KMS
 bill follows the misses.
 
+### Reusing a signature across frames (v5, v6)
+
+A new price frame every few seconds does not mean a new price. When the
+frame for a pair carries the same price as the one already signed, under
+the same session and for the same tokens, the oracle serves the previous
+signature again as long as that quote still has at least
+`signing.reuse_min_remaining_secs` (default 10) before its expiry. The
+taker gets an older publish time and the original expiry, both in the
+signed bytes, so it can judge freshness itself. A moving price still gets
+a fresh signature on every frame. v1 and v4 sign no expiry and are never
+reused. Set the value to 0 in `config.toml` to sign every frame:
+
+```toml
+[signing]
+reuse_min_remaining_secs = 10
+```
+
+`oracle_signature_reuse_total` counts the KMS calls this avoided.
+
 ## Usage
 
 ```bash
