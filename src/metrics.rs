@@ -76,6 +76,22 @@ impl MetricsHandle {
             "oracle_missing_symbols",
             "Configured symbols that have never been cached (broker positions absent at startup, or wiped mid-run)"
         );
+        metrics::describe_counter!(
+            "oracle_signature_cache_hits_total",
+            "Signed-context requests served from the signature cache (finished or in-flight signature for identical bytes); no KMS call"
+        );
+        metrics::describe_counter!(
+            "oracle_signature_cache_misses_total",
+            "Signed-context requests that started a KMS AsymmetricSign; the KMS bill scales with this, not with requests"
+        );
+        metrics::describe_counter!(
+            "oracle_signature_reuse_total",
+            "v5/v6 responses answered with the previous frame's signature because the price was unchanged and that quote's expiry was still ahead by the configured margin; each one is a KMS call not made"
+        );
+        metrics::describe_gauge!(
+            "oracle_signature_cache_entries",
+            "Signatures currently held in the content-addressed cache (idle TTL 120s, swept every 256 inserts)"
+        );
     }
 
     pub fn render(&self) -> String {

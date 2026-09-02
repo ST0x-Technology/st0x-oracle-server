@@ -14,6 +14,48 @@ Serves `SignedContextV1` data using real-time Alpaca NBBO quotes, enabling Raind
 
 If Alpaca is temporarily unreachable, the poll loop logs the error and leaves the previous cached quote in place. The Rainlang strategy bounds freshness via a `max-staleness` guard against `block.timestamp`.
 
+### Signature cache
+
+The price, publish time and quote expiry the oracle signs come from the
+pricing frame; the token addresses from the requested pair; the session
+window from the market-hours cache, which changes only at session
+boundaries. Two requests for one pair inside one price frame therefore
+sign byte-identical data, and the server keeps a content-addressed cache
+(`keccak256` of the packed context to signature) so the second request
+reuses the first signature instead of paying for another KMS operation.
+Concurrent requests for bytes already being signed wait on that one sign;
+it runs on its own task, so a client hanging up cannot abort it, and a
+failure fails all waiters at once. Entries live while used (idle TTL 2
+minutes, swept every 256 inserts, 16k hard cap). Consumers see nothing
+different: same bytes, a valid signature, the same expiry.
+
+One caveat: if the market-hours calendar failed to load (the server
+starts anyway and retries hourly) the session window is `now`, the bytes
+change every second and the cache stops helping until the calendar loads.
+
+`oracle_signature_cache_hits_total` / `_misses_total` and
+`oracle_signature_cache_entries` on `/metrics` show the effect; the KMS
+bill follows the misses.
+
+### Reusing a signature across frames (v5, v6)
+
+A new price frame every few seconds does not mean a new price. When the
+frame for a pair carries the same price as the one already signed, under
+the same session and for the same tokens, the oracle serves the previous
+signature again as long as that quote still has at least
+`signing.reuse_min_remaining_secs` (default 10) before its expiry. The
+taker gets an older publish time and the original expiry, both in the
+signed bytes, so it can judge freshness itself. A moving price still gets
+a fresh signature on every frame. v1 and v4 sign no expiry and are never
+reused. Set the value to 0 in `config.toml` to sign every frame:
+
+```toml
+[signing]
+reuse_min_remaining_secs = 10
+```
+
+`oracle_signature_reuse_total` counts the KMS calls this avoided.
+
 ## Usage
 
 ```bash

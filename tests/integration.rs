@@ -1227,3 +1227,158 @@ async fn test_v5_response_is_v6_minus_nav_ratio() {
     assert_eq!(v5_version.format().unwrap(), "5");
     assert_eq!(&v5[1..9], &v6[1..9], "v6 must extend v5 without changes");
 }
+
+// ---------------------------------------------------------------------------
+// Cross-frame signature reuse (v5/v6): an unchanged price under a new frame
+// is answered with the previous, still-valid signature.
+
+/// App plus a handle on its pricing cache so a test can push new frames.
+async fn reuse_test_app(reuse_min_remaining_secs: u64) -> (axum::Router, LiveClient) {
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
+    let pricing = LiveClient::with_seeded(vec![]).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        pricing.clone(),
+        vec!["COIN".to_string()],
+        always_in_session_market_hours().await,
+        metrics,
+    )
+    .with_signature_reuse(reuse_min_remaining_secs);
+    (create_app(state), pricing)
+}
+
+/// A COIN frame at `price` USDC, stamped `source_ts_secs`, expiring
+/// `expires_in_secs` after NOW (the reuse margin is measured against the
+/// wall clock, so the expiry must be too).
+fn frame(price: &str, source_ts_secs: i64, expires_in_secs: i64) -> Quote {
+    let inv = Float::parse(price.to_string())
+        .unwrap()
+        .inv()
+        .unwrap()
+        .format()
+        .unwrap();
+    let mut q = fake_quote("COIN", WCOIN, &inv, price);
+    q.source_ts_unix_ms = source_ts_secs * 1000;
+    q.expiry_unix_ms = (Utc::now().timestamp() + expires_in_secs) * 1000;
+    q
+}
+
+async fn response_of(app: axum::Router, endpoint: &str) -> OracleResponse {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let mut responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(responses.len(), 1);
+    responses.pop().unwrap()
+}
+
+/// Slot 2 (publish_time) rendered the same way a `Float::parse` of the
+/// expected seconds would render, so tests compare strings, not floats.
+fn publish_time_of(r: &OracleResponse) -> String {
+    Float::from(B256::from(r.context[2])).format().unwrap()
+}
+
+fn secs(s: i64) -> String {
+    Float::parse(s.to_string()).unwrap().format().unwrap()
+}
+
+#[tokio::test]
+async fn test_v5_unchanged_price_reuses_previous_signature() {
+    let (app, pricing) = reuse_test_app(10).await;
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME, 60)).await;
+    let first = response_of(app.clone(), "/context/v5").await;
+    assert_eq!(publish_time_of(&first), secs(FIXED_PUBLISH_TIME));
+
+    // Next frame, five seconds later, same price: the previous signature
+    // is still good for ~60s, so it is served again unchanged.
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME + 5, 60)).await;
+    let second = response_of(app.clone(), "/context/v5").await;
+    assert_eq!(
+        second.context, first.context,
+        "same bytes, publish_time not advanced"
+    );
+    assert_eq!(second.signature, first.signature);
+
+    // The price moves: a fresh signature on the new frame.
+    pricing
+        .seed(frame("101", FIXED_PUBLISH_TIME + 10, 60))
+        .await;
+    let third = response_of(app, "/context/v5").await;
+    assert_eq!(publish_time_of(&third), secs(FIXED_PUBLISH_TIME + 10));
+    assert_ne!(third.context[1], first.context[1], "price slot moved");
+    assert_ne!(third.signature, first.signature);
+}
+
+#[tokio::test]
+async fn test_v5_near_expiry_quote_is_not_reused() {
+    let (app, pricing) = reuse_test_app(10).await;
+    // Only 6s of validity left: under the 10s margin, so never reused.
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME, 6)).await;
+    let first = response_of(app.clone(), "/context/v5").await;
+
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME + 5, 6)).await;
+    let second = response_of(app, "/context/v5").await;
+    assert_eq!(publish_time_of(&second), secs(FIXED_PUBLISH_TIME + 5));
+    assert_ne!(second.context, first.context);
+}
+
+#[tokio::test]
+async fn test_v4_never_reuses_across_frames() {
+    // v4 signs no expiry, so the taker cannot see how old a reused quote
+    // would be; it always gets the newest frame.
+    let (app, pricing) = reuse_test_app(10).await;
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME, 60)).await;
+    let first = response_of(app.clone(), "/context/v4").await;
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME + 5, 60)).await;
+    let second = response_of(app, "/context/v4").await;
+    assert_eq!(publish_time_of(&second), secs(FIXED_PUBLISH_TIME + 5));
+    assert_ne!(second.context, first.context);
+}
+
+#[tokio::test]
+async fn test_reuse_disabled_signs_every_frame() {
+    let (app, pricing) = reuse_test_app(0).await;
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME, 60)).await;
+    let first = response_of(app.clone(), "/context/v5").await;
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME + 5, 60)).await;
+    let second = response_of(app, "/context/v5").await;
+    assert_eq!(publish_time_of(&second), secs(FIXED_PUBLISH_TIME + 5));
+    assert_ne!(second.context, first.context);
+}
+
+#[tokio::test]
+async fn test_v6_reuse_requires_same_nav_ratio() {
+    let (app, pricing) = reuse_test_app(10).await;
+    let mut q = frame("100", FIXED_PUBLISH_TIME, 60);
+    q.nav_ratio = nav_ratio_pattern();
+    pricing.seed(q).await;
+    let first = response_of(app.clone(), "/context/v6").await;
+
+    // Same price, new frame, same ratio: reused.
+    let mut q = frame("100", FIXED_PUBLISH_TIME + 5, 60);
+    q.nav_ratio = nav_ratio_pattern();
+    pricing.seed(q).await;
+    let second = response_of(app.clone(), "/context/v6").await;
+    assert_eq!(second.context, first.context);
+
+    // Same price, ratio changed: the ratio is signed at slot 9, so re-sign.
+    let mut q = frame("100", FIXED_PUBLISH_TIME + 10, 60);
+    q.nav_ratio = WireU256::from_bytes(U256::from(NAV_RATIO_RAW + 1).to_be_bytes());
+    pricing.seed(q).await;
+    let third = response_of(app, "/context/v6").await;
+    assert_eq!(publish_time_of(&third), secs(FIXED_PUBLISH_TIME + 10));
+    assert_ne!(third.context[9], first.context[9]);
+}
