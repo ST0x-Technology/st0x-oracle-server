@@ -91,7 +91,62 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
         // Zero = the "no ratio" sentinel. Tests that exercise the v6
         // NAV-ratio slot overwrite this with a full-entropy pattern.
         nav_ratio: WireU256::ZERO,
+        // A pre-v0.7.0 producer states nothing about the session, which
+        // is what every legacy test below exercises: those responses
+        // come from the oracle's own fallback calendar. Tests of the
+        // per-quote path use `fake_quote_stating` instead.
+        session: None,
+        session_start_unix_ms: None,
+        session_end_unix_ms: None,
     }
+}
+
+/// A quote whose producer states which session it priced in, and the
+/// bounds of that session. `start` / `end` are offsets from `now`.
+fn fake_quote_stating(
+    symbol: &str,
+    base_token: &str,
+    session: &str,
+    start: ChronoDuration,
+    end: ChronoDuration,
+) -> Quote {
+    // Whole-second bounds on purpose: the sub-second inward rounding is
+    // pinned by the `wire_session` unit tests, so these fixtures stay
+    // about which session is signed, not about rounding.
+    let now = Utc::now().timestamp();
+    let mut q = fake_quote(symbol, base_token, "0.01", "100");
+    q.session = Some(session.to_string());
+    q.session_start_unix_ms = Some((now + start.num_seconds()) * 1000);
+    q.session_end_unix_ms = Some((now + end.num_seconds()) * 1000);
+    q
+}
+
+/// Build a test app over hand-built quotes. `entries` are
+/// `(token_address, symbol)` registry pairs; `quotes` are seeded into
+/// the pricing cache verbatim so a test can state session fields the
+/// price-driven `test_app_with` helpers cannot express.
+async fn test_app_quotes(
+    entries: &[(&str, &str)],
+    quotes: Vec<Quote>,
+    market_hours: Arc<MarketHoursCache>,
+) -> axum::Router {
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry_entries: Vec<(String, String)> = entries
+        .iter()
+        .map(|(addr, sym)| (addr.to_string(), sym.to_string()))
+        .collect();
+    let registry = TokenRegistry::new(registry_entries, USDC).unwrap();
+    let configured_symbols: Vec<String> = entries.iter().map(|(_, s)| s.to_string()).collect();
+    let pricing = LiveClient::with_seeded(quotes).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    create_app(AppState::new(
+        signer,
+        registry,
+        pricing,
+        configured_symbols,
+        market_hours,
+        metrics,
+    ))
 }
 
 /// A full-entropy 18-decimal fixed-point NAV ratio — every decimal
@@ -1226,4 +1281,321 @@ async fn test_v5_response_is_v6_minus_nav_ratio() {
     let v5_version = Float::from(alloy::primitives::B256::from(v5[0]));
     assert_eq!(v5_version.format().unwrap(), "5");
     assert_eq!(&v5[1..9], &v6[1..9], "v6 must extend v5 without changes");
+}
+
+// ---------------------------------------------------------------------
+// Per-quote session (P13)
+//
+// The producer prices the quote, clamps its expiry to the session
+// boundary, and states which session that was. The oracle signs that
+// statement instead of re-deriving one from its own US calendar. Every
+// test below is built so the two paths give DIFFERENT answers for the
+// same fixture — otherwise it would pass whichever path ran.
+// ---------------------------------------------------------------------
+
+const WFALL: &str = "0x3333333333333333333333333333333333333333";
+const WDISA: &str = "0x4444444444444444444444444444444444444444";
+const WPAST: &str = "0x5555555555555555555555555555555555555555";
+const WBADT: &str = "0x6666666666666666666666666666666666666666";
+
+/// POST one (USDC -> `token`) request to `endpoint`, returning the raw
+/// status alongside the decoded responses (empty on a non-200).
+async fn post_one(
+    app: axum::Router,
+    endpoint: &str,
+    token: &str,
+) -> (axum::http::StatusCode, Vec<OracleResponse>) {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, token)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let responses = if status == 200 {
+        serde_json::from_slice(&bytes).unwrap()
+    } else {
+        Vec::new()
+    };
+    (status, responses)
+}
+
+/// Scrape `/metrics` and return the sample value of the one series
+/// whose line names `metric` and carries every fragment in `labels`.
+/// Label ORDER in the exposition text is the exporter's business, so
+/// this matches on containment rather than on a rendered label set.
+async fn metric_value(app: axum::Router, metric: &str, labels: &[&str]) -> Option<f64> {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .find(|l| l.starts_with(metric) && labels.iter().all(|f| l.contains(f)))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+}
+
+fn secs_of(ctx: &[FixedBytes<32>], slot: usize) -> u64 {
+    U256::from_be_bytes::<32>(ctx[slot].into()).to::<u64>()
+}
+
+/// A quote that states `premarket` served against a calendar that says
+/// `rth`: the producer's statement is what gets signed, tag AND bounds.
+/// Both paths are live for this fixture and they disagree, so neither
+/// the tag nor the bounds can be right by coincidence.
+#[tokio::test]
+async fn test_v5_signs_the_quotes_stated_session_over_the_oracles_calendar() {
+    let start = ChronoDuration::hours(3);
+    let end = ChronoDuration::hours(5);
+    let quote = fake_quote_stating("DISAGR", WDISA, "premarket", -start, end);
+    let (want_start, want_end) = (
+        quote.session_start_unix_ms.unwrap() / 1000,
+        quote.session_end_unix_ms.unwrap() / 1000,
+    );
+    let app = test_app_quotes(
+        &[(WDISA, "DISAGR")],
+        vec![quote],
+        // Classifies `now` as rth, with bounds nowhere near the
+        // quote's — so a fallback would be visible in all three slots.
+        always_in_session_market_hours().await,
+    )
+    .await;
+
+    let (status, responses) = post_one(app.clone(), "/context/v5", WDISA).await;
+    assert_eq!(status, 200);
+    let ctx = &responses[0].context;
+    assert_eq!(decode_session_tag_v3(ctx[3]), "premarket");
+    assert_eq!(secs_of(ctx, 4), want_start as u64);
+    assert_eq!(secs_of(ctx, 5), want_end as u64);
+
+    // The disagreement is signed as the producer stated it, but it is
+    // never silent: the oracle's own calendar said `rth`.
+    let disagreements = metric_value(
+        app,
+        "oracle_session_disagreement_total",
+        &[
+            r#"symbol="DISAGR""#,
+            r#"stated="premarket""#,
+            r#"local="rth""#,
+        ],
+    )
+    .await;
+    assert_eq!(
+        disagreements,
+        Some(1.0),
+        "a producer/calendar disagreement must be counted"
+    );
+}
+
+/// v4 signs the same session slots as v5; the per-quote path is not a
+/// v5-only change.
+#[tokio::test]
+async fn test_v4_signs_the_quotes_stated_session_too() {
+    let app = test_app_quotes(
+        &[(WCOIN, "COIN")],
+        vec![fake_quote_stating(
+            "COIN",
+            WCOIN,
+            "afterhours",
+            -ChronoDuration::hours(1),
+            ChronoDuration::hours(1),
+        )],
+        always_in_session_market_hours().await,
+    )
+    .await;
+    let (status, responses) = post_one(app, "/context/v4", WCOIN).await;
+    assert_eq!(status, 200);
+    assert_eq!(decode_session_tag_v3(responses[0].context[3]), "afterhours");
+}
+
+/// A pre-v0.7.0 producer states nothing. The oracle falls back to its
+/// own calendar rather than refusing — and counts the fallback, because
+/// a fallback that fires forever in production is a silent regression
+/// to the behaviour this change removes.
+#[tokio::test]
+async fn test_v5_falls_back_to_the_local_calendar_when_the_quote_states_nothing() {
+    let now = Utc::now();
+    let mh = Arc::new(MarketHoursCache::new());
+    let window = SessionWindow {
+        date: now.date_naive(),
+        session_open: now - ChronoDuration::hours(12),
+        rth_open: now - ChronoDuration::hours(8),
+        rth_close: now - ChronoDuration::hours(1),
+        session_close: now + ChronoDuration::hours(2),
+    };
+    mh.set(vec![window.clone()]).await;
+
+    let app = test_app_quotes(
+        &[(WFALL, "FALLBK")],
+        vec![fake_quote("FALLBK", WFALL, "0.01", "100")],
+        mh,
+    )
+    .await;
+
+    let (status, responses) = post_one(app.clone(), "/context/v5", WFALL).await;
+    assert_eq!(status, 200);
+    let ctx = &responses[0].context;
+    // The calendar's afterhours sub-window, not the quote's (it has none).
+    assert_eq!(decode_session_tag_v3(ctx[3]), "afterhours");
+    assert_eq!(secs_of(ctx, 4), window.rth_close.timestamp() as u64);
+    assert_eq!(secs_of(ctx, 5), window.session_close.timestamp() as u64);
+
+    assert_eq!(
+        metric_value(
+            app,
+            "oracle_session_fallback_total",
+            &[r#"symbol="FALLBK""#]
+        )
+        .await,
+        Some(1.0),
+        "every local-calendar fallback must be counted"
+    );
+}
+
+/// Control for the two rejection tests below: this exact fixture, with
+/// a session that has NOT ended and a tag the oracle recognises, is
+/// served. So a 503 in either mutation is caused by the mutation.
+#[tokio::test]
+async fn test_v5_serves_the_control_fixture_the_rejection_tests_mutate() {
+    let app = test_app_quotes(
+        &[(WPAST, "PASTEND")],
+        vec![fake_quote_stating(
+            "PASTEND",
+            WPAST,
+            "rth",
+            -ChronoDuration::hours(2),
+            ChronoDuration::hours(2),
+        )],
+        always_in_session_market_hours().await,
+    )
+    .await;
+    let (status, _) = post_one(app, "/context/v5", WPAST).await;
+    assert_eq!(status, 200);
+}
+
+/// A session that ended before the request is a producer whose view of
+/// the market outlived the market. Signing it would hand a taker a
+/// context the on-chain `now() <= session-end` guard reverts on. The
+/// oracle's own calendar says we are mid-RTH, so a fallback here would
+/// paper straight over it — the refusal has to come from the quote.
+#[tokio::test]
+async fn test_v5_refuses_a_quote_whose_stated_session_has_ended() {
+    let app = test_app_quotes(
+        &[(WPAST, "PASTEND")],
+        vec![fake_quote_stating(
+            "PASTEND",
+            WPAST,
+            "rth",
+            -ChronoDuration::hours(2),
+            -ChronoDuration::seconds(1),
+        )],
+        always_in_session_market_hours().await,
+    )
+    .await;
+    let (status, _) = post_one(app.clone(), "/context/v5", WPAST).await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        metric_value(
+            app,
+            "oracle_session_refused_total",
+            &[r#"symbol="PASTEND""#, r#"reason="session_ended""#]
+        )
+        .await,
+        Some(1.0),
+    );
+}
+
+/// A tag the oracle does not recognise must never reach a signature —
+/// including the two closed tags its own classifier emits, which a
+/// closed market can never produce a quote for. Refusing this asset is
+/// not the same as crashing: the process stays up and other symbols
+/// keep serving (pinned by the batch test below).
+#[tokio::test]
+async fn test_v5_refuses_a_quote_with_an_unrecognised_session_tag() {
+    for tag in ["overnight_closed", "lunch_auction"] {
+        let app = test_app_quotes(
+            &[(WBADT, "BADTAG")],
+            vec![fake_quote_stating(
+                "BADTAG",
+                WBADT,
+                tag,
+                -ChronoDuration::hours(2),
+                ChronoDuration::hours(2),
+            )],
+            always_in_session_market_hours().await,
+        )
+        .await;
+        let (status, _) = post_one(app, "/context/v5", WBADT).await;
+        assert_eq!(status, 503, "tag {tag} must not be signed");
+    }
+}
+
+/// The point of the whole change: one HTTP batch, two symbols priced in
+/// two different sessions, two different signed tags and bound pairs. A
+/// batch-level session classification is structurally unable to do
+/// this, which is why the old one had to go.
+#[tokio::test]
+async fn test_v5_batch_signs_a_different_session_per_symbol() {
+    let rth = fake_quote_stating(
+        "COIN",
+        WCOIN,
+        "rth",
+        -ChronoDuration::hours(1),
+        ChronoDuration::hours(3),
+    );
+    let after = fake_quote_stating(
+        "DRAM",
+        WDRAM,
+        "afterhours",
+        -ChronoDuration::hours(6),
+        ChronoDuration::hours(9),
+    );
+    let (rth_end, after_end) = (
+        rth.session_end_unix_ms.unwrap() / 1000,
+        after.session_end_unix_ms.unwrap() / 1000,
+    );
+    let app = test_app_quotes(
+        &[(WCOIN, "COIN"), (WDRAM, "DRAM")],
+        vec![rth, after],
+        always_in_session_market_hours().await,
+    )
+    .await;
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v5")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_batch(&[
+                    (USDC, WCOIN),
+                    (USDC, WDRAM),
+                ])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(decode_session_tag_v3(responses[0].context[3]), "rth");
+    assert_eq!(decode_session_tag_v3(responses[1].context[3]), "afterhours");
+    assert_eq!(secs_of(&responses[0].context, 5), rth_end as u64);
+    assert_eq!(secs_of(&responses[1].context, 5), after_end as u64);
+    assert_ne!(responses[0].context[5], responses[1].context[5]);
 }

@@ -72,6 +72,18 @@ impl MetricsHandle {
             "oracle_configured_symbols",
             "Number of symbols declared in config.toml — joined with oracle_missing_symbols on the dashboard for a coverage view"
         );
+        metrics::describe_counter!(
+            "oracle_session_fallback_total",
+            "Responses whose session slots came from the oracle's own US calendar because the pricing quote stated none (pre-v0.7.0 producer). Labelled by symbol. This should roll to a flat zero as producers upgrade; a symbol still counting here is signing a session the producer never asserted"
+        );
+        metrics::describe_counter!(
+            "oracle_session_disagreement_total",
+            "Requests where the pricing quote's stated session differed from the oracle's own calendar. The quote is authoritative and is what gets signed; this counter exists so the divergence is never silent. Labelled by symbol, stated and local"
+        );
+        metrics::describe_counter!(
+            "oracle_session_refused_total",
+            "Requests refused (503) because the quote's stated session could not be signed: unknown tag, partial fields, out-of-range or incoherent bounds, or a session that already ended. Labelled by symbol and reason"
+        );
         metrics::describe_gauge!(
             "oracle_missing_symbols",
             "Configured symbols that have never been cached (broker positions absent at startup, or wiped mid-run)"

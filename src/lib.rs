@@ -24,11 +24,13 @@ use sign::Signer;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::market_hours::MarketHoursCache;
+use crate::market_hours::{
+    wire_session, MarketHoursCache, SessionInfo, SessionSource, WireSession,
+};
 use crate::metrics::MetricsHandle;
 use crate::pricing_client::LiveClient;
 use crate::registry::{PriceDirection, ResolvedPair, TokenRegistry};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use st0x_pricing_types::Quote;
 
 sol! {
@@ -76,10 +78,18 @@ pub struct AppState {
     /// Every symbol declared in config.toml. /status compares this
     /// against the pricing cache to surface the partial-serving set.
     configured_symbols: Vec<String>,
-    /// Market-hours source from Alpaca's calendar, used ONLY to classify
-    /// the current session for the v4/v5 session slots (tag +
-    /// start/end bounds). `publish_time` comes from the pricing quote's
-    /// own `source_ts_unix_ms`, not from this cache.
+    /// Market-hours source from Alpaca's calendar. DEMOTED (P13): the
+    /// session slots a response signs come from the pricing quote's own
+    /// `session*` fields; this cache is only the fallback for a
+    /// pre-v0.7.0 producer that states nothing, and the baseline the
+    /// oracle compares a stated session against so a disagreement is
+    /// visible. `publish_time` has never come from here — it is the
+    /// quote's `source_ts_unix_ms`.
+    ///
+    /// It is a US calendar and the oracle will never have an XPAR or
+    /// XETR one, so the fallback is US-only by construction. Once
+    /// `oracle_session_fallback_total` has been flat at zero across the
+    /// fleet, this whole module can go.
     market_hours: Arc<MarketHoursCache>,
     /// Prometheus exposition format renderer for `/metrics`.
     metrics: MetricsHandle,
@@ -377,9 +387,19 @@ async fn post_signed_context_pair_bound(
     let needed_symbols: Vec<&str> = resolved.iter().map(|(_, _, p)| p.symbol.as_str()).collect();
     let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
 
-    // Session classification is snapshot once per batch; publish_time is
-    // per-quote (the pricing quote's own source_ts), read inside the builder.
-    let session_info = state.market_hours.session_info_for(Utc::now()).await;
+    // One `now` for the whole batch, so every element of one response
+    // judges its session against the same instant.
+    //
+    // The oracle no longer signs a batch-level session classification —
+    // a batch mixing a US and a European name is structurally unable to
+    // be right about both, and even for a pure US batch the oracle's
+    // calendar and the producer's are two independently refreshed views
+    // of "now" that no test in either repo could catch disagreeing.
+    // What is snapshotted here is the FALLBACK: used only for a quote
+    // that states no session of its own, and otherwise only as the
+    // baseline a stated session is compared against.
+    let now = Utc::now();
+    let local_session = state.market_hours.session_info_for(now).await;
 
     let mut responses = Vec::with_capacity(resolved.len());
     for (input_token, output_token, pair) in &resolved {
@@ -395,7 +415,8 @@ async fn post_signed_context_pair_bound(
             &quote,
             *input_token,
             *output_token,
-            &session_info,
+            &local_session,
+            now,
             schema,
         )
         .await?;
@@ -612,6 +633,100 @@ async fn build_response_from_quote(
     })
 }
 
+/// Decide the session slots for one quote, and say where they came
+/// from.
+///
+/// The pricing service is authoritative by design: it prices the quote,
+/// clamps `expiry_unix_ms` to the session boundary, and states the
+/// session it did that in. Signing its statement means the expiry and
+/// the session bounds in one signed context can never come from two
+/// different views of the calendar. It is also the only arrangement
+/// that can serve a batch mixing venues — the oracle has no XPAR or
+/// XETR calendar and is not going to grow one.
+///
+/// Three outcomes:
+///
+/// - **Stated** — signed as given. If it disagrees with the oracle's
+///   own calendar the quote still wins, but the disagreement is logged
+///   and counted: the producer being authoritative is a decision, and a
+///   decision is not a reason to stop looking. (Once European names
+///   reach the oracle this counter is expected non-zero for them, which
+///   is why it is labelled per symbol.)
+/// - **Absent** — a pre-v0.7.0 producer. Falls back to the oracle's US
+///   calendar, exactly as before this change, and counts it. A fallback
+///   that fires forever in production is a silent regression to the
+///   two-calendar behaviour, so it has to be visible on a dashboard
+///   rather than in a log line nobody greps.
+/// - **Refused** — an unrecognised tag, a partial statement, an
+///   unrepresentable or incoherent bound, or a session that has already
+///   ended. Never downgraded to the fallback: substituting the oracle's
+///   answer for a producer statement the oracle could not accept is the
+///   divergence, not the cure. The request 503s, which is what this
+///   handler already does for any asset it cannot serve — the process
+///   stays up and unrelated symbols keep serving.
+fn session_info_for_quote(
+    symbol: &str,
+    quote: &Quote,
+    local_session: &SessionInfo,
+    now: DateTime<Utc>,
+) -> Result<(SessionInfo, SessionSource), AppError> {
+    match wire_session(
+        quote.session.as_deref(),
+        quote.session_start_unix_ms,
+        quote.session_end_unix_ms,
+        now,
+    ) {
+        Ok(WireSession::Stated(info)) => {
+            if info.session != local_session.session {
+                tracing::warn!(
+                    symbol = %symbol,
+                    stated = info.session.as_str(),
+                    local = local_session.session.as_str(),
+                    "Pricing quote's session disagrees with the oracle's calendar; signing the quote's"
+                );
+                ::metrics::counter!(
+                    "oracle_session_disagreement_total",
+                    "symbol" => symbol.to_string(),
+                    "stated" => info.session.as_str(),
+                    "local" => local_session.session.as_str(),
+                )
+                .increment(1);
+            }
+            Ok((info, SessionSource::Quote))
+        }
+        Ok(WireSession::Absent) => {
+            tracing::warn!(
+                symbol = %symbol,
+                local = local_session.session.as_str(),
+                "Pricing quote states no session (producer predates types v0.7.0); \
+                 falling back to the oracle's own calendar"
+            );
+            ::metrics::counter!(
+                "oracle_session_fallback_total",
+                "symbol" => symbol.to_string(),
+            )
+            .increment(1);
+            Ok((local_session.clone(), SessionSource::LocalCalendar))
+        }
+        Err(e) => {
+            tracing::warn!(
+                symbol = %symbol,
+                error = %e,
+                "Refusing to sign a quote whose stated session cannot be signed"
+            );
+            ::metrics::counter!(
+                "oracle_session_refused_total",
+                "symbol" => symbol.to_string(),
+                "reason" => e.reason(),
+            )
+            .increment(1);
+            Err(AppError::Unavailable(format!(
+                "Cannot sign a session for {symbol}: {e}"
+            )))
+        }
+    }
+}
+
 /// Pair-bound response builder (v4/v5/v6). Same price + publish_time
 /// logic as v1's `build_response_from_quote`, plus the session slots
 /// and the caller's raw input/output token addresses stamped into
@@ -625,13 +740,16 @@ async fn build_response_from_quote_pair_bound(
     quote: &Quote,
     input_token: Address,
     output_token: Address,
-    session_info: &crate::market_hours::SessionInfo,
+    local_session: &SessionInfo,
+    now: DateTime<Utc>,
     schema: PairSchema,
 ) -> Result<oracle::OracleResponse, AppError> {
     // publish_time is the pricing quote's source_ts (see
-    // `build_response_from_quote`); session slots come from the oracle's
-    // own market-hours classification.
+    // `build_response_from_quote`); the session slots come from the
+    // quote too, with the oracle's own calendar as the fallback.
     let publish_time = publish_time_from_quote(quote)?;
+    let (session_info, session_source) =
+        session_info_for_quote(&pair.symbol, quote, local_session, now)?;
     let session_start: u64 = session_info
         .start
         .timestamp()
@@ -655,6 +773,7 @@ async fn build_response_from_quote_pair_bound(
         output = %output_token,
         publish_time = publish_time,
         session = session_info.session.as_str(),
+        session_source = session_source.as_str(),
         session_start = session_start,
         session_end = session_end,
         source_ts_unix_ms = quote.source_ts_unix_ms,

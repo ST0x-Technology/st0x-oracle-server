@@ -10,9 +10,23 @@
 //!    time (not sign time) means a stalled poll loop can't hide: `t`
 //!    stops advancing and the timestamp ages out.
 //!
-//! 2. **Session classification (`session_info_for`).** The v2/v3/v4
+//! 2. **Session classification (`session_info_for`).** The v4/v5/v6
 //!    signed context carries the session tag (slot 3) plus the UTC
 //!    start/end bounds (slots 4/5); strategies gate on those.
+//!
+//!    **Demoted (P13).** Those slots now come from the pricing quote's
+//!    own `session` / `session_start_unix_ms` / `session_end_unix_ms`
+//!    (`wire_session` below) — the producer already clamps the quote's
+//!    expiry to the session boundary, so taking the session from the
+//!    same place means one calendar instead of two independently
+//!    refreshed ones that no test in either repo could catch
+//!    disagreeing. This classifier is kept for two jobs only: the
+//!    fallback for a producer that predates types v0.7.0 and states
+//!    nothing, and the baseline a stated session is compared against so
+//!    a disagreement is counted rather than silent. It is a US calendar
+//!    and there will never be an XPAR or XETR one here; once
+//!    `oracle_session_fallback_total` is flat at zero fleet-wide it can
+//!    be deleted.
 //!
 //! This is the fetch-time refinement of RAI-693: the frozen-out-of-session
 //! mark still gets a stale timestamp, but now it's decided when the price
@@ -64,6 +78,25 @@ impl Session {
         }
     }
 
+    /// Parse a session tag off the pricing wire.
+    ///
+    /// Only the three TRADEABLE tags are accepted. The two closed
+    /// variants round-trip through `as_str` but are deliberately NOT
+    /// parseable: a closed market produces no quote, so a frame
+    /// carrying `"overnight_closed"` is a producer fault, and
+    /// `st0x-fixed-spread-v5.rain` would reject the signed tag anyway.
+    /// Anything else — a future tag from a newer producer, a typo, a
+    /// fabricated value — is unknown, and an unknown tag must fail
+    /// closed rather than be guessed at.
+    pub fn from_tradeable_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "rth" => Some(Self::Rth),
+            "premarket" => Some(Self::Premarket),
+            "afterhours" => Some(Self::Afterhours),
+            _ => None,
+        }
+    }
+
     /// Encode the session tag as Rain `IntOrAString` **V3** bytes32 —
     /// the exact byte layout the Rainlang parser produces for a `"…"`
     /// string literal via `LibIntOrAString::fromStringV3`. Byte 31 =
@@ -93,6 +126,163 @@ pub struct SessionInfo {
     pub session: Session,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+}
+
+/// How a signed response's session slots were decided.
+///
+/// `Quote` is the design intent: the pricing service prices the quote,
+/// clamps its expiry to the session boundary, and states which session
+/// that was — one calendar, one view of "now". `LocalCalendar` is the
+/// legacy path, kept only so a pre-v0.7.0 producer keeps serving; every
+/// use is counted so the roll-off is observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSource {
+    Quote,
+    LocalCalendar,
+}
+
+impl SessionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quote => "quote",
+            Self::LocalCalendar => "local_calendar",
+        }
+    }
+}
+
+/// What a quote's three optional session fields say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireSession {
+    /// The producer stated a session and both its bounds, and all three
+    /// survived validation. Authoritative — sign it.
+    Stated(SessionInfo),
+    /// The producer said nothing (pre-v0.7.0). Fall back to the local
+    /// calendar.
+    Absent,
+}
+
+/// Why a quote's stated session cannot be signed. Every variant is a
+/// refusal, never a downgrade to the local calendar: a producer that
+/// states a session the oracle cannot sign is a producer whose view of
+/// the market disagrees with the oracle's, and quietly substituting the
+/// oracle's answer is how the two-calendar divergence got here.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WireSessionError {
+    #[error("unrecognised session tag {0:?} (expected rth, premarket or afterhours)")]
+    UnknownTag(String),
+    #[error(
+        "partially stated session (session={session:?}, start={start:?}, end={end:?}): \
+         all three fields must be present or all three absent"
+    )]
+    Partial {
+        session: Option<String>,
+        start: Option<i64>,
+        end: Option<i64>,
+    },
+    #[error("session bound {unix_ms} ms is not a representable instant")]
+    OutOfRange { unix_ms: i64 },
+    #[error("session start {start_unix_ms} ms is not before session end {end_unix_ms} ms")]
+    Incoherent {
+        start_unix_ms: i64,
+        end_unix_ms: i64,
+    },
+    #[error("session already ended: end {end} is not after now {now}")]
+    Ended {
+        end: DateTime<Utc>,
+        now: DateTime<Utc>,
+    },
+}
+
+impl WireSessionError {
+    /// Stable, low-cardinality metric label. Keep these strings fixed —
+    /// the obs dashboard joins on them.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::UnknownTag(_) => "unknown_tag",
+            Self::Partial { .. } => "partial_fields",
+            Self::OutOfRange { .. } => "bound_out_of_range",
+            Self::Incoherent { .. } => "incoherent_bounds",
+            Self::Ended { .. } => "session_ended",
+        }
+    }
+}
+
+/// Interpret a quote's three optional session fields.
+///
+/// Sub-second rounding is deliberately asymmetric: the start rounds UP
+/// and the end rounds DOWN, so the whole-second window the oracle signs
+/// is always a subset of the sub-second window the producer stated. The
+/// on-chain guard is `now() >= session_start && now() <= session_end`
+/// (`strategy/st0x-oracle-limit-v4.rain`), so rounding the other way
+/// would licence up to a second of trading outside the real session.
+/// This is the same "the safe direction is inward" argument
+/// `expiry_from_quote` makes for the expiry.
+///
+/// The already-ended check is applied to the ROUNDED end, not the raw
+/// one: the rounded value is what gets signed and what the chain
+/// compares, so a raw end 400 ms in the future that floors to the
+/// current second must be refused rather than signed into a context
+/// that reverts.
+pub fn wire_session(
+    session: Option<&str>,
+    session_start_unix_ms: Option<i64>,
+    session_end_unix_ms: Option<i64>,
+    now: DateTime<Utc>,
+) -> Result<WireSession, WireSessionError> {
+    let (tag, start_ms, end_ms) = match (session, session_start_unix_ms, session_end_unix_ms) {
+        (None, None, None) => return Ok(WireSession::Absent),
+        (Some(tag), Some(start), Some(end)) => (tag, start, end),
+        (session, start, end) => {
+            return Err(WireSessionError::Partial {
+                session: session.map(str::to_string),
+                start,
+                end,
+            })
+        }
+    };
+
+    let parsed = Session::from_tradeable_tag(tag)
+        .ok_or_else(|| WireSessionError::UnknownTag(tag.to_string()))?;
+
+    let start =
+        round_up_to_second(start_ms).ok_or(WireSessionError::OutOfRange { unix_ms: start_ms })?;
+    let end =
+        round_down_to_second(end_ms).ok_or(WireSessionError::OutOfRange { unix_ms: end_ms })?;
+
+    if start >= end {
+        return Err(WireSessionError::Incoherent {
+            start_unix_ms: start_ms,
+            end_unix_ms: end_ms,
+        });
+    }
+    if end <= now {
+        return Err(WireSessionError::Ended { end, now });
+    }
+
+    Ok(WireSession::Stated(SessionInfo {
+        session: parsed,
+        start,
+        end,
+    }))
+}
+
+/// Millisecond instant rounded DOWN to a whole second. `None` when the
+/// value is not a representable instant.
+fn round_down_to_second(unix_ms: i64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(unix_ms.div_euclid(1000), 0)
+}
+
+/// Millisecond instant rounded UP to a whole second. `None` when the
+/// value is not a representable instant (including when rounding up
+/// would overflow).
+fn round_up_to_second(unix_ms: i64) -> Option<DateTime<Utc>> {
+    let secs = unix_ms.div_euclid(1000);
+    let secs = if unix_ms.rem_euclid(1000) == 0 {
+        secs
+    } else {
+        secs.checked_add(1)?
+    };
+    DateTime::from_timestamp(secs, 0)
 }
 
 /// Rolling cache of session windows around today. Refreshed periodically
@@ -170,7 +360,11 @@ impl MarketHoursCache {
         }
     }
 
-    /// Classify the current market session and return its UTC bounds.
+    /// Classify the current market session and return its UTC bounds
+    /// from the oracle's own Alpaca-fed US calendar.
+    ///
+    /// FALLBACK ONLY (P13) — see the module doc. A response's session
+    /// slots come from the quote unless the producer stated none.
     ///
     /// - Inside an active extended-session window we look at the cached
     ///   `rth_open` / `rth_close` to split into `Premarket` / `Rth` /
@@ -341,6 +535,263 @@ mod tests {
             rth_open: Utc.with_ymd_and_hms(2026, 6, 1, 13, 30, 0).unwrap(),
             rth_close: utc(2026, 6, 1, 20, 0),
             session_close: utc(2026, 6, 2, 0, 0),
+        }
+    }
+
+    // ---- wire_session: the producer's own statement -------------------
+    //
+    // Fixtures below deliberately use non-round millisecond values and a
+    // `now` that sits comfortably inside the stated window, so a case
+    // that is meant to be REJECTED for one reason cannot also be
+    // rejected for another. `wire_ok` is the one fixture every negative
+    // case is a single-field mutation of — and it is asserted to be
+    // accepted, so "rejected" always means "rejected by the mutation".
+
+    /// `now` for the wire fixtures: 2026-05-29 14:30:00 UTC.
+    fn wire_now() -> DateTime<Utc> {
+        utc(2026, 5, 29, 14, 30)
+    }
+
+    const WIRE_START_MS: i64 = 1_780_000_003_001; // .003001 s past a second
+    const WIRE_END_MS: i64 = 1_780_100_009_999;
+
+    fn wire_ok() -> Result<WireSession, WireSessionError> {
+        wire_session(
+            Some("premarket"),
+            Some(WIRE_START_MS),
+            Some(WIRE_END_MS),
+            wire_now(),
+        )
+    }
+
+    /// The control for every negative case below: this exact fixture is
+    /// accepted, so a rejection in a mutated variant is caused by the
+    /// mutation and nothing else.
+    #[test]
+    fn wire_session_control_fixture_is_accepted() {
+        assert!(matches!(wire_ok(), Ok(WireSession::Stated(_))));
+    }
+
+    #[test]
+    fn wire_session_accepts_each_tradeable_tag() {
+        for (tag, expected) in [
+            ("rth", Session::Rth),
+            ("premarket", Session::Premarket),
+            ("afterhours", Session::Afterhours),
+        ] {
+            let got = wire_session(
+                Some(tag),
+                Some(WIRE_START_MS),
+                Some(WIRE_END_MS),
+                wire_now(),
+            );
+            match got {
+                Ok(WireSession::Stated(info)) => assert_eq!(info.session, expected, "tag {tag}"),
+                other => panic!("tag {tag} should be accepted, got {other:?}"),
+            }
+        }
+    }
+
+    /// The two closed tags round-trip through `Session::as_str`, so a
+    /// parser written as the inverse of `as_str` would accept them. It
+    /// must not: a closed market produces no quote, and the on-chain
+    /// session guard only ever compares against the three tradeable
+    /// tags. Everything unrecognised fails closed the same way.
+    #[test]
+    fn wire_session_refuses_every_non_tradeable_tag() {
+        for tag in [
+            "overnight_closed",
+            "weekend_closed",
+            "closed",
+            "RTH",
+            "rth ",
+            "",
+            "lunch_auction",
+        ] {
+            let got = wire_session(
+                Some(tag),
+                Some(WIRE_START_MS),
+                Some(WIRE_END_MS),
+                wire_now(),
+            );
+            assert_eq!(
+                got,
+                Err(WireSessionError::UnknownTag(tag.to_string())),
+                "tag {tag:?} must fail closed"
+            );
+        }
+    }
+
+    /// Nothing stated at all is the pre-v0.7.0 producer, and the only
+    /// case that may fall back to the local calendar.
+    #[test]
+    fn wire_session_with_no_fields_is_absent() {
+        assert_eq!(
+            wire_session(None, None, None, wire_now()),
+            Ok(WireSession::Absent)
+        );
+    }
+
+    /// Any partial statement is incoherent, not a fallback: a producer
+    /// that knows the session but not its bounds cannot have its bounds
+    /// filled in from a different calendar without recreating exactly
+    /// the divergence this change removes.
+    #[test]
+    fn wire_session_refuses_a_partially_stated_session() {
+        let cases: [(Option<&str>, Option<i64>, Option<i64>); 6] = [
+            (Some("rth"), None, None),
+            (Some("rth"), Some(WIRE_START_MS), None),
+            (Some("rth"), None, Some(WIRE_END_MS)),
+            (None, Some(WIRE_START_MS), Some(WIRE_END_MS)),
+            (None, Some(WIRE_START_MS), None),
+            (None, None, Some(WIRE_END_MS)),
+        ];
+        for (tag, start, end) in cases {
+            let got = wire_session(tag, start, end, wire_now());
+            assert!(
+                matches!(got, Err(WireSessionError::Partial { .. })),
+                "({tag:?}, {start:?}, {end:?}) must be refused as partial, got {got:?}"
+            );
+        }
+    }
+
+    /// The signed window must never be wider than the stated one: the
+    /// start rounds up to the next whole second and the end rounds
+    /// down. The on-chain guard is inclusive at both ends, so rounding
+    /// outward would licence up to a second of trading outside the real
+    /// session.
+    #[test]
+    fn wire_session_rounds_the_window_inward() {
+        let Ok(WireSession::Stated(info)) = wire_ok() else {
+            panic!("control fixture must be accepted")
+        };
+        // 1_780_000_003_001 ms -> 1_780_000_004 s (up), not ...003.
+        assert_eq!(info.start.timestamp(), 1_780_000_004);
+        assert_eq!(info.start.timestamp_subsec_nanos(), 0);
+        // 1_780_100_009_999 ms -> 1_780_100_009 s (down), not ...010.
+        assert_eq!(info.end.timestamp(), 1_780_100_009);
+        assert_eq!(info.end.timestamp_subsec_nanos(), 0);
+        // The signed window is strictly inside the stated one.
+        assert!(info.start.timestamp_millis() >= WIRE_START_MS);
+        assert!(info.end.timestamp_millis() <= WIRE_END_MS);
+    }
+
+    /// A whole-second bound is not moved by the rounding.
+    #[test]
+    fn wire_session_leaves_whole_second_bounds_alone() {
+        let got = wire_session(
+            Some("rth"),
+            Some(1_780_000_000_000),
+            Some(1_780_100_000_000),
+            wire_now(),
+        );
+        let Ok(WireSession::Stated(info)) = got else {
+            panic!("whole-second bounds must be accepted, got {got:?}")
+        };
+        assert_eq!(info.start.timestamp(), 1_780_000_000);
+        assert_eq!(info.end.timestamp(), 1_780_100_000);
+    }
+
+    /// An end already in the past is a producer whose view of the
+    /// session outlived the session. Signing it would burn a taker's
+    /// gas on a guaranteed revert.
+    #[test]
+    fn wire_session_refuses_an_end_already_past() {
+        let now = wire_now();
+        let got = wire_session(
+            Some("rth"),
+            Some(now.timestamp_millis() - 3_600_000),
+            Some(now.timestamp_millis() - 1_000),
+            now,
+        );
+        assert!(
+            matches!(got, Err(WireSessionError::Ended { .. })),
+            "expected Ended, got {got:?}"
+        );
+    }
+
+    /// The boundary is exclusive: an end exactly equal to `now` is over.
+    #[test]
+    fn wire_session_refuses_an_end_exactly_now() {
+        let now = wire_now();
+        let got = wire_session(
+            Some("rth"),
+            Some(now.timestamp_millis() - 3_600_000),
+            Some(now.timestamp_millis()),
+            now,
+        );
+        assert!(
+            matches!(got, Err(WireSessionError::Ended { .. })),
+            "expected Ended, got {got:?}"
+        );
+    }
+
+    /// ...and one whole second later is fine. Paired with the two tests
+    /// above this pins the comparison exactly: the same fixture differs
+    /// only in the end offset, so neither result can be explained by
+    /// anything else in it.
+    #[test]
+    fn wire_session_accepts_an_end_one_second_from_now() {
+        let now = wire_now();
+        let got = wire_session(
+            Some("rth"),
+            Some(now.timestamp_millis() - 3_600_000),
+            Some(now.timestamp_millis() + 1_000),
+            now,
+        );
+        assert!(
+            matches!(got, Ok(WireSession::Stated(_))),
+            "expected acceptance, got {got:?}"
+        );
+    }
+
+    /// The already-ended check runs on the ROUNDED end. A raw end 400 ms
+    /// in the future floors onto the current second, and a context
+    /// signed with it reverts on-chain — so it must be refused, not
+    /// signed. A raw-value check would accept this.
+    #[test]
+    fn wire_session_refuses_an_end_that_floors_onto_now() {
+        let now = utc(2026, 5, 29, 14, 30);
+        let got = wire_session(
+            Some("rth"),
+            Some(now.timestamp_millis() - 3_600_000),
+            Some(now.timestamp_millis() + 400),
+            now,
+        );
+        assert!(
+            matches!(got, Err(WireSessionError::Ended { .. })),
+            "expected Ended, got {got:?}"
+        );
+    }
+
+    /// A window that does not open before it closes is nonsense; the
+    /// on-chain guard would compare against bounds that admit nothing
+    /// (or, inverted, everything).
+    #[test]
+    fn wire_session_refuses_bounds_that_do_not_open_before_they_close() {
+        for (start, end) in [
+            (WIRE_END_MS, WIRE_START_MS),           // inverted
+            (WIRE_START_MS, WIRE_START_MS),         // empty
+            (1_780_000_000_400, 1_780_000_000_600), // collapses to empty after rounding
+        ] {
+            let got = wire_session(Some("rth"), Some(start), Some(end), wire_now());
+            assert!(
+                matches!(got, Err(WireSessionError::Incoherent { .. })),
+                "({start}, {end}) must be refused as incoherent, got {got:?}"
+            );
+        }
+    }
+
+    /// A bound outside the representable instant range is refused
+    /// rather than saturating onto some other instant.
+    #[test]
+    fn wire_session_refuses_an_unrepresentable_bound() {
+        for (start, end) in [(i64::MIN, WIRE_END_MS), (WIRE_START_MS, i64::MAX)] {
+            let got = wire_session(Some("rth"), Some(start), Some(end), wire_now());
+            assert!(
+                matches!(got, Err(WireSessionError::OutOfRange { .. })),
+                "({start}, {end}) must be refused as out of range, got {got:?}"
+            );
         }
     }
 

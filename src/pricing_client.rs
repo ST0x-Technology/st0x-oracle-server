@@ -244,9 +244,10 @@ async fn fetch_id_token(audience: &str) -> Result<String, ClientError> {
 /// testable:
 ///
 /// - `Price` stores the whole frame as one `Quote` — the rates, expiry,
-///   source_ts and NAV ratio of a cached observation always come from
-///   the same frame, so a signed context can never pair a rate from one
-///   frame with a NAV ratio from another.
+///   source_ts, NAV ratio and stated session of a cached observation
+///   always come from the same frame, so a signed context can never
+///   pair a rate from one frame with a NAV ratio or a session from
+///   another.
 /// - `Halt` fails closed: `halted = true` evicts the cached quote so
 ///   every subsequent request for the asset 503s instead of serving a
 ///   price the producer has disowned (the wrapped vault NAV can step on
@@ -269,6 +270,14 @@ async fn apply_server_frame(
                 expiry_unix_ms: p.expiry_unix_ms,
                 source_ts_unix_ms: p.source_ts_unix_ms,
                 nav_ratio: p.nav_ratio,
+                // The producer's own statement of which session it
+                // priced this frame in, carried verbatim — never
+                // defaulted. `None` means a pre-v0.7.0 producer said
+                // nothing, and only `None` routes the request to the
+                // oracle's fallback calendar.
+                session: p.session,
+                session_start_unix_ms: p.session_start_unix_ms,
+                session_end_unix_ms: p.session_end_unix_ms,
             };
             cache.write().await.insert(p.asset, q);
             None
@@ -400,7 +409,29 @@ mod tests {
             model_version: "0.1.0".into(),
             source_ts_unix_ms: 1_714_999_970_000,
             nav_ratio,
+            session: None,
+            session_start_unix_ms: None,
+            session_end_unix_ms: None,
         })
+    }
+
+    /// The same frame, but stating the session the producer priced it
+    /// in. Deliberately NOT `"rth"`, and with bounds that are not
+    /// round numbers, so a carry-through that substituted a default
+    /// could not coincide with these values.
+    fn price_frame_with_session(
+        asset: &str,
+        session: &str,
+        start_unix_ms: i64,
+        end_unix_ms: i64,
+    ) -> ServerFrame {
+        let ServerFrame::Price(mut p) = price_frame(asset, WireU256::ZERO) else {
+            unreachable!("price_frame builds a Price frame")
+        };
+        p.session = Some(session.to_string());
+        p.session_start_unix_ms = Some(start_unix_ms);
+        p.session_end_unix_ms = Some(end_unix_ms);
+        ServerFrame::Price(p)
     }
 
     fn halt_frame(asset: &str, halted: bool) -> ServerFrame {
@@ -433,6 +464,43 @@ mod tests {
         let q = cache.read().await.get("COIN").cloned().unwrap();
         assert_eq!(q.nav_ratio.0, nav, "NAV ratio must be bit-for-bit");
         assert_eq!(q.rate_quote_to_base, WireFloat::from_bytes([0x43; 32]));
+    }
+
+    /// The producer states which trading session it priced the quote
+    /// in; the cached `Quote` must carry that statement verbatim. The
+    /// oracle signs the tag and the bounds into the on-chain context,
+    /// so a field dropped here is silently replaced by the oracle's own
+    /// calendar — exactly the two-calendar divergence this change
+    /// exists to remove.
+    #[tokio::test]
+    async fn price_frame_carries_the_producers_session_into_the_cached_quote() {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+
+        apply_server_frame(
+            &cache,
+            price_frame_with_session("MC.PA", "premarket", 1_714_996_803_001, 1_715_000_007_999),
+        )
+        .await;
+
+        let q = cache.read().await.get("MC.PA").cloned().unwrap();
+        assert_eq!(q.session.as_deref(), Some("premarket"));
+        assert_eq!(q.session_start_unix_ms, Some(1_714_996_803_001));
+        assert_eq!(q.session_end_unix_ms, Some(1_715_000_007_999));
+    }
+
+    /// A pre-v0.7.0 producer sends no session fields at all. The cached
+    /// quote must say so — `None`, not a fabricated default — because
+    /// `None` is what routes the request to the oracle's fallback
+    /// calendar, and a fabricated tag would be signed as if the
+    /// producer had asserted it.
+    #[tokio::test]
+    async fn price_frame_without_session_fields_caches_none() {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        apply_server_frame(&cache, price_frame("COIN", WireU256::ZERO)).await;
+        let q = cache.read().await.get("COIN").cloned().unwrap();
+        assert_eq!(q.session, None);
+        assert_eq!(q.session_start_unix_ms, None);
+        assert_eq!(q.session_end_unix_ms, None);
     }
 
     /// A halt fails closed: the cached quote is evicted immediately, so
