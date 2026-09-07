@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use rain_math_float::Float;
 use st0x_oracle_server::market_hours::{MarketHoursCache, SessionWindow};
 use st0x_oracle_server::metrics::MetricsHandle;
-use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
+use st0x_oracle_server::oracle::OracleResponse;
 use st0x_oracle_server::pricing_client::LiveClient;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
@@ -87,6 +87,7 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
         rate_base_to_quote: wire_float_of(base_to_quote),
         rate_quote_to_base: wire_float_of(quote_to_base),
         expiry_unix_ms: i64::MAX,
+        execution_deadline_unix_ms: Some(i64::MAX),
         source_ts_unix_ms: FIXED_PUBLISH_TIME * 1000,
         // Zero = the "no ratio" sentinel. Tests that exercise the v6
         // NAV-ratio slot overwrite this with a full-entropy pattern.
@@ -465,61 +466,85 @@ async fn test_v1_unknown_token_returns_400() {
 }
 
 #[tokio::test]
-async fn test_v1_single_returns_v1_schema_from_cache() {
-    let app = test_app().await;
-    let body = encode_single(USDC, WCOIN);
-
-    let response = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v1")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-
-    assert_eq!(
-        responses.len(),
-        1,
-        "single-request must return length-1 array"
-    );
-    let resp = &responses[0];
-    assert_eq!(
-        resp.context.len(),
-        3,
-        "schema v1 must have 3 context elements"
-    );
-
-    // version
-    let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
-    assert_eq!(version.format().unwrap(), SCHEMA_VERSION.to_string());
-
-    // price (broker mark = 100.0 — same number for both directions,
-    // build_context inverts via Float when needed)
-    let price = Float::from(alloy::primitives::B256::from(resp.context[1]));
-    assert_eq!(price.format().unwrap(), "100");
-
-    // publish_time = the mark's fetch time (QuoteData.t), seeded to
-    // FIXED_PUBLISH_TIME, so we expect that exact value here. Compare
-    // against a Float-round-tripped canonical form since Rain Float
-    // formats large integers in scientific notation.
-    let publish = Float::from(alloy::primitives::B256::from(resp.context[2]));
-    let expected = Float::parse(FIXED_PUBLISH_TIME.to_string())
-        .unwrap()
-        .format()
-        .unwrap();
-    assert_eq!(publish.format().unwrap(), expected);
+async fn legacy_schemas_refuse_new_signatures() {
+    for endpoint in ["/context/v1", "/context/v4"] {
+        let response = test_app()
+            .await
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["detail"].as_str().unwrap().contains("legacy schema"));
+    }
 }
 
 #[tokio::test]
-async fn test_v1_publish_time_is_quote_source_ts_even_when_in_session() {
+async fn executable_schemas_bind_and_enforce_the_pricing_deadline() {
+    let now_ms = Utc::now().timestamp_millis();
+    let future_deadline = now_ms + 60_999;
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
+        for deadline in [
+            None,
+            Some(0),
+            Some(-1),
+            Some(now_ms - 1),
+            Some(future_deadline),
+        ] {
+            let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+            quote.execution_deadline_unix_ms = deadline;
+            let pricing = LiveClient::with_seeded(vec![quote]).await;
+            let state = AppState::new(
+                Signer::new(TEST_KEY).unwrap(),
+                TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap(),
+                pricing,
+                vec!["COIN".to_string()],
+                fixed_close_market_hours().await,
+                MetricsHandle::install().unwrap(),
+            );
+            let response = create_app(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(endpoint)
+                        .header("content-type", "application/octet-stream")
+                        .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if deadline == Some(future_deadline) {
+                assert_eq!(response.status(), 200, "{endpoint}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let signed: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(signed.len(), 1);
+                assert_eq!(
+                    Float::from(signed[0].context[8])
+                        .to_fixed_decimal(0)
+                        .unwrap(),
+                    U256::from(future_deadline / 1000),
+                    "{endpoint} must sign the floored deadline, not the later freshness expiry"
+                );
+            } else {
+                assert_eq!(response.status(), 503, "{endpoint}: {deadline:?}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(error["detail"].as_str().unwrap().contains("deadline"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_v5_publish_time_is_quote_source_ts_even_when_in_session() {
     // publish_time is ALWAYS the pricing quote's own `source_ts`, never
     // the oracle's request clock. Here the market-hours cache says we're
     // inside an active session — under the old behaviour that would have
@@ -533,7 +558,7 @@ async fn test_v1_publish_time_is_quote_source_ts_even_when_in_session() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -557,7 +582,7 @@ async fn test_v1_publish_time_is_quote_source_ts_even_when_in_session() {
 }
 
 #[tokio::test]
-async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
+async fn test_v5_binds_input_and_output_tokens_at_slots_6_and_7() {
     // /context/v4's whole reason for existing: the signed context binds
     // the raw input/output token addresses so an attacker can't reuse a
     // frame across pairs. This test asserts that binding is byte-exact:
@@ -570,7 +595,7 @@ async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v4")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -583,11 +608,11 @@ async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
     let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(responses.len(), 1);
     let resp = &responses[0];
-    assert_eq!(resp.context.len(), 8, "v4 must emit 8 context elements");
+    assert_eq!(resp.context.len(), 9, "v5 must emit 9 context elements");
 
     // schema_version = 4
     let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
-    assert_eq!(version.format().unwrap(), "4");
+    assert_eq!(version.format().unwrap(), "5");
 
     // session tag still uses V3 IntOrAString (same shape as v3's slot 3)
     // — v4 only adds tokens, it doesn't renegotiate session encoding.
@@ -628,7 +653,7 @@ async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
 }
 
 #[tokio::test]
-async fn test_v4_rejects_the_swapped_token_attack() {
+async fn test_v5_rejects_the_swapped_token_attack() {
     // The scenario v4 exists to prevent: an attacker submits a signed
     // context whose IO tokens don't match the running order. This test
     // proves the tokens the signer commits to *are* the ones the caller
@@ -654,7 +679,7 @@ async fn test_v4_rejects_the_swapped_token_attack() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v4")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(WCOIN, USDC)))
                 .unwrap(),
@@ -872,7 +897,7 @@ async fn test_status_reports_missing_when_symbol_uncached() {
 }
 
 #[tokio::test]
-async fn test_v1_returns_503_for_uncached_symbol() {
+async fn test_v5_returns_503_for_uncached_symbol() {
     // Configured-but-uncached symbol is the post-soft-start failure
     // mode: server is up, healthy symbols quote, an unfilled position
     // returns 503 per request instead of taking down the whole oracle.
@@ -884,7 +909,7 @@ async fn test_v1_returns_503_for_uncached_symbol() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -898,7 +923,7 @@ async fn test_v1_returns_503_for_uncached_symbol() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WDRAM)))
                 .unwrap(),
@@ -924,7 +949,7 @@ async fn test_v1_returns_503_for_uncached_symbol() {
 }
 
 #[tokio::test]
-async fn test_v1_batch_returns_length_matching_array() {
+async fn test_v5_batch_returns_length_matching_array() {
     let app = test_app().await;
     // Two orders: buy COIN, then sell COIN.
     let body = encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)]);
@@ -933,7 +958,7 @@ async fn test_v1_batch_returns_length_matching_array() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(body))
                 .unwrap(),
@@ -987,13 +1012,7 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
     // remaining endpoints. v7 uses `pick_underlying_rate_bytes` (a distinct
     // picker), and since this app's underlying rates mirror the vault rates
     // it must pick the SAME direction and orient identically.
-    for endpoint in [
-        "/context/v1",
-        "/context/v4",
-        "/context/v5",
-        "/context/v6",
-        "/context/v7",
-    ] {
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
         // Sell-side order (input=USDC, output=tStock): must serve the ASK
         // in quote-per-base units = inv(quote_to_base) = 100.
         let sell_resp = app
@@ -1057,7 +1076,7 @@ async fn test_zero_rate_fails_closed_with_500() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -1078,9 +1097,9 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
     let mut quote = fake_quote("COIN", WCOIN, "100", "100");
-    // 1_700_000_020_500 ms floors to 1_700_000_020 s — the trailing
+    // 4_000_000_020_500 ms floors to 4_000_000_020 s; the trailing
     // 500ms must be dropped, never rounded up past the model's horizon.
-    quote.expiry_unix_ms = 1_700_000_020_500;
+    quote.expiry_unix_ms = 4_000_000_020_500;
     let pricing = LiveClient::with_seeded(vec![quote]).await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
@@ -1117,7 +1136,7 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
     // Slot 8: the seeded expiry, ms floored to whole seconds. Compare
     // Float-canonical forms (large ints format in scientific notation).
     let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
-    let expected = Float::parse("1700000020".to_string())
+    let expected = Float::parse("4000000020".to_string())
         .unwrap()
         .format()
         .unwrap();
@@ -1130,7 +1149,7 @@ async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
     let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
-    quote.expiry_unix_ms = 1_700_000_020_500;
+    quote.expiry_unix_ms = 4_000_000_020_500;
     quote.nav_ratio = nav_ratio;
     let pricing = LiveClient::with_seeded(vec![quote]).await;
     let metrics = MetricsHandle::install().expect("metrics install");
@@ -1168,7 +1187,7 @@ async fn test_v6_endpoint_signs_nav_ratio_at_slot_9() {
 
     // Slot 8 keeps the v5 expiry semantics: ms floored to whole seconds.
     let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
-    let expected = Float::parse("1700000020".to_string())
+    let expected = Float::parse("4000000020".to_string())
         .unwrap()
         .format()
         .unwrap();
@@ -1246,7 +1265,7 @@ async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> axum::
         .format()
         .unwrap();
     let mut quote = fake_quote("COIN", WCOIN, &vault_inv, vault_px);
-    quote.expiry_unix_ms = 1_700_000_020_500;
+    quote.expiry_unix_ms = 4_000_000_020_500;
 
     let under_inv = Float::parse(underlying_px.to_string())
         .unwrap()
@@ -1296,7 +1315,7 @@ async fn test_v7_endpoint_signs_underlying_price_at_slot_1() {
 
     // Slot 8 keeps the v5 expiry semantics: ms floored to whole seconds.
     let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
-    let expected = Float::parse("1700000020".to_string())
+    let expected = Float::parse("4000000020".to_string())
         .unwrap()
         .format()
         .unwrap();
@@ -1504,16 +1523,62 @@ async fn test_v5_shorter_expiry_on_new_frame_is_not_reused() {
 }
 
 #[tokio::test]
-async fn test_v4_never_reuses_across_frames() {
-    // v4 signs no expiry, so the taker cannot see how old a reused quote
-    // would be; it always gets the newest frame.
+async fn test_v4_refuses_signatures_even_with_reuse_enabled() {
     let (app, pricing) = reuse_test_app(10).await;
-    pricing.seed(frame("100", FIXED_PUBLISH_TIME, 60)).await;
-    let first = response_of(app.clone(), "/context/v4").await;
-    pricing.seed(frame("100", FIXED_PUBLISH_TIME + 5, 60)).await;
-    let second = response_of(app, "/context/v4").await;
-    assert_eq!(publish_time_of(&second), secs(FIXED_PUBLISH_TIME + 5));
-    assert_ne!(second.context, first.context);
+    for timestamp in [FIXED_PUBLISH_TIME, FIXED_PUBLISH_TIME + 5] {
+        pricing.seed(frame("100", timestamp, 60)).await;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/context/v4")
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+    }
+}
+
+#[tokio::test]
+async fn signature_reuse_respects_shortened_and_revoked_execution_deadlines() {
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
+        let (app, pricing) = reuse_test_app(10).await;
+        pricing.seed(frame("100", FIXED_PUBLISH_TIME, 120)).await;
+        let first = response_of(app.clone(), endpoint).await;
+
+        let deadline_seconds = Utc::now().timestamp() + 60;
+        let mut shortened = frame("100", FIXED_PUBLISH_TIME + 5, 120);
+        shortened.execution_deadline_unix_ms = Some(deadline_seconds * 1000);
+        pricing.seed(shortened.clone()).await;
+        let second = response_of(app.clone(), endpoint).await;
+        assert_eq!(
+            Float::from(second.context[8]).to_fixed_decimal(0).unwrap(),
+            U256::from(u64::try_from(deadline_seconds).unwrap())
+        );
+        assert_ne!(second.context[8], first.context[8]);
+
+        for deadline in [None, Some(Utc::now().timestamp_millis() - 1)] {
+            shortened.execution_deadline_unix_ms = deadline;
+            pricing.seed(shortened.clone()).await;
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(endpoint)
+                        .header("content-type", "application/octet-stream")
+                        .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 503, "{endpoint}");
+        }
+    }
 }
 
 #[tokio::test]
