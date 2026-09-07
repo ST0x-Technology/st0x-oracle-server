@@ -1,0 +1,25 @@
+name: config-check
+
+# PR guard for deploy/config/*.toml: each candidate is parsed by the
+# `validate` subcommand of the newest RELEASED image (highest v* label in
+# the registry). Early warning only; the release itself re-validates
+# against the exact digest it deploys.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/config/**"
+      - ".github/workflows/config-check.yml"
+
+jobs:
+  validate:
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/config-check.yml@cae26fdb27c048ba9d9d203e5c633892a27dd4aa # config-check, bump via PR
+    with:
+      config_files: deploy/config/staging.toml deploy/config/production.toml
+      ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-oracle
+      image: t0-oracle-server
+      service_account: oracle-labeler@t0-artifacts.iam.gserviceaccount.com
+      validate_command: /bin/st0x-oracle-server validate /candidate.toml
