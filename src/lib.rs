@@ -361,44 +361,10 @@ async fn post_signed_context_v1_inner(
         return Err(strict_abort(endpoint, err));
     }
 
-    let needed_symbols: Vec<&str> = resolved
-        .iter()
-        .filter_map(|r| r.as_ref().ok())
-        .map(|p| p.symbol.as_str())
+    let items = resolved
+        .into_iter()
+        .map(|pair| pair.and_then(|pair| Err(legacy_signature_unavailable(endpoint, &pair.symbol))))
         .collect();
-    let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
-
-    let mut built: Vec<Result<BuiltSlot<'_>, AppError>> = Vec::with_capacity(resolved.len());
-    for pair in resolved {
-        let item = match pair {
-            Err(err) => Err(err),
-            Ok(pair) => match snapshot.get(&pair.symbol) {
-                None => Err(no_live_quote("v1", &pair.symbol)),
-                Some(quote) => {
-                    build_response_from_quote(&state, &pair, quote)
-                        .await
-                        .map(|response| BuiltSlot {
-                            pair,
-                            quote,
-                            response,
-                        })
-                }
-            },
-        };
-        // Strict mode stops at the first failure, as before: nothing
-        // after it is signed.
-        if !envelope {
-            if let Err(err) = item {
-                return Err(strict_abort(endpoint, err));
-            }
-        }
-        built.push(item);
-    }
-
-    let validated_at_unix_ms = state.clock.now_unix_ms();
-    let items = revalidate_batch(endpoint, false, validated_at_unix_ms, built, envelope)
-        .map_err(|err| strict_abort(endpoint, err))?;
-
     finish(endpoint, items, envelope)
 }
 
@@ -424,6 +390,7 @@ fn revalidate_batch(
     signs_expiry: bool,
     validated_at_unix_ms: i64,
     built: Vec<Result<BuiltSlot<'_>, AppError>>,
+    current: &std::collections::HashMap<String, QuoteSnapshot>,
     envelope: bool,
 ) -> Result<Vec<Result<oracle::OracleResponse, AppError>>, AppError> {
     let mut items = Vec::with_capacity(built.len());
@@ -443,6 +410,33 @@ fn revalidate_batch(
                 signs_expiry,
                 RefusalPhase::BatchFinal,
             )?;
+            let current_quote = current.get(&slot.pair.symbol).ok_or_else(|| {
+                no_live_quote_at(endpoint, &slot.pair.symbol, RefusalPhase::BatchFinal)
+            })?;
+            validate_quote_liveness(
+                current_quote,
+                endpoint,
+                &slot.pair.symbol,
+                RefusalPhase::BatchFinal,
+            )?;
+            validate_quote_expiry(
+                current_quote,
+                validated_at_unix_ms,
+                endpoint,
+                &slot.pair.symbol,
+                signs_expiry,
+                RefusalPhase::BatchFinal,
+            )?;
+            if signs_expiry
+                && slot.response.validity_expiry_unix_ms > effective_expiry_unix_ms(current_quote)?
+            {
+                return Err(expired_quote_at(
+                    endpoint,
+                    &slot.pair.symbol,
+                    RefusalPhase::BatchFinal,
+                    "Signed expiry exceeds the current execution bound.".into(),
+                ));
+            }
             Ok(slot.response.response)
         });
         if !envelope {
@@ -805,6 +799,18 @@ async fn post_signed_context_pair_bound(
         return Err(strict_abort(endpoint, err));
     }
 
+    if schema == PairSchema::V4 {
+        let items = resolved
+            .into_iter()
+            .map(|slot| {
+                slot.and_then(|(_, _, pair)| {
+                    Err(legacy_signature_unavailable(endpoint, &pair.symbol))
+                })
+            })
+            .collect();
+        return finish(endpoint, items, envelope);
+    }
+
     let needed_symbols: Vec<&str> = resolved
         .iter()
         .filter_map(|r| r.as_ref().ok())
@@ -849,12 +855,19 @@ async fn post_signed_context_pair_bound(
         built.push(item);
     }
 
+    let current_symbols: Vec<&str> = built
+        .iter()
+        .filter_map(|slot| slot.as_ref().ok())
+        .map(|slot| slot.pair.symbol.as_str())
+        .collect();
+    let current = state.pricing.snapshot_many(&current_symbols).await;
     let validated_at_unix_ms = state.clock.now_unix_ms();
     let items = revalidate_batch(
         endpoint,
         schema.signs_expiry(),
         validated_at_unix_ms,
         built,
+        &current,
         envelope,
     )
     .map_err(|err| strict_abort(endpoint, err))?;
@@ -1097,8 +1110,19 @@ fn publish_time_from_quote(quote: &Quote) -> Result<u64, AppError> {
 /// trading on a price the model has disowned, and the whole point of v5
 /// is that this number is trustworthy.
 fn expiry_from_quote(quote: &Quote) -> Result<u64, AppError> {
-    u64::try_from(quote.expiry_unix_ms / 1000)
+    u64::try_from(effective_expiry_unix_ms(quote)? / 1000)
         .map_err(|_| AppError::Internal(anyhow::anyhow!("quote expiry out of range")))
+}
+
+fn effective_expiry_unix_ms(quote: &Quote) -> Result<i64, AppError> {
+    let execution_deadline = quote
+        .execution_deadline_unix_ms
+        .filter(|deadline| *deadline > 0)
+        .ok_or_else(|| AppError::Unavailable {
+            reason: UnavailableReason::ExpiredQuote,
+            detail: "Execution deadline is missing or invalid.".into(),
+        })?;
+    Ok(quote.expiry_unix_ms.min(execution_deadline))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1126,6 +1150,7 @@ impl RefusalPhase {
 pub enum UnavailableReason {
     NoLiveQuote,
     ExpiredQuote,
+    LegacySchema,
 }
 
 impl UnavailableReason {
@@ -1133,6 +1158,7 @@ impl UnavailableReason {
         match self {
             Self::NoLiveQuote => "no_live_quote",
             Self::ExpiredQuote => "expired_quote",
+            Self::LegacySchema => "legacy_schema",
         }
     }
 }
@@ -1171,6 +1197,31 @@ fn no_live_quote_at(endpoint: &'static str, symbol: &str, phase: RefusalPhase) -
 
 fn no_live_quote(endpoint: &'static str, symbol: &str) -> AppError {
     no_live_quote_at(endpoint, symbol, RefusalPhase::Admission)
+}
+
+fn expired_quote_at(
+    endpoint: &'static str,
+    symbol: &str,
+    phase: RefusalPhase,
+    detail: String,
+) -> AppError {
+    let reason = UnavailableReason::ExpiredQuote;
+    tracing::warn!(
+        reason = reason.code(),
+        endpoint,
+        symbol,
+        phase = phase.label(),
+        %detail,
+        "Refusing expired pricing quote"
+    );
+    unavailable(reason, endpoint, symbol, phase, detail)
+}
+
+fn legacy_signature_unavailable(endpoint: &'static str, symbol: &str) -> AppError {
+    let reason = UnavailableReason::LegacySchema;
+    let detail = "Legacy schema has no verified settlement expiry bound; migrate to v5, v6, or v7."
+        .to_string();
+    unavailable(reason, endpoint, symbol, RefusalPhase::Admission, detail)
 }
 
 fn validate_quote_liveness(
@@ -1226,8 +1277,28 @@ fn validate_quote_expiry(
     signs_expiry: bool,
     phase: RefusalPhase,
 ) -> Result<(), AppError> {
+    let effective_expiry = effective_expiry_unix_ms(quote).map_err(|_| {
+        expired_quote_at(
+            endpoint,
+            symbol,
+            phase,
+            format!("Execution deadline for {symbol} is missing or invalid."),
+        )
+    })?;
+    if quote.execution_deadline_unix_ms == Some(effective_expiry)
+        && !quote_is_live(effective_expiry, checked_at_unix_ms, signs_expiry)
+    {
+        return Err(expired_quote_at(
+            endpoint,
+            symbol,
+            phase,
+            format!(
+                "Execution deadline for {symbol} elapsed at {effective_expiry} (checked at {checked_at_unix_ms})."
+            ),
+        ));
+    }
     validate_expiry_deadline(
-        quote.expiry_unix_ms,
+        effective_expiry,
         checked_at_unix_ms,
         endpoint,
         symbol,
@@ -1250,6 +1321,7 @@ struct BuiltResponse {
     validity_expiry_unix_ms: i64,
 }
 
+#[cfg(test)]
 async fn build_response_from_quote(
     state: &AppState,
     pair: &ResolvedPair,
@@ -1555,7 +1627,7 @@ async fn build_response_from_quote_pair_bound(
     );
     Ok(BuiltResponse {
         response,
-        validity_expiry_unix_ms: quote.expiry_unix_ms,
+        validity_expiry_unix_ms: effective_expiry_unix_ms(quote)?,
     })
 }
 
@@ -1672,7 +1744,7 @@ mod expiry_tests {
     use crate::market_hours::{Session, SessionInfo};
     use crate::registry::PriceDirection;
     use st0x_pricing_types::{
-        ErrorCode, ErrorFrame, ServerFrame, WireAddress, WireFloat, WireU256,
+        ErrorCode, ErrorFrame, HaltFrame, ServerFrame, WireAddress, WireFloat, WireU256,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -1711,6 +1783,7 @@ mod expiry_tests {
             rate_base_to_quote: WireFloat::from_bytes(rate.into()),
             rate_quote_to_base: WireFloat::from_bytes(rate.into()),
             expiry_unix_ms,
+            execution_deadline_unix_ms: Some(expiry_unix_ms),
             source_ts_unix_ms: 1_000,
             nav_ratio: WireU256::ZERO,
             underlying_rate_base_to_quote: WireFloat::from_bytes(rate.into()),
@@ -1869,6 +1942,26 @@ mod expiry_tests {
     fn unavailable_reason_codes_are_stable() {
         assert_eq!(UnavailableReason::NoLiveQuote.code(), "no_live_quote");
         assert_eq!(UnavailableReason::ExpiredQuote.code(), "expired_quote");
+        assert_eq!(UnavailableReason::LegacySchema.code(), "legacy_schema");
+    }
+
+    #[test]
+    fn execution_deadline_bounds_signed_expiry_and_fails_closed() {
+        let mut quote = test_quote(20_000);
+        quote.execution_deadline_unix_ms = Some(10_999);
+        assert_eq!(effective_expiry_unix_ms(&quote).unwrap(), 10_999);
+        assert_eq!(expiry_from_quote(&quote).unwrap(), 10);
+
+        for deadline in [None, Some(0), Some(-1)] {
+            quote.execution_deadline_unix_ms = deadline;
+            assert!(matches!(
+                effective_expiry_unix_ms(&quote),
+                Err(AppError::Unavailable {
+                    reason: UnavailableReason::ExpiredQuote,
+                    ..
+                })
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1917,7 +2010,13 @@ mod expiry_tests {
 
         let request_state = Arc::clone(&state);
         let in_flight = tokio::spawn(async move {
-            post_signed_context_v1_inner(request_state, ContextQuery::default(), request).await
+            post_signed_context_pair_bound(
+                request_state,
+                ContextQuery::default(),
+                request,
+                PairSchema::V5,
+            )
+            .await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while state.signer.cache_stats().misses == 0 {
@@ -1953,18 +2052,100 @@ mod expiry_tests {
     }
 
     #[tokio::test]
+    async fn concurrent_deadline_changes_revalidate_in_flight_responses() {
+        for change in ["shorten", "revoke", "halt", "extend"] {
+            let entered = Arc::new(tokio::sync::Semaphore::new(0));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut quote = test_quote(120_000);
+            let pricing = LiveClient::with_seeded(vec![quote.clone()], 1).await;
+            let state = Arc::new(
+                AppState::new(
+                    Signer::new(TEST_KEY)
+                        .unwrap()
+                        .with_gate(entered.clone(), release.clone()),
+                    TokenRegistry::new(
+                        vec![(
+                            "0x1111111111111111111111111111111111111111".into(),
+                            "COIN".into(),
+                        )],
+                        "0x2222222222222222222222222222222222222222",
+                    )
+                    .unwrap(),
+                    1,
+                    pricing.clone(),
+                    vec!["COIN".into()],
+                    Arc::new(MarketHoursCache::new()),
+                    MetricsHandle::install().unwrap(),
+                )
+                .with_clock(Arc::new(SequenceClock::new([1_000]))),
+            );
+            let request = request_body(vec![request_tuple(
+                Address::from([0x22; 20]),
+                Address::from([0x11; 20]),
+            )]);
+            let request_state = Arc::clone(&state);
+            let in_flight = tokio::spawn(async move {
+                post_signed_context_pair_bound(
+                    request_state,
+                    ContextQuery::default(),
+                    request,
+                    PairSchema::V5,
+                )
+                .await
+            });
+            entered.acquire().await.unwrap().forget();
+
+            match change {
+                "halt" => {
+                    pricing
+                        .apply_test_frame(ServerFrame::Halt(HaltFrame {
+                            asset: quote.asset.clone(),
+                            chain_id: quote.chain_id,
+                            base: quote.base,
+                            quote: quote.quote,
+                            halted: true,
+                            reason: None,
+                        }))
+                        .await;
+                }
+                _ => {
+                    quote.execution_deadline_unix_ms = match change {
+                        "shorten" => Some(60_000),
+                        "extend" => Some(180_000),
+                        _ => None,
+                    };
+                    quote.expiry_unix_ms = 180_000;
+                    pricing.seed(quote).await;
+                }
+            }
+            release.add_permits(1);
+
+            let result = in_flight.await.unwrap();
+            if change == "extend" {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(AppError::Unavailable { .. })));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn batch_revalidates_all_responses_at_one_final_timestamp() {
         let clock = Arc::new(SequenceClock::new([
-            1_000, 1_000, 1_000, // first response completes while live
-            1_000, 1_000, 2_000, // second response crosses the first deadline
-            2_000, // one common final validation timestamp
+            1_000, 1_000, 1_000, 1_000, // first response completes while live
+            1_000, 1_000, 1_000, 3_000, // second response crosses the first deadline
+            3_000, // one common final validation timestamp
         ]));
-        let state = two_symbol_state(clock, two_symbol_quotes(2_000, 3_000)).await;
+        let state = two_symbol_state(clock, two_symbol_quotes(3_000, 4_000)).await;
 
-        let error =
-            post_signed_context_v1_inner(state, ContextQuery::default(), two_symbol_request_body())
-                .await
-                .unwrap_err();
+        let error = post_signed_context_pair_bound(
+            state,
+            ContextQuery::default(),
+            two_symbol_request_body(),
+            PairSchema::V5,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             error,
             AppError::Unavailable {
@@ -1980,18 +2161,19 @@ mod expiry_tests {
     #[tokio::test]
     async fn envelope_batch_keeps_final_revalidation_per_slot() {
         let clock = Arc::new(SequenceClock::new([
-            1_000, 1_000, 1_000, // first response completes while live
-            1_000, 1_000, 2_000, // second response crosses the first deadline
-            2_000, // one common final validation timestamp
+            1_000, 1_000, 1_000, 1_000, // first response completes while live
+            1_000, 1_000, 1_000, 3_000, // second response crosses the first deadline
+            3_000, // one common final validation timestamp
         ]));
-        let state = two_symbol_state(clock, two_symbol_quotes(2_000, 3_000)).await;
+        let state = two_symbol_state(clock, two_symbol_quotes(3_000, 4_000)).await;
 
-        let response = post_signed_context_v1_inner(
+        let response = post_signed_context_pair_bound(
             state,
             ContextQuery {
                 allow_failure: true,
             },
             two_symbol_request_body(),
+            PairSchema::V5,
         )
         .await
         .unwrap();

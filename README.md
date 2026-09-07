@@ -3,29 +3,29 @@
 Signed context oracle server for st0x tokenized equities on
 [Raindex](https://rainlang.xyz).
 
-Serves `SignedContextV1` data using real-time Alpaca NBBO quotes, enabling
-Raindex orders to price tokenized equities at executable hedging prices without
-on-chain oracle gas costs.
+Serves signed context from `st0x.pricing`, enabling Raindex orders to price
+tokenized equities at executable hedging prices without on-chain oracle gas
+costs.
 
 ## How it works
 
-1. A background loop polls Alpaca every `poll_interval_secs` (default 10s) for
-   every configured symbol and caches the quote alongside its Alpaca-reported
-   timestamp.
-2. On each `POST /context/v1`, the server decodes the ABI-encoded request body,
-   resolves the input/output tokens to an Alpaca ticker via the token registry,
-   and serves the **cached** quote — it never hits Alpaca synchronously.
-3. Selects the executable price (ask for buys, `1/bid` for sells), encoding the
-   inversion in Rain DecimalFloat precision (not f64).
-4. Encodes `[schema_version, price, publish_time]` as Rain DecimalFloats where
-   `publish_time` is Alpaca's own quote timestamp (NOT our fetch time).
-5. Signs via EIP-191 and returns a JSON array whose length matches the request
-   length: `OracleResponse` items by default, or one `ok`/`error` item per
-   request when a batch is sent with `?allowFailure=true` (see below).
+1. A background WebSocket subscriber caches whole quote frames from
+   `st0x.pricing`, including source timestamps and execution deadlines.
+2. On `POST /context/v5`, `/context/v6`, or `/context/v7`, the server resolves
+   the requested tokens and snapshots the cached quotes once per batch.
+3. It selects the directional rate and inverts it in Rain DecimalFloat
+   precision. v5 and v6 use vault-share rates; v7 uses underlying-asset rates.
+4. It signs the earlier of the freshness expiry and execution deadline, floored
+   to whole Unix seconds.
+5. It returns `OracleResponse` items by default, or one `ok` or `error` item per
+   request when a batch uses `?allowFailure=true`.
 
-If Alpaca is temporarily unreachable, the poll loop logs the error and leaves
-the previous cached quote in place. The Rainlang strategy bounds freshness via a
-`max-staleness` guard against `block.timestamp`.
+Missing or elapsed execution deadlines fail with HTTP 503 for single requests
+and strict batches. An `allowFailure=true` batch returns HTTP 200 with an
+`expired_quote` item. Strategies must enforce `block.timestamp < context[8]` at
+settlement. `/context/v1` and `/context/v4` remain registered only to refuse new
+signatures. See [execution deadlines and migration](docs/execution-deadlines.md)
+before updating a consumer.
 
 ### Signature cache
 
@@ -59,7 +59,7 @@ as long as that quote still has at least `signing.reuse_min_remaining_secs`
 original expiry, both in the signed bytes, so it can judge freshness itself. A
 moving price still gets a fresh signature on every frame, and so does an
 unchanged price whose new frame carries an earlier expiry: pricing owns the
-horizon. v1 and v4 sign no expiry and are never reused.
+horizon. v1 and v4 refuse new signatures.
 
 The one thing a consumer does see: a reused quote's signed `publish_time` trails
 the live frame by up to the expiry horizon minus this margin (about 20s with
@@ -265,7 +265,7 @@ and region as the Base production service.
 ### Endpoint
 
 ```http
-POST /context/v1
+POST /context/v7
 Content-Type: application/octet-stream
 ```
 
@@ -283,27 +283,27 @@ matching the request:
 [
   {
     "signer": "0x...",
-    "context": ["0x...", "0x...", "0x..."],
+    "context": ["0x..."],
     "signature": "0x..."
   }
 ]
 ```
 
-If the requested symbol has no usable pricing quote, every context schema
-returns HTTP 503 with one of two stable machine-readable `error` values:
-`no_live_quote` when the cache has no live entry, or `expired_quote` when the
-cached quote has reached its exclusive expiry deadline. `detail` is for humans;
-clients must match `error` exactly. Without the `allowFailure` flag (see
-below) a batch fails as one request and never returns a partial response
-array. Schemas v1 and v4 enforce the pricing frame's raw millisecond deadline.
-Schemas v5, v6, and v7 encode slot 8 in whole Unix seconds and the on-chain
-check is exclusive, so they floor the deadline and refuse the final partial
-second once the current time reaches that encoded second.
+If the requested symbol has no usable pricing quote, executable schemas return
+HTTP 503 with one of two stable machine-readable `error` values: `no_live_quote`
+when the cache has no live entry, or `expired_quote` when the cached quote has
+reached its exclusive expiry deadline. `detail` is for humans; clients must
+match `error` exactly. Without the `allowFailure` flag (see below) a batch fails
+as one request and never returns a partial response array. Schemas v5, v6, and
+v7 encode the earlier of the pricing frame's freshness expiry and execution
+deadline in slot 8. The on-chain check is exclusive, so the server floors the
+bound and refuses the final partial second. Schemas v1 and v4 return
+`legacy_schema` because they cannot carry that bound.
 
 ### Per-item results for batches: `allowFailure`
 
-By default a batch is all-or-nothing. If one item fails, the server returns
-one HTTP error for the full request, and no item gets a signed context.
+By default a batch is all-or-nothing. If one item fails, the server returns one
+HTTP error for the full request, and no item gets a signed context.
 
 Add `?allowFailure=true` to the URL to get one result per item instead:
 
@@ -311,43 +311,44 @@ Add `?allowFailure=true` to the URL to get one result per item instead:
 POST /context/v7?allowFailure=true
 ```
 
-With the flag, a batch response is always HTTP 200. Each item is either a
-signed context or an error, in request order:
+With the flag, a batch response is always HTTP 200. Each item is either a signed
+context or an error, in request order:
 
 ```json
 [
-  { "status": "ok",    "body": { "signer": "0x...", "context": ["0x..."], "signature": "0x..." } },
-  { "status": "error", "body": { "error": "no_live_quote", "detail": "No live quote for DRAM." } }
+  {
+    "status": "ok",
+    "body": { "signer": "0x...", "context": ["0x..."], "signature": "0x..." }
+  },
+  {
+    "status": "error",
+    "body": { "error": "no_live_quote", "detail": "No live quote for DRAM." }
+  }
 ]
 ```
 
 The `error` codes are the same as the HTTP error bodies: `bad_request`,
-`no_live_quote`, `expired_quote`, and `internal_error`. The expiry check at
-the end of a batch also applies per item: a slot that expired while the
-batch signed is an error item, and the other slots are still delivered.
+`no_live_quote`, `expired_quote`, `legacy_schema`, and `internal_error`. The
+expiry check at the end of a batch also applies per item: a slot that expired
+while the batch signed is an error item, and the other slots are still
+delivered.
 
 Rules:
 
-| Request | Flag | Response |
-|---|---|---|
-| Undecodable body | any | `400 {error, detail}` |
-| Single tuple | any | Unchanged: `200 [OracleResponse]` or `4xx/5xx {error, detail}` |
-| Batch | absent, `false`, or other | Unchanged: first failing item fails the request |
-| Batch, N items | `true` or `1` | `200`, N items with `status` and `body` |
-| Batch, 0 items | `true` or `1` | `200 []` |
+| Request          | Flag                      | Response                                                       |
+| ---------------- | ------------------------- | -------------------------------------------------------------- |
+| Undecodable body | any                       | `400 {error, detail}`                                          |
+| Single tuple     | any                       | Unchanged: `200 [OracleResponse]` or `4xx/5xx {error, detail}` |
+| Batch            | absent, `false`, or other | Unchanged: first failing item fails the request                |
+| Batch, N items   | `true` or `1`             | `200`, N items with `status` and `body`                        |
+| Batch, 0 items   | `true` or `1`             | `200 []`                                                       |
 
 The flag applies to all `/context/v*` endpoints. The key is case-sensitive.
 Unknown query keys are ignored.
 
-Do not put the flag in the on-chain oracle meta URL of an order. A client
-that does not understand the item format cannot parse the response. The
-client adds the flag itself when it supports the format.
-
-Schema v1 context layout (all Rain DecimalFloats):
-
-- `context[0]`: schema version (= 1)
-- `context[1]`: price (ask for buys, `1/bid` for sells)
-- `context[2]`: publish_time — Alpaca's own quote timestamp as Unix seconds UTC
+Do not put the flag in the on-chain oracle meta URL of an order. A client that
+does not understand the item format cannot parse the response. The client adds
+the flag itself when it supports the format.
 
 Schema v7 context layout (`POST /context/v7`):
 
@@ -360,7 +361,7 @@ Schema v7 context layout (`POST /context/v7`):
 - `context[5]`: session end (Unix seconds)
 - `context[6]`: input token address
 - `context[7]`: output token address
-- `context[8]`: quote expiry (Unix seconds)
+- `context[8]`: exclusive freshness and execution bound (Unix seconds)
 - `context[9]`: chain id this deployment signs for
 
 No slot carries a NAV ratio: v7 signs the underlying price and the strategy
