@@ -269,6 +269,8 @@ async fn apply_server_frame(
                 expiry_unix_ms: p.expiry_unix_ms,
                 source_ts_unix_ms: p.source_ts_unix_ms,
                 nav_ratio: p.nav_ratio,
+                underlying_rate_base_to_quote: p.underlying_rate_base_to_quote,
+                underlying_rate_quote_to_base: p.underlying_rate_quote_to_base,
             };
             cache.write().await.insert(p.asset, q);
             None
@@ -400,6 +402,8 @@ mod tests {
             model_version: "0.1.0".into(),
             source_ts_unix_ms: 1_714_999_970_000,
             nav_ratio,
+            underlying_rate_base_to_quote: WireFloat::from_bytes([0x44; 32]),
+            underlying_rate_quote_to_base: WireFloat::from_bytes([0x45; 32]),
         })
     }
 
@@ -414,8 +418,11 @@ mod tests {
         })
     }
 
-    /// The cached `Quote` must carry the frame's NAV ratio bit-for-bit
-    /// alongside its rates: one frame in, one coherent observation out.
+    /// The cached `Quote` must carry the frame's NAV ratio and the two
+    /// directional underlying rates bit-for-bit alongside its vault rates:
+    /// one frame in, one coherent observation out. `/context/v7` signs the
+    /// underlying rate off the same cached quote, so it has to survive the
+    /// frame→quote copy unchanged.
     #[tokio::test]
     async fn price_frame_stores_nav_ratio_with_the_same_observation() {
         let cache = Arc::new(RwLock::new(HashMap::new()));
@@ -433,6 +440,16 @@ mod tests {
         let q = cache.read().await.get("COIN").cloned().unwrap();
         assert_eq!(q.nav_ratio.0, nav, "NAV ratio must be bit-for-bit");
         assert_eq!(q.rate_quote_to_base, WireFloat::from_bytes([0x43; 32]));
+        assert_eq!(
+            q.underlying_rate_base_to_quote,
+            WireFloat::from_bytes([0x44; 32]),
+            "underlying base->quote rate must carry through bit-for-bit"
+        );
+        assert_eq!(
+            q.underlying_rate_quote_to_base,
+            WireFloat::from_bytes([0x45; 32]),
+            "underlying quote->base rate must carry through bit-for-bit"
+        );
     }
 
     /// A halt fails closed: the cached quote is evicted immediately, so
