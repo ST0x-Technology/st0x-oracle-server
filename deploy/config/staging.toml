@@ -1,0 +1,221 @@
+# st0x-oracle-server runtime config for STAGING: the deployed source of truth
+# since 2026-09-07 (moved here from t0.devops terraform/staging-oracle/oracle-
+# config.toml; the stack there keeps only the secret and its grants). Every
+# merge to the default branch validates it with the binary just built
+# (`validate`), publishes it as a version of the oracle-runtime-config secret
+# and pins that version into the new revision (deploy.yml ->
+# ST0x-Technology/.github app-release). No approval: staging is the fast path.
+# Non-secret settings only; secrets come from Secret Manager env injection.
+#
+
+port = 3000
+
+# Live pricing source. ws_url is a placeholder here: the stack's
+# PRICING_WS_URL env var overrides it with this env's Cloud Run pricing
+# URL (see main.tf). The consumer name must match the
+# `pricing_<consumer>_<32-hex>` API key format.
+[pricing]
+ws_url = "ws://st0x-pricing:8080/ws"
+consumer = "oracle"
+
+# Token registry: maps on-chain Base token addresses (st0x wrapped
+# equities) to pricing-service asset symbols. USDC is the implicit
+# quote token and is hardcoded in main.rs because it's a chain
+# invariant. Synced with ST0x Base Token List v1.2.0 (2026-05-26).
+# Config-as-data rehearsal 2026-08-11: this comment edit exercised the
+# full fast path (PR -> validator -> new secret version -> new revision).
+
+[[tokens]]
+address = "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"
+symbol = "wtNVDA"
+
+[[tokens]]
+address = "0x997baE3EC193a249596d3708C3fAB7C501Bb8a53"
+symbol = "wtAMZN"
+
+[[tokens]]
+address = "0x219A8d384a10BF19b9f24cB5cC53F79Dd0e5A03D"
+symbol = "wtTSLA"
+
+[[tokens]]
+address = "0xFF05E1bD696900dc6A52CA35Ca61Bb1024eDa8e2"
+symbol = "wtMSTR"
+
+[[tokens]]
+address = "0x1E46d7eFef64A833AFB1CD49299a7AD5B439f4d8"
+symbol = "wtIAU"
+
+[[tokens]]
+address = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"
+symbol = "wtCOIN"
+
+[[tokens]]
+address = "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"
+symbol = "wtSPYM"
+
+[[tokens]]
+address = "0xEB7F3E4093C9d68253b6104FbbfF561F3eC0442F"
+symbol = "wtSIVR"
+
+[[tokens]]
+address = "0x8AFba81DEc38DE0A18E2Df5E1967a7493651eebf"
+symbol = "wtCRCL"
+
+[[tokens]]
+address = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
+symbol = "wtBMNR"
+
+[[tokens]]
+address = "0x82f5BAEE1076334357a34A19E04f7c282D51cE47"
+symbol = "wtPPLT"
+
+[[tokens]]
+address = "0x823FF7Bbde2869aAe73A6CD53e7f614442836757"
+symbol = "wtQQQM"
+
+[[tokens]]
+address = "0x23ec6886b49D7ab123E9ee8e474D2fa7AB6Cbc2d"
+symbol = "wtVWO"
+
+[[tokens]]
+address = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"
+symbol = "wtARKK"
+
+[[tokens]]
+address = "0x78c31580c97101694C70022c83D570150c11e935"
+symbol = "wtSGOV"
+
+[[tokens]]
+address = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
+symbol = "wtSPCX"
+
+[[tokens]]
+address = "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"
+symbol = "wtCEG"
+
+[[tokens]]
+address = "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"
+symbol = "wtDRAM"
+
+[[tokens]]
+address = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
+symbol = "wtTSM"
+
+[[tokens]]
+address = "0xF4f8c66085910d583c01f3b4e44Bf731D4e2c565"
+symbol = "wtRKLB"
+
+[[tokens]]
+address = "0x8200c6d9AB9E02A25D7F2099244C476d99a085ef"
+symbol = "wtASML"
+
+[[tokens]]
+address = "0xFcD17aC4c4BF6a72c93018096F3fC09e66573Ff9"
+symbol = "wtSKHY"
+
+[[tokens]]
+address = "0x89EcfE9E0728D6b3c5eb0EE7236f8C6F806C7B56"
+symbol = "wtMU"
+
+[[tokens]]
+address = "0x648042Acd8638E12fEfd51C2b25A9f993f21a612"
+symbol = "wtAMD"
+
+[[tokens]]
+address = "0x70A182f481AEF05836666B6CfDbe84dCBCE8AC19"
+symbol = "wtAVGO"
+
+[[tokens]]
+address = "0x522DC65c89C9Af4f410BAe01bbf53aF75854a9f9"
+symbol = "wtAMAT"
+
+[[tokens]]
+address = "0x328B9aFFa511fE26673edBb4fEa37eDaF908A3bc"
+symbol = "wtLRCX"
+
+[[tokens]]
+address = "0x045Fb493D970f94a54FeaF931033622fC82192e6"
+symbol = "wtTTWO"
+
+# 2026-08-06 onboarding batch (Alastair) — matches st0x.pricing PR #40.
+[[tokens]]
+address = "0x1020EC8Aa3f709a1f3D8705cdBa89b950451bd88"
+symbol = "wtAAPL"
+
+[[tokens]]
+address = "0x7e5cc7eAe0455A07Ab4abf354E0f5657BA2888BD"
+symbol = "wtBABA"
+
+[[tokens]]
+address = "0x6a2357Df4975C667B171bE53dA6FFe6deBf7030c"
+symbol = "wtGOOGL"
+
+[[tokens]]
+address = "0xd50f561322fe3235DBc9Ec8b3aB7693383d8A425"
+symbol = "wtHOOD"
+
+[[tokens]]
+address = "0xf567652fC2d7Db8D5469fD06AEbe8C9c4372d722"
+symbol = "wtINTC"
+
+[[tokens]]
+address = "0x892CcF5E75f4a7Ee6402971a1587F65BEE4d52bd"
+symbol = "wtLLY"
+
+[[tokens]]
+address = "0x515A3Ac2a6aB590bDFa970caFFFd7fAdC680886E"
+symbol = "wtMSFT"
+
+[[tokens]]
+address = "0xCB9571aB96aA47374eF30D8E9ACCC1cD51064726"
+symbol = "wtORCL"
+
+[[tokens]]
+address = "0xb6D779A79E7493ed821a65D52bA419F0F6D5dD0a"
+symbol = "wtPTY"
+
+[[tokens]]
+address = "0xA759FAbbD866e6DB8bF76613C35825dC2e380bf0"
+symbol = "wtSMCI"
+
+[[tokens]]
+address = "0x295e9eCAb319006900a53b3f8D6Fcb0C131F4ada"
+symbol = "wtTQQQ"
+
+# 2026-09-03 onboarding batch (NKE, MCD) — matches the pricing config's
+# [[assets]]/[[tokens]] additions in the same PR.
+[[tokens]]
+address = "0x7ecAE30Ed8ee4F72653ada7b0941bDE7a0a8eE8d"
+symbol = "wtMCD"
+
+[[tokens]]
+address = "0x0883f32d23Ed5535057a4B5E3eB1970FE08606AF"
+symbol = "wtNKE"
+
+# 2026-09-04: wtGRND — matches the pricing config's [[assets]]/[[tokens]]
+# additions in the same PR.
+[[tokens]]
+address = "0x1197E6FA778c4D13E47875bD1761c68C22c928e0"
+symbol = "wtGRND"
+
+# 2026-09-06 onboarding batch (DNUT, FGI, PLBY, TR, WEN) — matches the
+# pricing config's [[assets]]/[[tokens]] additions in the same PR.
+[[tokens]]
+address = "0x1db49Ff8BEe88ec73F82F395B0BEAd372BdcAdb7"
+symbol = "wtDNUT"
+
+[[tokens]]
+address = "0x6aed8b1aCfb04F4e0e6db580F12fF41438a394e5"
+symbol = "wtFGI"
+
+[[tokens]]
+address = "0x35fDe767dBFAa610D12cf99914bCd6CFEda73B7B"
+symbol = "wtPLBY"
+
+[[tokens]]
+address = "0x433fd2Fc0964B07E9820e4cd01774eDE59D1F002"
+symbol = "wtTR"
+
+[[tokens]]
+address = "0x31Fa821F8B1BDea7Db357ec9622d1A2f6aFE903d"
+symbol = "wtWEN"
