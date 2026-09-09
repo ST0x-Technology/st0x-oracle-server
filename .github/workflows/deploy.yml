@@ -5,36 +5,30 @@ name: deploy
 #   nix build .#oci → push digest → t0-artifacts (central Artifact Registry)
 #     └─ deploy digest → t0-oracle-staging (this branch + main)
 #
-# PRODUCTION IS NOT DEPLOYED FROM THIS REPO. Prod rolls happen exclusively
-# in t0.devops: promote the staging-verified digest into
-# terraform/production-oracle/images.yaml — merging that fires the
-# release-oracle workflow (PAM-approved apply + image roll). Versions are
-# labels on top of that: pushing git tag vX.Y.Z runs release-tag.yml
-# (promote-on-tag, the org-standard flow), which labels the digest this
-# workflow already built and attested for that commit. This repo's
-# deployer SAs hold no rights in st0x-production (revoked 2026-07-24,
-# t0.devops#93), so a prod-deploy job here could only 403.
+# PRODUCTION IS DEPLOYED FROM THIS REPO TOO, but never by this workflow:
+# pushing git tag vX.Y.Z runs release-tag.yml (label the attested digest,
+# cut the GitHub release, then deploy production behind a PAM grant), and
+# a merge touching deploy/config/production.toml runs
+# production-release.yml (config-only, same gate). Staging is this file:
+# every main merge builds, attests, and hands the digest + the config at
+# deploy/config/staging.toml to the shared app-release workflow
+# (ST0x-Technology/.github), which validates the config with the binary
+# just built, publishes it as a Secret Manager version and rolls the
+# service. Since 2026-09-07 (t0.devops#465); before that production rolled
+# only from a t0.devops manifest merge.
 #
 # The image is built BY THE FLAKE (dockerTools) — no Dockerfile, no base
 # image: the exact nix store closure `nix build .#st0x-oracle-server`
 # produces, plus CA certs and the non-secret config. `created` is pinned in
 # the flake, so a commit rebuilds to the same digest.
 #
-# While the RAI-1002 parity window runs, THIS STACK BRANCH deploys to
-# staging via a staging-only deployer SA (can touch t0-oracle-staging and the
-# registry, nothing in production). Bindings live in
-# t0.devops/terraform/{production-artifacts,staging-oracle}.
-#
 # Auth: GitHub OIDC -> WIF, no stored keys. PRs get nothing (ci.yml gates).
+# (The RAI-1002 staging-only branch deployer is gone: t0.devops#106.)
 
 on:
   push:
     branches:
       - main
-      - feature/rai-1002-gcp-kms-signer
-      # Current top of the RAI-1002 stack (+ the WS read-deadline fix):
-      # staging-only, same staging deployer SA as the branch above.
-      - fix/pricing-ws-read-deadline
   workflow_dispatch: {}
 
 concurrency:
@@ -56,10 +50,9 @@ env:
   IMAGE: europe-west3-docker.pkg.dev/t0-artifacts/t0-oracle/t0-oracle-server
   # From t0.devops/terraform/production-artifacts outputs.
   WIF_PROVIDER: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
-  # main -> oracle-deployer; branch -> staging-only SA. Both stop at staging.
-  DEPLOYER_SA: ${{ github.ref == 'refs/heads/main'
-    && 'oracle-deployer@t0-artifacts.iam.gserviceaccount.com'
-    || 'oracle-deployer-staging@t0-artifacts.iam.gserviceaccount.com' }}
+  # Pushes + attests images, rolls staging. Production is oracle-releaser
+  # (release-tag.yml / production-release.yml), behind PAM.
+  DEPLOYER_SA: oracle-deployer@t0-artifacts.iam.gserviceaccount.com
 
 jobs:
   build-push:
@@ -149,36 +142,28 @@ jobs:
             --attestor="projects/t0-artifacts/attestors/oracle-image" \
             --keyversion="projects/t0-artifacts/locations/${REGION}/keyRings/attestors/cryptoKeys/oracle-image-attestor/cryptoKeyVersions/1"
 
+  # Staging rolls on every main merge: the shared app-release workflow
+  # validates deploy/config/staging.toml inside the image just built,
+  # publishes it as a version of oracle-runtime-config, and updates the
+  # service with the digest + that version pinned. No approval (staging).
   deploy-staging:
     needs: build-push
-    runs-on: ubuntu-latest
-    environment: staging
-    steps:
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ env.WIF_PROVIDER }}
-          service_account: ${{ env.DEPLOYER_SA }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      # Deploys by immutable digest, never by tag. Skips (loudly) while the
-      # service doesn't exist yet — the FIRST deploy is Terraform's
-      # (deploy_workload=true, oracle_container_image = a digest this
-      # workflow already pushed); every deploy after that happens here.
-      - name: Deploy to Cloud Run (staging)
-        run: |
-          set -euo pipefail
-          if ! gcloud run services describe "${SERVICE}" --project "${PROJECT_STAGING}" --region "${REGION}" --format='value(metadata.name)' >/dev/null 2>&1; then
-            echo "::warning::Cloud Run service '${SERVICE}' not found in ${PROJECT_STAGING} — image pushed but not deployed." \
-              "Bootstrap via st0x.devops/terraform/staging (deploy_workload=true," \
-              "oracle_container_image=${{ needs.build-push.outputs.digest }})."
-            exit 0
-          fi
-          gcloud run services update "${SERVICE}" \
-            --project "${PROJECT_STAGING}" \
-            --region "${REGION}" \
-            --image "${{ needs.build-push.outputs.digest }}" \
-            --quiet
-          gcloud run services describe "${SERVICE}" --project "${PROJECT_STAGING}" --region "${REGION}" \
-            --format='value(status.latestReadyRevisionName, status.url)'
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@986523b8a550aefc41e34ba35320da74d2e5d784 # app-release @ .github main
+    with:
+      environment: staging
+      runtime: cloud-run
+      project: t0-oracle-staging
+      region: europe-west3
+      service: t0-oracle
+      ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-oracle
+      images: t0-oracle-server
+      attestor: projects/t0-artifacts/attestors/oracle-image
+      service_account: oracle-deployer@t0-artifacts.iam.gserviceaccount.com
+      image_tag: ${{ github.sha }}
+      config_file: deploy/config/staging.toml
+      config_secret: oracle-runtime-config
+      config_mount: /config/st0x-oracle-server.toml
+      validate_command: /bin/st0x-oracle-server validate /candidate.toml

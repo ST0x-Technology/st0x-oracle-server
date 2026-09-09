@@ -104,6 +104,47 @@ pub const SCHEMA_VERSION_V6: u64 = 6;
 /// depends on it.
 const NAV_RATIO_DECIMALS: u8 = 18;
 
+/// Schema version emitted by `/context/v7`. The underlying-price analogue
+/// of v5: the exact v5 nine-slot shape, but slot 1 carries the price of
+/// the vault's UNDERLYING ERC4626 asset (the offchain stock) rather than
+/// the vault-share rate, and there is NO NAV-ratio slot (RAI-2198,
+/// part of the "derive, don't gate" pivot — RAI-1479).
+///
+/// - `context[1]`: underlying price (Rain Float; the directional
+///   `underlying_rate_*` for the request's swap direction, inverted into
+///   Raindex ratio units exactly as v1–v6 invert the vault rate — see
+///   `pick_underlying_rate_bytes`)
+///
+/// v6 signs the NAV ratio (as a lossless Float at slot 9) so a strategy
+/// can assert exact equality between the signed ratio and the vault's live
+/// `convertToAssets` answer, rejecting any fill that straddles a NAV step.
+/// That exact-match gate is a DoS surface (audit H03): the vault NAV can
+/// step between the sign and the settle for reasons entirely outside an
+/// attacker's control, and every such step bricks otherwise-valid signed
+/// frames. v7 removes the gate. Instead of signing the ratio and forcing
+/// equality, it signs only the UNDERLYING price and leaves the ratio
+/// UNSIGNED — the consuming strategy (RAI-2199) reads the vault's live
+/// `erc4626-convert-to-assets` answer on-chain at settlement and DERIVES
+/// the vault price (`vault_price = underlying × convertToAssets(1 share)`)
+/// atomically. Nothing to straddle: the ratio used is always the live one.
+///
+/// The underlying is the only quantity the on-chain side can re-derive the
+/// vault price from, so it is what must be signed. The oracle stays a dumb
+/// carrier: it signs the underlying rate straight off the same cached
+/// `Quote` the vault rate would come from, and does no derivation itself.
+///
+/// The all-zero underlying rate is the "not carried" sentinel — a producer
+/// predating st0x.pricing-types' `underlying_rate_*` fields decodes them to
+/// the zero Float via `#[serde(default)]`, and a real stock rate is never
+/// zero. v7 fails closed on it (see `pick_underlying_rate_bytes`) rather
+/// than signing a garbage price: unlike v6's NAV ratio — where zero is a
+/// legitimate "non-vault base, no assertion" sentinel the strategy may
+/// accept — a zero underlying price is never usable, so the carrier
+/// refuses the request rather than pushing the decision downstream.
+///
+/// v1–v6 stay unchanged and are still served on their own endpoints.
+pub const SCHEMA_VERSION_V7: u64 = 7;
+
 /// Oracle response matching Rain's SignedContextV1 format.
 /// The JSON array shape of this struct is what upstream
 /// `rain.orderbook/crates/quote/src/oracle.rs` expects to deserialize.
@@ -428,6 +469,59 @@ pub fn build_context_v6(
     Ok(ctx)
 }
 
+/// Build the v7 signed-context array — the exact v5 nine-slot shape, but
+/// `price_bytes` is the vault's UNDERLYING price rather than the vault
+/// rate, and there is NO NAV-ratio slot (contrast v6, which appends one).
+///
+/// `price_bytes` is the 32-byte packed Rain Float the caller already
+/// picked for this request's swap direction from the quote's directional
+/// `underlying_rate_*` fields (via `pick_underlying_rate_bytes`, inverted
+/// into Raindex ratio units exactly as the vault rate is). The oracle
+/// signs it straight through — a dumb carrier, no derivation. The vault
+/// price is derived on-chain by the consuming strategy from this
+/// underlying price and the vault's LIVE NAV ratio, so no ratio is signed.
+///
+/// Layout (identical to v5 except slot 0's version and slot 1's meaning):
+/// - `context[0]`: schema version (= 7)
+/// - `context[1]`: UNDERLYING price (Rain Float; the underlying rate for
+///   this request's direction, inverted into ratio units, spread included
+///   — see `pick_underlying_rate_bytes`)
+/// - `context[2]`: publish_time (Rain Float, Unix seconds)
+/// - `context[3]`: session tag (Rain IntOrAString V3)
+/// - `context[4]`: session_start (Rain Float, Unix seconds)
+/// - `context[5]`: session_end (Rain Float, Unix seconds)
+/// - `context[6]`: input_token address (bytes32, Address left-padded)
+/// - `context[7]`: output_token address (bytes32, Address left-padded)
+/// - `context[8]`: quote expiry (Rain Float, Unix seconds; the
+///   less-than consumer assert makes the expiry second itself
+///   EXCLUSIVE — already rejected)
+///
+/// There is no `context[9]`: the ratio is never signed. The strategy reads
+/// it live on-chain at settlement (`erc4626-convert-to-assets`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_context_v7(
+    price_bytes: [u8; 32],
+    publish_time: u64,
+    session_bytes: [u8; 32],
+    session_start: u64,
+    session_end: u64,
+    input_token: Address,
+    output_token: Address,
+    quote_expiry: u64,
+) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
+    build_expiry_bound_context(
+        SCHEMA_VERSION_V7,
+        price_bytes,
+        publish_time,
+        session_bytes,
+        session_start,
+        session_end,
+        input_token,
+        output_token,
+        quote_expiry,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +813,92 @@ mod tests {
             nav_ratio_bytes(),
         )
         .unwrap();
+        assert_eq!(ctx[1].as_slice(), &bytes[..]);
+    }
+
+    #[test]
+    fn test_build_context_v7_layout() {
+        // v7 is the v5 nine-slot shape: no NAV-ratio slot. Slot 1 carries
+        // whatever price the caller passed — for v7 that is the UNDERLYING
+        // price, but at this layer it is still an opaque 32-byte Float.
+        let ctx = build_context_v7(
+            price_bytes_of("184.90"),
+            1_700_000_000,
+            v3_session_bytes(),
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.len(),
+            9,
+            "schema v7 must emit 9 elements — no NAV-ratio slot"
+        );
+
+        let version = Float::from(alloy::primitives::B256::from(ctx[0]));
+        assert_eq!(version.format().unwrap(), "7");
+
+        let price = Float::from(alloy::primitives::B256::from(ctx[1]));
+        assert_eq!(price.format().unwrap(), "184.9");
+
+        // Slots 6/7 keep the v4 pair binding.
+        assert_eq!(&ctx[6].as_slice()[12..], IN_TOKEN.as_slice());
+        assert_eq!(&ctx[6].as_slice()[..12], [0u8; 12]);
+        assert_eq!(&ctx[7].as_slice()[12..], OUT_TOKEN.as_slice());
+
+        // Slot 8 keeps the v5 expiry, and is the LAST slot.
+        let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
+        assert_eq!(expiry.format().unwrap(), float_string_of(1_700_000_020));
+    }
+
+    #[test]
+    fn test_build_context_v7_is_v5_shape_bytewise() {
+        // v7 and v5 share the same builder and the same nine slots; for
+        // identical inputs they must be byte-identical except the schema
+        // version at slot 0. (The values DIFFER in production only because
+        // the handler feeds v7 the underlying price and v5 the vault rate;
+        // the context shape itself is the same.) This pins that v7 is v5's
+        // shape with no ratio slot, so a v5-derived consumer parsing v7
+        // sees the layout it expects up to slot 8.
+        let price = price_bytes_of("184.90");
+        let sess = v3_session_bytes();
+        let v5 = build_context_v5(
+            price,
+            1_700_000_000,
+            sess,
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+        )
+        .unwrap();
+        let v7 = build_context_v7(
+            price,
+            1_700_000_000,
+            sess,
+            1_700_000_000,
+            1_700_023_400,
+            IN_TOKEN,
+            OUT_TOKEN,
+            1_700_000_020,
+        )
+        .unwrap();
+
+        assert_eq!(v7.len(), v5.len(), "v7 must have the v5 slot count");
+        assert_eq!(v7.len(), 9, "and that count is 9 — no ratio slot");
+        // Slot 0 is the schema version and is expected to differ.
+        assert_eq!(&v7[1..], &v5[1..], "v7 is byte-for-byte v5 past slot 0");
+    }
+
+    #[test]
+    fn test_build_context_v7_passes_price_bytes_through_unchanged() {
+        let bytes = price_bytes_of("0.005");
+        let ctx =
+            build_context_v7(bytes, 1, v3_session_bytes(), 1, 2, IN_TOKEN, OUT_TOKEN, 3).unwrap();
         assert_eq!(ctx[1].as_slice(), &bytes[..]);
     }
 }

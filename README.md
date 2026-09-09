@@ -37,7 +37,7 @@ change every second and the cache stops helping until the calendar loads.
 `oracle_signature_cache_entries` on `/metrics` show the effect; the KMS
 bill follows the misses.
 
-### Reusing a signature across frames (v5, v6)
+### Reusing a signature across frames (v5, v6, v7)
 
 A new price frame every few seconds does not mean a new price. When the
 frame for a pair carries the same price as the one already signed, under

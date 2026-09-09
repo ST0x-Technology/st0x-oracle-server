@@ -24,7 +24,7 @@ use alloy::primitives::{Address, FixedBytes};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Everything in a v5/v6 signed context EXCEPT publish_time and expiry.
+/// Everything in a v5/v6/v7 signed context EXCEPT publish_time and expiry.
 /// If all of this matches the previous signature for the pair, the two
 /// contexts state the same price under the same session for the same
 /// tokens; only their timestamps differ.
