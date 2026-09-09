@@ -1148,22 +1148,7 @@ async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> axum::Router {
 /// POST a single (USDC -> WCOIN) request to `endpoint` and return the
 /// signed context of the one response.
 async fn context_of(app: axum::Router, endpoint: &str) -> Vec<FixedBytes<32>> {
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri(endpoint)
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(responses.len(), 1);
-    responses[0].context.clone()
+    response_of(app, endpoint).await.context
 }
 
 #[tokio::test]
@@ -1489,6 +1474,33 @@ async fn test_v5_near_expiry_quote_is_not_reused() {
     let second = response_of(app, "/context/v5").await;
     assert_eq!(publish_time_of(&second), secs(FIXED_PUBLISH_TIME + 5));
     assert_ne!(second.context, first.context);
+}
+
+#[tokio::test]
+async fn test_v5_shorter_expiry_on_new_frame_is_not_reused() {
+    // Same price, but pricing has pulled the horizon in (a recalibrated
+    // profile, or a mark it no longer stands behind). The stored 60s
+    // signature would still clear the margin, yet serving it would vouch
+    // for the price past the point the producer disowned it.
+    let (app, pricing) = reuse_test_app(10).await;
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME, 60)).await;
+    let first = response_of(app.clone(), "/context/v5").await;
+
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME + 5, 15)).await;
+    let second = response_of(app.clone(), "/context/v5").await;
+    assert_eq!(publish_time_of(&second), secs(FIXED_PUBLISH_TIME + 5));
+    assert_ne!(
+        second.context[8], first.context[8],
+        "the shorter expiry is signed"
+    );
+
+    // The horizon opens back up: the 15s signature is the one on file
+    // and still fits inside the new frame, so it is reused.
+    pricing
+        .seed(frame("100", FIXED_PUBLISH_TIME + 10, 60))
+        .await;
+    let third = response_of(app, "/context/v5").await;
+    assert_eq!(third.context, second.context);
 }
 
 #[tokio::test]

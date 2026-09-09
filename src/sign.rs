@@ -16,9 +16,10 @@ use tokio::sync::watch;
 const SIGN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a request waits on a signature another request is already
-/// producing: the full attempt-plus-retry budget of that sign, with slack.
-/// Waiters never sign themselves, so this is also the worst case a caller
-/// can spend inside `sign_context`.
+/// producing: the full attempt-plus-retry budget of that sign, with slack,
+/// measured from when the sign STARTED, not from when this request joined
+/// it. Waiters never sign themselves, so this is also the worst case a
+/// caller can spend inside `sign_context`.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2 * 5 + 1);
 
 /// Idle time after which a cached signature is dropped. Validity is not the
@@ -55,8 +56,8 @@ enum SignState {
 /// sign fails all current waiters at once instead of letting each retry
 /// in turn.
 struct CacheEntry {
-    /// Millis since `SignatureCache::epoch` at the last hit or insert.
-    last_used: AtomicU64,
+    /// When the sign task was spawned; the wait budget counts from here.
+    started_at: Instant,
     state: watch::Receiver<SignState>,
 }
 
@@ -64,10 +65,26 @@ impl CacheEntry {
     fn is_pending(&self) -> bool {
         matches!(*self.state.borrow(), SignState::Pending)
     }
+
+    /// A sign that is still in flight. A slot whose sender is gone while
+    /// the value is still `Pending` had its task die without reporting
+    /// (a panic, or a spawn during shutdown); nobody will ever fill it,
+    /// so it must not count as live or it poisons its hash for the life
+    /// of the process.
+    fn is_in_flight(&self) -> bool {
+        self.is_pending() && self.state.has_changed().is_ok()
+    }
+}
+
+/// Map value: the shared entry plus its idle clock. `last_used` is only
+/// read or written under the map lock, so it needs no atomics.
+struct Slot {
+    last_used: Instant,
+    entry: Arc<CacheEntry>,
 }
 
 struct CacheMap {
-    entries: HashMap<FixedBytes<32>, Arc<CacheEntry>>,
+    entries: HashMap<FixedBytes<32>, Slot>,
     inserts_since_sweep: u64,
 }
 
@@ -85,7 +102,6 @@ struct CacheMap {
 /// stops helping until the calendar loads. It stays correct, just useless.
 struct SignatureCache {
     map: Mutex<CacheMap>,
-    epoch: Instant,
     idle_ttl: Duration,
     max_entries: usize,
     /// Signs started (one per distinct input actually sent to KMS).
@@ -108,7 +124,6 @@ impl SignatureCache {
                 entries: HashMap::new(),
                 inserts_since_sweep: 0,
             }),
-            epoch: Instant::now(),
             idle_ttl,
             max_entries,
             misses: AtomicU64::new(0),
@@ -116,26 +131,20 @@ impl SignatureCache {
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    fn is_live(&self, entry: &CacheEntry, now_ms: u64) -> bool {
-        entry.is_pending()
-            || now_ms.saturating_sub(entry.last_used.load(Ordering::Relaxed))
-                < u64::try_from(self.idle_ttl.as_millis()).unwrap_or(u64::MAX)
+    fn is_live(&self, slot: &Slot, now: Instant) -> bool {
+        slot.entry.is_in_flight() || now.duration_since(slot.last_used) < self.idle_ttl
     }
 
     /// Find or create the slot for `hash`. Synchronous: the map lock never
     /// spans an await, signing happens outside it.
     fn lookup(&self, hash: FixedBytes<32>) -> Lookup {
         let mut guard = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        let now_ms = self.now_ms();
+        let now = Instant::now();
 
-        if let Some(entry) = guard.entries.get(&hash) {
-            if self.is_live(entry, now_ms) {
-                entry.last_used.store(now_ms, Ordering::Relaxed);
-                return Lookup::Existing(Arc::clone(entry));
+        if let Some(slot) = guard.entries.get_mut(&hash) {
+            if self.is_live(slot, now) {
+                slot.last_used = now;
+                return Lookup::Existing(Arc::clone(&slot.entry));
             }
             guard.entries.remove(&hash);
         }
@@ -145,19 +154,25 @@ impl SignatureCache {
             || guard.entries.len() >= self.max_entries
         {
             guard.inserts_since_sweep = 0;
-            guard.entries.retain(|_, e| self.is_live(e, now_ms));
+            guard.entries.retain(|_, slot| self.is_live(slot, now));
             if guard.entries.len() >= self.max_entries {
                 // Still over: drop everything finished, keep in-flight signs.
-                guard.entries.retain(|_, e| e.is_pending());
+                guard.entries.retain(|_, slot| slot.entry.is_in_flight());
             }
         }
 
         let (tx, rx) = watch::channel(SignState::Pending);
         let entry = Arc::new(CacheEntry {
-            last_used: AtomicU64::new(now_ms),
+            started_at: now,
             state: rx,
         });
-        guard.entries.insert(hash, Arc::clone(&entry));
+        guard.entries.insert(
+            hash,
+            Slot {
+                last_used: now,
+                entry: Arc::clone(&entry),
+            },
+        );
         ::metrics::gauge!("oracle_signature_cache_entries").set(guard.entries.len() as f64);
         Lookup::Fresh(entry, tx)
     }
@@ -169,7 +184,7 @@ impl SignatureCache {
         if guard
             .entries
             .get(&hash)
-            .is_some_and(|current| Arc::ptr_eq(current, entry))
+            .is_some_and(|current| Arc::ptr_eq(&current.entry, entry))
         {
             guard.entries.remove(&hash);
             ::metrics::gauge!("oracle_signature_cache_entries").set(guard.entries.len() as f64);
@@ -192,6 +207,8 @@ pub struct SignatureCacheStats {
 struct TestHook {
     delay: Duration,
     fail: bool,
+    /// Drop the sender without reporting, as a panicking task would.
+    abort: bool,
 }
 
 /// EIP-191 signer for Rain signed context.
@@ -397,22 +414,30 @@ impl Signer {
             }
         };
 
+        // Budget from the sign's own start, so a request that joins late
+        // does not add a full timeout on top of what the sign already
+        // spent. A settled channel resolves on the first poll even when
+        // the remaining budget is zero.
+        let remaining = WAIT_TIMEOUT.saturating_sub(entry.started_at.elapsed());
         let mut rx = entry.state.clone();
-        let settled = tokio::time::timeout(
-            WAIT_TIMEOUT,
-            rx.wait_for(|s| !matches!(s, SignState::Pending)),
-        )
-        .await;
+        let settled =
+            tokio::time::timeout(remaining, rx.wait_for(|s| !matches!(s, SignState::Pending)))
+                .await;
         match settled {
             Ok(Ok(state)) => match &*state {
                 SignState::Done(sig) => Ok((sig.clone(), self.address())),
                 SignState::Failed(msg) => Err(anyhow::anyhow!("{msg}")),
                 SignState::Pending => unreachable!("wait_for returned while pending"),
             },
-            // Sender dropped without a result: the sign task panicked.
-            Ok(Err(_)) => Err(anyhow::anyhow!(
-                "signing task aborted before producing a result"
-            )),
+            // Sender dropped without a result: the sign task died (panic or
+            // runtime shutdown). Evict so the next request signs fresh
+            // instead of inheriting the dead slot forever.
+            Ok(Err(_)) => {
+                self.cache.evict(hash, &entry);
+                Err(anyhow::anyhow!(
+                    "signing task aborted before producing a result"
+                ))
+            }
             Err(_) => Err(anyhow::anyhow!(
                 "timed out after {}s waiting for an in-flight signature",
                 WAIT_TIMEOUT.as_secs()
@@ -438,6 +463,10 @@ impl Signer {
             #[cfg(test)]
             if let Some(h) = hook {
                 tokio::time::sleep(h.delay).await;
+                if h.abort {
+                    drop(tx);
+                    return;
+                }
                 if h.fail {
                     cache.evict(hash, &entry);
                     let _ = tx.send(SignState::Failed("injected test failure".into()));
@@ -612,6 +641,7 @@ mod tests {
         let signer = Arc::new(Signer::new(TEST_KEY).unwrap().with_test_hook(TestHook {
             delay: Duration::from_millis(50),
             fail: false,
+            abort: false,
         }));
         let context = vec![FixedBytes::<32>::from(U256::from(42u64))];
         let tasks: Vec<_> = (0..32)
@@ -643,6 +673,7 @@ mod tests {
         let signer = Arc::new(Signer::new(TEST_KEY).unwrap().with_test_hook(TestHook {
             delay: Duration::from_millis(80),
             fail: false,
+            abort: false,
         }));
         let context = vec![FixedBytes::<32>::from(U256::from(9u64))];
         let leader = {
@@ -666,6 +697,7 @@ mod tests {
         let signer = Arc::new(Signer::new(TEST_KEY).unwrap().with_test_hook(TestHook {
             delay: Duration::from_millis(30),
             fail: true,
+            abort: false,
         }));
         let context = vec![FixedBytes::<32>::from(U256::from(3u64))];
         let started = std::time::Instant::now();
@@ -685,6 +717,30 @@ mod tests {
         // The dead slot was evicted: the next request starts a fresh sign.
         let _ = signer.sign_context(&context).await;
         assert_eq!(signer.cache_stats().misses, 2);
+    }
+
+    #[tokio::test]
+    async fn test_sign_context_dead_task_does_not_poison_the_slot() {
+        // The sign task dies without reporting (what a panic inside the
+        // KMS client looks like from here). The waiters fail, but the next
+        // request for the same bytes must start a fresh sign rather than
+        // trip over the dead slot until restart.
+        let signer = Arc::new(Signer::new(TEST_KEY).unwrap().with_test_hook(TestHook {
+            delay: Duration::from_millis(20),
+            fail: false,
+            abort: true,
+        }));
+        let context = vec![FixedBytes::<32>::from(U256::from(7u64))];
+        let err = signer.sign_context(&context).await.unwrap_err();
+        assert!(err.to_string().contains("aborted"), "got: {err}");
+        assert_eq!(signer.cache_stats().misses, 1);
+
+        let _ = signer.sign_context(&context).await;
+        assert_eq!(
+            signer.cache_stats().misses,
+            2,
+            "the dead slot was evicted and re-signed"
+        );
     }
 
     #[tokio::test]

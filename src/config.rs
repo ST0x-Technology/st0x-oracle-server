@@ -14,32 +14,28 @@ pub struct Config {
     pub signing: SigningConfig,
 }
 
-/// Default margin for cross-frame signature reuse (see `reuse`): a
-/// previous v5/v6/v7 quote is served again only while it still has at least
-/// this many seconds before its expiry. Pricing stamps expiry 20 to 30s
-/// after the frame, so 10s leaves a taker a real settlement window.
-pub const DEFAULT_REUSE_MIN_REMAINING_SECS: u64 = 10;
-
-/// Signing economics. Optional `[signing]` table in the TOML.
+/// Signing economics. Optional `[signing]` table in the TOML; a missing
+/// table or a missing key takes the `Default`. Unknown keys are rejected
+/// so a misspelt knob fails config-check instead of silently keeping the
+/// default (this is the one runtime tunable an operator reaches for
+/// during an incident).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SigningConfig {
     /// Seconds a previous v5/v6/v7 quote must still have before its expiry to
     /// be reused instead of signing an unchanged price under a new
     /// publish_time. 0 disables reuse (every new frame is signed).
-    #[serde(default = "default_reuse_min_remaining_secs")]
+    /// Pricing stamps expiry 20 to 30s after the frame, so the default of
+    /// 10s leaves a taker a real settlement window.
     pub reuse_min_remaining_secs: u64,
 }
 
 impl Default for SigningConfig {
     fn default() -> Self {
         Self {
-            reuse_min_remaining_secs: DEFAULT_REUSE_MIN_REMAINING_SECS,
+            reuse_min_remaining_secs: 10,
         }
     }
-}
-
-fn default_reuse_min_remaining_secs() -> u64 {
-    DEFAULT_REUSE_MIN_REMAINING_SECS
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +153,53 @@ mod tests {
         let cfg: Config = toml::from_str(&text).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.port, 3000);
+    }
+
+    #[test]
+    fn signing_defaults_and_overrides() {
+        let base = format!(
+            r#"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "COIN"
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&base).unwrap();
+        assert_eq!(
+            cfg.signing.reuse_min_remaining_secs, 10,
+            "no table: default"
+        );
+
+        let cfg: Config = toml::from_str(&format!("{base}\n[signing]\n")).unwrap();
+        assert_eq!(
+            cfg.signing.reuse_min_remaining_secs, 10,
+            "empty table: default"
+        );
+
+        let cfg: Config = toml::from_str(&format!(
+            "{base}\n[signing]\nreuse_min_remaining_secs = 0\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.signing.reuse_min_remaining_secs, 0);
+    }
+
+    #[test]
+    fn rejects_unknown_signing_key() {
+        // A typo in the one incident-time knob must fail loud, not keep
+        // the default.
+        let text = format!(
+            r#"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "COIN"
+            {MIN_PRICING}
+            [signing]
+            reuse_min_remaining_sec = 0
+        "#
+        );
+        let err = toml::from_str::<Config>(&text).unwrap_err().to_string();
+        assert!(err.contains("reuse_min_remaining_sec"), "got: {err}");
     }
 
     #[test]

@@ -110,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         pricing_ws_url = %config.pricing.ws_url,
         pricing_consumer = %config.pricing.consumer,
         token_count = config.tokens.len(),
+        signature_reuse_min_remaining_secs = config.signing.reuse_min_remaining_secs,
         "Loaded config"
     );
 
