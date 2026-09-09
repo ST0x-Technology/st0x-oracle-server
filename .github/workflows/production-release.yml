@@ -1,27 +1,27 @@
 name: production-release
 
-# Production releases that are NOT a new version tag (those are
-# release-tag.yml):
-#   - a merge to main touching deploy/config/production.toml is a
-#     CONFIG-ONLY release: the file is validated inside the digest LIVE in
-#     production, published as a new oracle-runtime-config version, and the
-#     service re-rolls on the same digest;
-#   - workflow_dispatch with a version is a ROLLBACK (or re-deploy): image
-#     and config both come from that tag.
-# Both block on the app-deploy PAM grant in t0-oracle, approved in the GCP
-# console; the justification names the digest and config version swap.
+# THE production release for this repo, and the only way to roll it. One
+# manual action plus the app-deploy PAM approval in t0-oracle:
+#   Actions -> production-release -> Run workflow
+#     version = vX.Y.Z  : image AND deploy/config/production.toml from that tag
+#                         (new version, re-deploy or rollback);
+#     version empty     : CONFIG-ONLY release, deploy/config/production.toml
+#                         from the default branch on the digest LIVE in
+#                         production.
+# Nothing fires on its own any more (until 2026-09-08 a merge touching the
+# production config requested a grant by itself, and release-tag.yml did
+# the same for every tag; RAI-2266). Either way the file is validated
+# inside the exact image it will run on before the grant is requested,
+# published as a runtime-config version, and a new revision rolls with
+# that version pinned once an approver activates the grant.
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - deploy/config/production.toml
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag to deploy (vX.Y.Z), image and config both from that tag"
-        required: true
+        description: "vX.Y.Z to deploy image and config from that tag; leave empty for a config-only release of deploy/config/production.toml from the default branch onto the live image"
+        required: false
+        default: ""
         type: string
 
 concurrency:
