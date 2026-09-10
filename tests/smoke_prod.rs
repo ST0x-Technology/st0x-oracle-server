@@ -192,3 +192,52 @@ async fn prod_publish_time_is_monotonic_and_dedupes() {
         secs
     );
 }
+
+/// Batch with `?allowFailure=true` against prod. Shape-only: two slots
+/// for two requests. Until the envelope change is deployed, prod ignores
+/// the flag and returns the bare `OracleResponse` array; after, each
+/// slot is `{status, body}`. The test accepts either and prints which,
+/// so it can run across the deploy without a flip-day edit — tighten it
+/// to envelope-only once prod is confirmed on the new build.
+#[tokio::test]
+async fn prod_batch_with_allow_failure_flag_has_one_slot_per_item() {
+    if !smoke_enabled() {
+        return;
+    }
+
+    let body = vec![order_tuple(USDC, WCOIN), order_tuple(WCOIN, USDC)].abi_encode();
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{PROD_URL}?allowFailure=true"))
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let slots: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(slots.len(), 2, "batch of 2 → 2 slots");
+
+    for (i, slot) in slots.iter().enumerate() {
+        match slot.get("status").and_then(|s| s.as_str()) {
+            Some("ok") => {
+                let r: OracleResponse = serde_json::from_value(slot["body"].clone()).unwrap();
+                assert_eq!(r.signature.len(), 65, "slot {i} signature length");
+                eprintln!("slot {i}: envelope ok");
+            }
+            Some("error") => {
+                assert!(slot["body"]["error"].is_string(), "slot {i}: {slot}");
+                assert!(slot["body"]["detail"].is_string(), "slot {i}: {slot}");
+                eprintln!("slot {i}: envelope error {}", slot["body"]["error"]);
+            }
+            Some(other) => panic!("slot {i}: unknown status {other}"),
+            None => {
+                // Pre-deploy shape: bare OracleResponse.
+                let r: OracleResponse = serde_json::from_value(slot.clone()).unwrap();
+                assert_eq!(r.signature.len(), 65, "slot {i} signature length");
+                eprintln!("slot {i}: bare OracleResponse (flag not yet deployed)");
+            }
+        }
+    }
+}

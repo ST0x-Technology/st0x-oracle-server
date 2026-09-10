@@ -19,8 +19,9 @@ on-chain oracle gas costs.
    inversion in Rain DecimalFloat precision (not f64).
 4. Encodes `[schema_version, price, publish_time]` as Rain DecimalFloats where
    `publish_time` is Alpaca's own quote timestamp (NOT our fetch time).
-5. Signs via EIP-191 and returns a JSON array of `OracleResponse` whose length
-   matches the request length.
+5. Signs via EIP-191 and returns a JSON array whose length matches the request
+   length: `OracleResponse` items by default, or one `ok`/`error` item per
+   request when a batch is sent with `?allowFailure=true` (see below).
 
 If Alpaca is temporarily unreachable, the poll loop logs the error and leaves
 the previous cached quote in place. The Rainlang strategy bounds freshness via a
@@ -275,8 +276,8 @@ Accepts either form (matching upstream
   `(OrderV4, uint256 inputIOIndex, uint256 outputIOIndex, address counterparty)`
 - **Batch**: ABI-encoded `(OrderV4, uint256, uint256, address)[]`
 
-The response is always a JSON array of `OracleResponse`, with length matching
-the request:
+By default the response is a JSON array of `OracleResponse`, with length
+matching the request:
 
 ```json
 [
@@ -292,12 +293,55 @@ If the requested symbol has no usable pricing quote, every context schema
 returns HTTP 503 with one of two stable machine-readable `error` values:
 `no_live_quote` when the cache has no live entry, or `expired_quote` when the
 cached quote has reached its exclusive expiry deadline. `detail` is for humans;
-clients must match `error` exactly. A batch fails as one request and never
-returns a partial response array. Schemas v1 and v4 enforce the pricing frame's
-raw millisecond deadline. Schemas v5, v6, and v7 encode slot 8 in whole Unix
-seconds and the on-chain check is exclusive, so they floor the deadline and
-refuse the final partial second once the current time reaches that encoded
-second.
+clients must match `error` exactly. Without the `allowFailure` flag (see
+below) a batch fails as one request and never returns a partial response
+array. Schemas v1 and v4 enforce the pricing frame's raw millisecond deadline.
+Schemas v5, v6, and v7 encode slot 8 in whole Unix seconds and the on-chain
+check is exclusive, so they floor the deadline and refuse the final partial
+second once the current time reaches that encoded second.
+
+### Per-item results for batches: `allowFailure`
+
+By default a batch is all-or-nothing. If one item fails, the server returns
+one HTTP error for the full request, and no item gets a signed context.
+
+Add `?allowFailure=true` to the URL to get one result per item instead:
+
+```http
+POST /context/v7?allowFailure=true
+```
+
+With the flag, a batch response is always HTTP 200. Each item is either a
+signed context or an error, in request order:
+
+```json
+[
+  { "status": "ok",    "body": { "signer": "0x...", "context": ["0x..."], "signature": "0x..." } },
+  { "status": "error", "body": { "error": "no_live_quote", "detail": "No live quote for DRAM." } }
+]
+```
+
+The `error` codes are the same as the HTTP error bodies: `bad_request`,
+`no_live_quote`, `expired_quote`, and `internal_error`. The expiry check at
+the end of a batch also applies per item: a slot that expired while the
+batch signed is an error item, and the other slots are still delivered.
+
+Rules:
+
+| Request | Flag | Response |
+|---|---|---|
+| Undecodable body | any | `400 {error, detail}` |
+| Single tuple | any | Unchanged: `200 [OracleResponse]` or `4xx/5xx {error, detail}` |
+| Batch | absent, `false`, or other | Unchanged: first failing item fails the request |
+| Batch, N items | `true` or `1` | `200`, N items with `status` and `body` |
+| Batch, 0 items | `true` or `1` | `200 []` |
+
+The flag applies to all `/context/v*` endpoints. The key is case-sensitive.
+Unknown query keys are ignored.
+
+Do not put the flag in the on-chain oracle meta URL of an order. A client
+that does not understand the item format cannot parse the response. The
+client adds the flag itself when it supports the format.
 
 Schema v1 context layout (all Rain DecimalFloats):
 
