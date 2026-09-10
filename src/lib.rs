@@ -220,33 +220,10 @@ async fn post_signed_context_v1_inner(
         return Ok(Json(Vec::<oracle::OracleResponse>::new()));
     }
 
-    // Resolve every request's token pair first so we know which symbols
-    // we need from the cache. This lets us take a single snapshot of
-    // exactly those entries, so a poll loop update mid-iteration can't
-    // mix quotes (or publish_time values) for the same symbol within
-    // one HTTP response.
-    let mut resolved: Vec<(OrderV4, ResolvedPair)> = Vec::with_capacity(requests.len());
-    for (order, input_io_index, output_io_index, _counterparty) in requests {
-        let pair = resolve_pair_for_order(&state, &order, input_io_index, output_io_index)?;
-        resolved.push((order, pair));
+    for (order, input_io_index, output_io_index, _) in requests {
+        resolve_pair_for_order(&state, &order, input_io_index, output_io_index)?;
     }
-
-    let needed_symbols: Vec<&str> = resolved.iter().map(|(_, p)| p.symbol.as_str()).collect();
-    let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
-
-    let mut responses = Vec::with_capacity(resolved.len());
-    for (_, pair) in &resolved {
-        let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
-            AppError::Unavailable(format!(
-                "No live quote for {} yet. The pricing WS has not delivered a frame since startup.",
-                pair.symbol
-            ))
-        })?;
-        let resp = build_response_from_quote(&state, pair, &quote).await?;
-        responses.push(resp);
-    }
-
-    Ok(Json(responses))
+    Err(legacy_signature_unavailable())
 }
 
 /// Record a `/context/v{N}` request's outcome on the `oracle_context_request_total`
@@ -271,18 +248,9 @@ fn record_request_outcome(
     .increment(1);
 }
 
-/// v4 handler — `/context/v4` endpoint. Same request shape and
-/// snapshot-once batching as v1, plus the caller's raw
-/// `validInputs[input_io_index].token` /
-/// `validOutputs[output_io_index].token` addresses are stamped into
-/// signed-context slots 6 and 7 respectively.
-///
-/// The security property: a v4 strategy that asserts
-/// `equal-to(signed-context<0 6> input-token()) &&
-/// equal-to(signed-context<0 7> output-token())` can no longer be
-/// tricked into applying a signed price for pair `(A,B)` against an
-/// order whose IO pair is `(C,D)`. See `oracle::SCHEMA_VERSION_V4`
-/// for the full context layout.
+/// Legacy `/context/v4` endpoint. Valid non-empty requests receive HTTP
+/// 503 because v4 lacks a settlement expiry. Migrate to v5, v6, or v7;
+/// all retain v4's binding to the requested input and output tokens.
 async fn post_signed_context_v4(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -463,6 +431,13 @@ async fn post_signed_context_pair_bound(
         responses.push(resp);
     }
 
+    // Signing a later element can suspend the batch after an earlier response
+    // passed its checks. Re-read all bounds together without rebuilding prices.
+    let current = state.pricing.snapshot_many(&needed_symbols).await;
+    let now_ms = Utc::now().timestamp_millis();
+    for ((_, _, pair), response) in resolved.iter().zip(&responses) {
+        validate_response_at(response, current.get(&pair.symbol), now_ms)?;
+    }
     Ok(Json(responses))
 }
 
@@ -701,35 +676,51 @@ fn publish_time_from_quote(quote: &Quote) -> Result<u64, AppError> {
 /// trading on a price the model has disowned, and the whole point of v5
 /// is that this number is trustworthy.
 fn expiry_from_quote(quote: &Quote) -> Result<u64, AppError> {
-    u64::try_from(quote.expiry_unix_ms / 1000)
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("quote expiry out of range")))
+    let deadline = quote
+        .execution_deadline_unix_ms
+        .filter(|deadline| *deadline > 0)
+        .ok_or_else(|| AppError::Unavailable("execution deadline missing or invalid".into()))?;
+    let expiry = u64::try_from(quote.expiry_unix_ms.min(deadline))
+        .map_err(|_| AppError::Unavailable("quote expiry out of range".into()))?;
+    Ok(expiry / 1000)
 }
 
-async fn build_response_from_quote(
-    state: &AppState,
-    pair: &ResolvedPair,
-    quote: &Quote,
-) -> Result<oracle::OracleResponse, AppError> {
-    let publish_time = publish_time_from_quote(quote)?;
+fn validate_quote_at(quote: &Quote, now_ms: i64) -> Result<(), AppError> {
+    let expiry = expiry_from_quote(quote)?;
+    if now_ms < 0 || expiry <= (now_ms / 1000) as u64 {
+        return Err(AppError::Unavailable(
+            "quote freshness or execution deadline elapsed".into(),
+        ));
+    }
+    Ok(())
+}
 
-    let price_bytes = pick_rate_bytes(quote, pair.direction).map_err(AppError::Internal)?;
+fn validate_response_at(
+    response: &oracle::OracleResponse,
+    current: Option<&Quote>,
+    now_ms: i64,
+) -> Result<(), AppError> {
+    let current = current.ok_or_else(|| {
+        AppError::Unavailable("live quote removed while preparing response".into())
+    })?;
+    validate_quote_at(current, now_ms)?;
+    let signed_expiry: u64 = Float::from(response.context[8])
+        .to_fixed_decimal(0)
+        .map_err(|error| AppError::Internal(error.into()))?
+        .try_into()
+        .map_err(|error| AppError::Internal(anyhow::anyhow!("invalid signed expiry: {error}")))?;
+    if signed_expiry <= (now_ms / 1000) as u64 || signed_expiry > expiry_from_quote(current)? {
+        return Err(AppError::Unavailable(
+            "signed expiry elapsed or exceeds the current execution bound".into(),
+        ));
+    }
+    Ok(())
+}
 
-    tracing::info!(
-        symbol = %pair.symbol,
-        direction = pair.direction.as_str(),
-        publish_time = publish_time,
-        source_ts_unix_ms = quote.source_ts_unix_ms,
-        "Building signed context from live pricing quote"
-    );
-
-    let context = oracle::build_context(price_bytes, publish_time)?;
-    let (signature, signer) = state.signer.sign_context(&context).await?;
-
-    Ok(oracle::OracleResponse {
-        signer,
-        context,
-        signature,
-    })
+fn legacy_signature_unavailable() -> AppError {
+    AppError::Unavailable(
+        "legacy schema has no verified settlement expiry bound; migrate to v5, v6 or v7".into(),
+    )
 }
 
 /// Pair-bound response builder (v4/v5/v6/v7). Same publish_time logic as
@@ -749,6 +740,10 @@ async fn build_response_from_quote_pair_bound(
     session_info: &crate::market_hours::SessionInfo,
     schema: PairSchema,
 ) -> Result<oracle::OracleResponse, AppError> {
+    if schema == PairSchema::V4 {
+        return Err(legacy_signature_unavailable());
+    }
+    validate_quote_at(quote, Utc::now().timestamp_millis())?;
     // publish_time is the pricing quote's source_ts (see
     // `build_response_from_quote`); session slots come from the oracle's
     // own market-hours classification.
@@ -870,6 +865,9 @@ async fn build_response_from_quote_pair_bound(
                 source_ts_unix_ms = quote.source_ts_unix_ms,
                 "Price unchanged and previous quote still valid; reusing its signature"
             );
+            validate_quote_at(quote, Utc::now().timestamp_millis())?;
+            let current = state.pricing.latest(&pair.symbol).await;
+            validate_response_at(&previous, current.as_ref(), Utc::now().timestamp_millis())?;
             return Ok(previous);
         }
     }
@@ -889,13 +887,17 @@ async fn build_response_from_quote_pair_bound(
         "Building pair-bound signed context from live pricing quote"
     );
 
+    validate_quote_at(quote, Utc::now().timestamp_millis())?;
     let (signature, signer) = state.signer.sign_context(&context).await?;
+    validate_quote_at(quote, Utc::now().timestamp_millis())?;
 
     let response = oracle::OracleResponse {
         signer,
         context,
         signature,
     };
+    let current = state.pricing.latest(&pair.symbol).await;
+    validate_response_at(&response, current.as_ref(), Utc::now().timestamp_millis())?;
     if let Some((key, expiry)) = reuse {
         state.reuse.store(key, expiry, response.clone());
     }
@@ -954,5 +956,228 @@ impl IntoResponse for AppError {
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         Self::Internal(err)
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use alloy::primitives::U256;
+    use st0x_pricing_types::{WireAddress, WireFloat, WireU256};
+    use tokio::sync::Semaphore;
+
+    const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    fn request(base: Address, quote: Address) -> (OrderV4, U256, U256, Address) {
+        (
+            OrderV4 {
+                owner: Address::ZERO,
+                evaluable: EvaluableV4 {
+                    interpreter: Address::ZERO,
+                    store: Address::ZERO,
+                    bytecode: Bytes::new().into(),
+                },
+                validInputs: vec![IOV2 {
+                    token: quote,
+                    vaultId: Default::default(),
+                }],
+                validOutputs: vec![IOV2 {
+                    token: base,
+                    vaultId: Default::default(),
+                }],
+                nonce: Default::default(),
+            },
+            U256::ZERO,
+            U256::ZERO,
+            Address::ZERO,
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_deadline_changes_reject_in_flight_responses() {
+        for schema in [PairSchema::V5, PairSchema::V6, PairSchema::V7] {
+            for (batch, reuse) in [(false, false), (true, false), (true, true)] {
+                for change in ["shorten", "revoke", "halt", "extend"] {
+                    let entered = Arc::new(Semaphore::new(0));
+                    let release = Arc::new(Semaphore::new(0));
+                    let signer = Signer::new(TEST_KEY)
+                        .unwrap()
+                        .with_gate(entered.clone(), release.clone());
+                    let expiry = Utc::now().timestamp_millis() + 120_000;
+                    let mut coin = quote(Some(expiry), expiry);
+                    let rate = WireFloat(B256::from(Float::parse("1".into()).unwrap()).into());
+                    coin.rate_base_to_quote = rate;
+                    coin.rate_quote_to_base = rate;
+                    coin.underlying_rate_base_to_quote = rate;
+                    coin.underlying_rate_quote_to_base = rate;
+                    let mut other = coin.clone();
+                    other.asset = "OTHER".into();
+                    other.base = WireAddress([3; 20]);
+                    let base = Address::from([1; 20]);
+                    let quote_token = Address::from([2; 20]);
+                    let other_base = Address::from([3; 20]);
+                    let pricing = LiveClient::with_seeded(vec![coin.clone(), other]).await;
+                    let market_hours = Arc::new(MarketHoursCache::new());
+                    let now = Utc::now();
+                    market_hours
+                        .set(vec![market_hours::SessionWindow {
+                            date: now.date_naive(),
+                            session_open: now - chrono::Duration::hours(8),
+                            rth_open: now - chrono::Duration::hours(2),
+                            rth_close: now + chrono::Duration::hours(2),
+                            session_close: now + chrono::Duration::hours(8),
+                        }])
+                        .await;
+                    let state = Arc::new(
+                        AppState::new(
+                            signer,
+                            TokenRegistry::new(
+                                vec![
+                                    (base.to_string(), "COIN".into()),
+                                    (other_base.to_string(), "OTHER".into()),
+                                ],
+                                &quote_token.to_string(),
+                            )
+                            .unwrap(),
+                            pricing.clone(),
+                            vec!["COIN".into(), "OTHER".into()],
+                            market_hours,
+                            MetricsHandle::install().unwrap(),
+                        )
+                        .with_signature_reuse(if reuse { 10 } else { 0 }),
+                    );
+                    let single = Bytes::from(request(base, quote_token).abi_encode());
+                    if batch {
+                        release.add_permits(1);
+                        assert!(post_signed_context_pair_bound(
+                            state.clone(),
+                            single.clone(),
+                            schema
+                        )
+                        .await
+                        .is_ok());
+                        entered.acquire().await.unwrap().forget();
+                    }
+                    // For reuse, the blocked second element leaves the first cached
+                    // response waiting at the final batch gate.
+                    let body = if batch {
+                        Bytes::from(
+                            vec![request(base, quote_token), request(other_base, quote_token)]
+                                .abi_encode(),
+                        )
+                    } else {
+                        single
+                    };
+                    if batch && !reuse {
+                        release.add_permits(1);
+                    }
+                    let task =
+                        tokio::spawn(post_signed_context_pair_bound(state.clone(), body, schema));
+                    entered.acquire().await.unwrap().forget();
+                    if batch && !reuse {
+                        entered.acquire().await.unwrap().forget();
+                    }
+                    match change {
+                        "halt" => {
+                            pricing
+                                .apply_test_frame(st0x_pricing_types::ServerFrame::Halt(
+                                    st0x_pricing_types::HaltFrame {
+                                        asset: coin.asset.clone(),
+                                        chain_id: coin.chain_id,
+                                        base: coin.base,
+                                        quote: coin.quote,
+                                        halted: true,
+                                        reason: None,
+                                    },
+                                ))
+                                .await
+                        }
+                        _ => {
+                            coin.execution_deadline_unix_ms = match change {
+                                "shorten" => Some(expiry - 60_000),
+                                "extend" => Some(expiry + 60_000),
+                                _ => None,
+                            };
+                            pricing.seed(coin).await;
+                        }
+                    }
+                    release.add_permits(1);
+                    let result = task.await.unwrap();
+                    if change == "extend" {
+                        assert!(result.is_ok(), "{schema:?} batch={batch} reuse={reuse}");
+                    } else {
+                        assert!(
+                            matches!(result, Err(AppError::Unavailable(_))),
+                            "{schema:?} batch={batch} reuse={reuse} change={change}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_response_must_not_outlive_its_signed_expiry() {
+        let current = quote(Some(30_000), 30_000);
+        let mut response = oracle::OracleResponse {
+            signer: Address::ZERO,
+            context: vec![Default::default(); 9],
+            signature: Default::default(),
+        };
+        response.context[8] = Float::parse("10".into()).unwrap().into();
+        assert!(validate_response_at(&response, Some(&current), 9_999).is_ok());
+        assert!(validate_response_at(&response, Some(&current), 10_000).is_err());
+    }
+
+    fn quote(deadline: Option<i64>, expiry: i64) -> Quote {
+        Quote {
+            asset: "COIN".into(),
+            chain_id: 8453,
+            base: WireAddress([1; 20]),
+            quote: WireAddress([2; 20]),
+            rate_base_to_quote: WireFloat([0; 32]),
+            rate_quote_to_base: WireFloat([0; 32]),
+            source_ts_unix_ms: 1_000,
+            expiry_unix_ms: expiry,
+            execution_deadline_unix_ms: deadline,
+            nav_ratio: WireU256::ZERO,
+            underlying_rate_base_to_quote: WireFloat([0; 32]),
+            underlying_rate_quote_to_base: WireFloat([0; 32]),
+        }
+    }
+
+    #[test]
+    fn exclusive_deadline_and_model_expiry_bound_cached_quotes() {
+        let quote = quote(Some(10_000), 20_000);
+        assert!(validate_quote_at(&quote, 9_999).is_ok());
+        assert!(validate_quote_at(&quote, 10_000).is_err());
+        assert!(validate_quote_at(&quote, 10_001).is_err());
+        assert_eq!(expiry_from_quote(&quote).ok(), Some(10));
+        let stale = self::quote(Some(20_000), 10_000);
+        assert!(validate_quote_at(&stale, 10_000).is_err());
+    }
+
+    #[test]
+    fn missing_invalid_and_fractional_deadlines_fail_safely() {
+        for deadline in [None, Some(0), Some(-1), Some(i64::MIN)] {
+            assert!(validate_quote_at(&quote(deadline, 20_000), 1_000).is_err());
+        }
+        assert_eq!(
+            expiry_from_quote(&quote(Some(10_999), 20_000)).ok(),
+            Some(10)
+        );
+        assert!(validate_quote_at(&quote(Some(10_999), 20_000), 10_000).is_err());
+        assert!(validate_quote_at(&quote(Some(20_000), -1), 1_000).is_err());
+    }
+
+    #[test]
+    fn a_delayed_batch_must_revalidate_its_earliest_observation() {
+        let quotes = [quote(Some(10_000), 20_000), quote(Some(30_000), 20_000)];
+        assert!(quotes
+            .iter()
+            .all(|quote| validate_quote_at(quote, 9_000).is_ok()));
+        assert!(!quotes
+            .iter()
+            .all(|quote| validate_quote_at(quote, 10_000).is_ok()));
     }
 }

@@ -227,6 +227,8 @@ pub struct Signer {
     cache: Arc<SignatureCache>,
     #[cfg(test)]
     test_hook: Option<TestHook>,
+    #[cfg(test)]
+    gate: Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
 }
 
 /// Components of a KMS key version resource name:
@@ -314,6 +316,8 @@ impl Signer {
             )),
             #[cfg(test)]
             test_hook: None,
+            #[cfg(test)]
+            gate: None,
         }
     }
 
@@ -381,6 +385,16 @@ impl Signer {
         self.inner.address()
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_gate(
+        mut self,
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        self.gate = Some((entered, release));
+        self
+    }
+
     /// Sign a context array using EIP-191.
     ///
     /// The signature is over `keccak256(abi.encodePacked(context[]))`,
@@ -390,6 +404,11 @@ impl Signer {
         &self,
         context: &[FixedBytes<32>],
     ) -> anyhow::Result<(Bytes, Address)> {
+        #[cfg(test)]
+        if let Some((entered, release)) = &self.gate {
+            entered.add_permits(1);
+            release.acquire().await.unwrap().forget();
+        }
         // abi.encodePacked(bytes32[]) is the raw concatenation, so hash the
         // slots straight through without building the packed buffer. The
         // hash is what gets signed and is therefore also the cache key:

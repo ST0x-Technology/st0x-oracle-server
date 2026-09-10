@@ -119,6 +119,11 @@ impl LiveClient {
         self.cache.write().await.insert(quote.asset.clone(), quote);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn apply_test_frame(&self, frame: ServerFrame) {
+        apply_server_frame(&self.cache, frame).await;
+    }
+
     pub async fn latest(&self, symbol: &str) -> Option<Quote> {
         self.cache.read().await.get(symbol).cloned()
     }
@@ -274,6 +279,7 @@ async fn apply_server_frame(
                 rate_base_to_quote: p.rate_base_to_quote,
                 rate_quote_to_base: p.rate_quote_to_base,
                 expiry_unix_ms: p.expiry_unix_ms,
+                execution_deadline_unix_ms: p.execution_deadline_unix_ms,
                 source_ts_unix_ms: p.source_ts_unix_ms,
                 nav_ratio: p.nav_ratio,
                 underlying_rate_base_to_quote: p.underlying_rate_base_to_quote,
@@ -406,6 +412,7 @@ mod tests {
             rate_base_to_quote: WireFloat::from_bytes([0x42; 32]),
             rate_quote_to_base: WireFloat::from_bytes([0x43; 32]),
             expiry_unix_ms: 1_715_000_030_000,
+            execution_deadline_unix_ms: Some(1_715_000_060_000),
             model_version: "0.1.0".into(),
             source_ts_unix_ms: 1_714_999_970_000,
             nav_ratio,
@@ -457,6 +464,7 @@ mod tests {
             WireFloat::from_bytes([0x45; 32]),
             "underlying quote->base rate must carry through bit-for-bit"
         );
+        assert_eq!(q.execution_deadline_unix_ms, Some(1_715_000_060_000));
     }
 
     /// A halt fails closed: the cached quote is evicted immediately, so

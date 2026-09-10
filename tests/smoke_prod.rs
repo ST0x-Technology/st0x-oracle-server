@@ -2,11 +2,12 @@
 //! doesn't execute in the normal `cargo test` suite.
 //!
 //! Usage: `RUN_PROD_SMOKE=1 cargo test --test smoke_prod -- --nocapture`
+//! Success checks require an active quote during an executable market session.
 
 use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::sol_types::SolValue;
 use rain_math_float::Float;
-use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
+use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION_V7};
 use st0x_oracle_server::{EvaluableV4, OrderV4, IOV2};
 use std::str::FromStr;
 
@@ -16,11 +17,56 @@ fn smoke_enabled() -> bool {
     matches!(std::env::var("RUN_PROD_SMOKE").as_deref(), Ok("1"))
 }
 
-const PROD_URL: &str = "https://st0x-oracle-server.fly.dev/context/v1";
+const PROD_URL: &str = "https://st0x-oracle-server.fly.dev/context/v7";
+const LEGACY_URL: &str = "https://st0x-oracle-server.fly.dev/context/v1";
 
 // Base mainnet
 const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204";
+
+fn assert_v7_context(response: &OracleResponse, input: &str, output: &str) {
+    assert_eq!(response.context.len(), 9, "schema v7 context length");
+    let version = Float::from(response.context[0]);
+    assert_eq!(version.format().unwrap(), SCHEMA_VERSION_V7.to_string());
+    assert_eq!(
+        response.context[6],
+        Address::from_str(input).unwrap().into_word()
+    );
+    assert_eq!(
+        response.context[7],
+        Address::from_str(output).unwrap().into_word()
+    );
+    let expiry: u64 = Float::from(response.context[8])
+        .to_fixed_decimal(0)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(expiry > 0, "signed expiry must be positive Unix seconds");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        now < expiry,
+        "signed expiry is exclusive and must still be in the future"
+    );
+}
+
+#[tokio::test]
+async fn prod_legacy_v1_refuses_signatures() {
+    if !smoke_enabled() {
+        return;
+    }
+
+    let response = reqwest::Client::new()
+        .post(LEGACY_URL)
+        .header("content-type", "application/octet-stream")
+        .body(order_tuple(USDC, WCOIN).abi_encode())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+}
 
 fn order_tuple(input: &str, output: &str) -> (OrderV4, U256, U256, Address) {
     let order = OrderV4 {
@@ -65,15 +111,7 @@ async fn prod_single_buy_coin() {
     assert_eq!(responses.len(), 1, "single request → length-1 array");
 
     let r = &responses[0];
-    assert_eq!(
-        r.context.len(),
-        3,
-        "schema v1 → 3 context elements (version, price, publish_time)"
-    );
-
-    // version
-    let version = Float::from(alloy::primitives::B256::from(r.context[0]));
-    assert_eq!(version.format().unwrap(), SCHEMA_VERSION.to_string());
+    assert_v7_context(r, USDC, WCOIN);
 
     // price sanity: must be > 0
     let price = Float::from(alloy::primitives::B256::from(r.context[1]));
@@ -120,8 +158,8 @@ async fn prod_batch_buy_sell_coin() {
     assert_eq!(resp.status(), 200);
     let responses: Vec<OracleResponse> = resp.json().await.unwrap();
     assert_eq!(responses.len(), 2, "batch → length-2 array");
-    assert_eq!(responses[0].context.len(), 3);
-    assert_eq!(responses[1].context.len(), 3);
+    assert_v7_context(&responses[0], USDC, WCOIN);
+    assert_v7_context(&responses[1], WCOIN, USDC);
 
     // The two responses should carry the SAME publish_time because both
     // resolve to COIN and read the same cache entry.
@@ -167,9 +205,13 @@ async fn prod_publish_time_is_monotonic_and_dedupes() {
             .send()
             .await
             .unwrap()
+            .error_for_status()
+            .unwrap()
             .json()
             .await
             .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_v7_context(&r[0], USDC, WCOIN);
         publish_times.push(r[0].context[2]);
     }
 

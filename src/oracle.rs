@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 /// understand.
 pub const SCHEMA_VERSION: u64 = 1;
 
-/// Schema version emitted by `/context/v4`. The retired v2/v3 schemas
+/// Legacy schema version. `/context/v4` refuses new signatures because
+/// this layout has no settlement expiry. The retired v2/v3 schemas
 /// extended v1 with three session slots (a bytes32 ASCII tag plus the
 /// UTC `start` and `end` of the current session); v4 keeps that
 /// six-element shape and additionally binds the signed price to the
@@ -46,14 +47,16 @@ pub const SCHEMA_VERSION_V4: u64 = 4;
 /// past the point the model stopped standing behind it, or refuses one
 /// the model still honours.
 ///
-/// v5 signs that horizon so the producer's answer, not the strategy's
-/// guess, is what binds. v5 strategies SHOULD assert
+/// v5 signs the earlier of `expiry_unix_ms` and the required
+/// `execution_deadline_unix_ms`, floored to whole Unix seconds.
+/// v5 strategies MUST assert
 /// `less-than(block-timestamp(), signed-context<0 8>)` in addition to
 /// whatever `max-staleness` bound they already apply — the two are
 /// complementary: `max-staleness` bounds how old the mark may be,
 /// `context[8]` bounds how long the model will honour it.
 ///
-/// v4 stays unchanged and is still served on `/context/v4`.
+/// `/context/v1` and `/context/v4` refuse new signatures with HTTP 503.
+/// See `docs/execution-deadlines.md` for migration requirements.
 pub const SCHEMA_VERSION_V5: u64 = 5;
 
 /// Schema version emitted by `/context/v6`. Extends v5 by signing the
@@ -142,7 +145,8 @@ const NAV_RATIO_DECIMALS: u8 = 18;
 /// accept — a zero underlying price is never usable, so the carrier
 /// refuses the request rather than pushing the decision downstream.
 ///
-/// v1–v6 stay unchanged and are still served on their own endpoints.
+/// v5 and v6 remain supported. v1 and v4 refuse new signatures with HTTP
+/// 503; v2 and v3 are retired. See `docs/execution-deadlines.md`.
 pub const SCHEMA_VERSION_V7: u64 = 7;
 
 /// Oracle response matching Rain's SignedContextV1 format.
