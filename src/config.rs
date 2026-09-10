@@ -8,6 +8,17 @@ use std::str::FromStr;
 pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// The USDC address this deployment quotes against: the implicit
+    /// quote side of every pair `TokenRegistry::resolve` accepts. It is
+    /// a property of the CHAIN, not of the protocol — Base's native USDC
+    /// is `0x8335…2913`, Robinhood Chain's (4663) is `0x3884…FeDF` — so
+    /// it belongs next to the token registry it is keyed with rather
+    /// than in the binary. Defaults to Base, which is what every config
+    /// that predates multichain means.
+    #[serde(default = "default_quote_token")]
+    pub quote_token: String,
+
     pub tokens: Vec<TokenEntry>,
     pub pricing: PricingConfig,
     #[serde(default)]
@@ -54,8 +65,28 @@ pub struct PricingConfig {
     pub consumer: String,
 }
 
+/// USDC on Base — the quote token for the Base deployment, and the
+/// default when a config names none. Unchanged from when this lived as a
+/// constant in `main.rs`.
+pub const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
 fn default_port() -> u16 {
     3000
+}
+
+fn default_quote_token() -> String {
+    USDC_BASE.to_string()
+}
+
+/// Addresses in the bottom 2^16 of the address space — the zero address,
+/// the precompiles, and the `0x…0001`-style sentinels a config carries
+/// while the chain's tokens are still being deployed. No ERC20 lands
+/// there, so treating them as unfillable placeholders costs nothing and
+/// stops a half-filled config from booting a deployment that looks
+/// healthy on `/status` (symbols subscribed, quotes warm) while
+/// resolving no real order.
+fn is_placeholder_address(addr: &Address) -> bool {
+    addr.as_slice()[..18].iter().all(|b| *b == 0)
 }
 
 impl Config {
@@ -72,6 +103,14 @@ impl Config {
         if self.tokens.is_empty() {
             anyhow::bail!("config.toml has no [[tokens]] entries");
         }
+        let quote = Address::from_str(&self.quote_token)
+            .map_err(|e| anyhow::anyhow!("Invalid quote_token {:?}: {}", self.quote_token, e))?;
+        if is_placeholder_address(&quote) {
+            anyhow::bail!(
+                "Placeholder quote_token {} — fill in the chain's USDC address before releasing this config",
+                self.quote_token
+            );
+        }
         // Reject duplicate addresses up front. The TokenRegistry stores
         // entries in a HashMap so a repeated address would silently
         // overwrite the earlier symbol — better to fail loud at config
@@ -82,6 +121,23 @@ impl Config {
                 .map_err(|e| anyhow::anyhow!("Invalid token address {:?}: {}", t.address, e))?;
             if t.symbol.trim().is_empty() {
                 anyhow::bail!("Empty symbol for token {}", t.address);
+            }
+            if is_placeholder_address(&addr) {
+                anyhow::bail!(
+                    "Placeholder address {} for {} — replace it with the token's deployed address before releasing this config",
+                    t.address,
+                    t.symbol
+                );
+            }
+            // USDC is the quote side of every pair, so an entry that
+            // repeats it would claim the quote token is also a tStock and
+            // make `resolve` answer for a USDC/USDC order.
+            if addr == quote {
+                anyhow::bail!(
+                    "Token {} ({}) is the quote token — the quote side is implicit and must not be listed as a tStock",
+                    t.address,
+                    t.symbol
+                );
             }
             if !seen_addresses.insert(addr) {
                 anyhow::bail!(
@@ -244,6 +300,118 @@ mod tests {
         assert!(
             err.to_string().contains("Duplicate token address"),
             "expected duplicate-address error, got: {err}"
+        );
+    }
+
+    /// Robinhood Chain's USDC is a different contract from Base's, so a
+    /// deployment there sets `quote_token` and everything else — the
+    /// registry, the direction logic — is unchanged.
+    #[test]
+    fn quote_token_defaults_to_base_and_is_overridable() {
+        let base = format!(
+            r#"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "wtCOIN"
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&base).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.quote_token, USDC_BASE);
+
+        let robinhood = format!(
+            r#"
+            quote_token = "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "wtCOIN"
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&robinhood).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.quote_token,
+            "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_quote_token() {
+        let text = format!(
+            r#"
+            quote_token = "not-an-address"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "wtCOIN"
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("quote_token"));
+    }
+
+    /// The forcing function on a config whose chain has not finished
+    /// deploying: sentinel token addresses must be filled in before the
+    /// config can load, so a placeholder registry can never boot.
+    #[test]
+    fn rejects_placeholder_token_address() {
+        let text = format!(
+            r#"
+            [[tokens]]
+            address = "0x0000000000000000000000000000000000000001"
+            symbol = "wtCOIN"
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("Placeholder address"),
+            "expected placeholder error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_placeholder_quote_token() {
+        let text = format!(
+            r#"
+            quote_token = "0x0000000000000000000000000000000000000000"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "wtCOIN"
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("Placeholder quote_token"),
+            "expected placeholder error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_quote_token_listed_as_tstock() {
+        let text = format!(
+            r#"
+            quote_token = "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF"
+            [[tokens]]
+            address = "0x3884564bA51b349E7661C7E28aD947dEe327fEdf"
+            symbol = "wtUSDC"
+            {MIN_PRICING}
+        "#
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("is the quote token"),
+            "expected quote-token collision error, got: {err}"
         );
     }
 

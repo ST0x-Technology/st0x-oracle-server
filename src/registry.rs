@@ -11,7 +11,8 @@ use std::str::FromStr;
 pub struct TokenRegistry {
     /// token address → pricing symbol
     tokens: HashMap<Address, String>,
-    /// USDC address on Base
+    /// This chain's USDC address, from `[quote_token]` in the config —
+    /// Base and Robinhood Chain (4663) each deploy their own.
     pub quote_token: Address,
 }
 
@@ -59,7 +60,7 @@ impl TokenRegistry {
     /// Build a registry from env-style config.
     ///
     /// `entries` is a list of (token_address, pricing_symbol) pairs.
-    /// `quote_token` is the USDC address.
+    /// `quote_token` is this chain's USDC address.
     pub fn new(entries: Vec<(String, String)>, quote_token: &str) -> anyhow::Result<Self> {
         let quote = Address::from_str(quote_token)
             .map_err(|e| anyhow::anyhow!("Invalid quote token address: {}", e))?;
@@ -167,6 +168,38 @@ mod tests {
         let pair = reg.resolve(rklb, usdc).unwrap();
         assert_eq!(pair.symbol, "RKLB");
         assert_eq!(pair.direction, PriceDirection::BaseToQuote);
+    }
+
+    /// Nothing in the resolver is Base-specific: point it at another
+    /// chain's USDC (Robinhood Chain 4663 here) with that chain's token
+    /// addresses and both directions resolve the same way. A Base USDC
+    /// order against a Robinhood registry resolves to nothing, which is
+    /// the fail-closed half of the same property.
+    #[test]
+    fn test_resolve_on_a_non_base_chain() {
+        const USDC_ROBINHOOD: &str = "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF";
+        let reg = TokenRegistry::new(
+            vec![(
+                "0x4444444444444444444444444444444444444444".into(),
+                "RKLB".into(),
+            )],
+            USDC_ROBINHOOD,
+        )
+        .unwrap();
+        let usdc = Address::from_str(USDC_ROBINHOOD).unwrap();
+        let rklb = Address::from_str("0x4444444444444444444444444444444444444444").unwrap();
+
+        assert_eq!(
+            reg.resolve(usdc, rklb).unwrap().direction,
+            PriceDirection::QuoteToBase
+        );
+        assert_eq!(
+            reg.resolve(rklb, usdc).unwrap().direction,
+            PriceDirection::BaseToQuote
+        );
+
+        let usdc_base = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        assert!(reg.resolve(usdc_base, rklb).is_err());
     }
 
     #[test]

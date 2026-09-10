@@ -15,9 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
-/// USDC on Base. Chain invariant; doesn't move with the token registry.
-const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-
 #[derive(Parser)]
 #[command(name = "st0x-oracle-server")]
 #[command(about = "Signed context oracle server for st0x tokenized equities.\n\
@@ -88,7 +85,11 @@ async fn main() -> anyhow::Result<()> {
             .or_else(|| std::env::var("CONFIG_PATH").ok())
             .unwrap_or_else(|| "config.toml".to_string());
         let config = Config::load(std::path::Path::new(&path))?;
-        println!("{path}: OK ({} tokens)", config.tokens.len());
+        println!(
+            "{path}: OK ({} tokens, quote token {})",
+            config.tokens.len(),
+            config.quote_token
+        );
         return Ok(());
     }
 
@@ -109,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         port = config.port,
         pricing_ws_url = %config.pricing.ws_url,
         pricing_consumer = %config.pricing.consumer,
+        quote_token = %config.quote_token,
         token_count = config.tokens.len(),
         signature_reuse_min_remaining_secs = config.signing.reuse_min_remaining_secs,
         "Loaded config"
@@ -149,7 +151,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let alpaca = AlpacaClient::new(&cli.alpaca_api_key_id, &cli.alpaca_api_secret_key);
 
-    let registry = TokenRegistry::from_config(&config.tokens, USDC_BASE)?;
+    // The quote token comes from the config, not the binary: it is the
+    // one address in the registry that changes per chain (Base USDC vs
+    // Robinhood Chain USDC), and it is keyed with the token list it has
+    // to agree with.
+    let registry = TokenRegistry::from_config(&config.tokens, &config.quote_token)?;
 
     tracing::info!("Signer address: {}", signer.address());
     tracing::info!(

@@ -1,0 +1,272 @@
+# st0x-oracle-server runtime config for ROBINHOOD CHAIN (chain id 4663).
+#
+# NOT YET DEPLOYED, AND NOT YET LOADABLE. This file is the Robinhood
+# deployment's config in the same sense deploy/config/production.toml is
+# Base's, but no Cloud Run service reads it yet and no workflow validates
+# or publishes it: .github/workflows/{config-check,deploy,production-
+# release}.yml still name production.toml and staging.toml only. Wire it
+# up in the same commit that creates the service, and split it into
+# robinhood-staging.toml / robinhood-production.toml at that point if the
+# two environments diverge.
+#
+# The [[tokens]] addresses below are SENTINELS, not deployments — the 4663
+# wt tokens were still being deployed when this landed. `Config::load`
+# rejects every address in the bottom 2^16 of the address space, so this
+# file fails `st0x-oracle-server validate` until they are filled in. That
+# is deliberate: a placeholder registry would otherwise boot, subscribe to
+# every symbol and look healthy on /status while resolving no real order.
+#
+# TWO PROPERTIES MUST HOLD BEFORE THIS DEPLOYMENT SIGNS ANYTHING, and
+# neither holds in this binary. Both are correctness, not polish:
+#
+#   1. The signed context must name its chain. EIP-191 signing is
+#      chain-agnostic and no context slot carries a chain id, so a context
+#      signed for one chain verifies unchanged inside an order on another
+#      wherever the two chains share a token address — which ST0x tokens,
+#      deployed deterministically, may well do. The `chain_id` key below
+#      is what a binary that signs the chain reads; it is inert (unknown
+#      keys are ignored) until then, and is set now so this deployment can
+#      never silently inherit the 8453 default.
+#   2. The pricing quote cache must be keyed by (chain id, symbol).
+#      st0x.pricing stamps a chain id on every frame; a symbol-keyed cache
+#      lets a Base frame overwrite the Robinhood frame for the same symbol
+#      and the oracle signs whichever landed last.
+#
+# Chain constants, for whoever fills this in. The server reads NONE of
+# them — they are here so the deployment's facts live in one place:
+#
+#   RPC (archive) https://robinhood-chain.gateway.tenderly.co
+#   RPC (public)  https://rpc.mainnet.chain.robinhood.com
+#   IRaindexV6    0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20
+#   RaindexInvent 0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30
+#   USDC (native, Circle, 6 dec)
+#                 0x3884564BA51B349e7661c7e28Ad947DEE327FeDF
+#   Token-owner Safe
+#                 0x3840aeDaEc8e82f79d8F6a8F6ADCa271E13E0329
+#   Subgraph      TODO — the Ormi subgraph for 4663 is being set up
+#                 separately. strategy/settings.yaml gets its `robinhood`
+#                 network (and the Zoltu interpreter suite, identical to
+#                 the other chains) once that URL exists; adding a
+#                 subgraph-less network before then would only break the
+#                 Raindex UI for Base.
+#
+# Non-secret settings only; secrets come from Secret Manager env injection.
+
+port = 3000
+
+# The chain this deployment serves. Inert on a binary that does not sign a
+# chain id (unknown keys are ignored) — see property 1 in the header.
+chain_id = 4663
+
+# USDC on Robinhood Chain — native Circle issuance, 6 decimals. The quote
+# side of every pair; it is NOT Base's USDC, which is the whole reason
+# this key exists rather than a constant in main.rs.
+quote_token = "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF"
+
+# Live pricing source. ws_url is a placeholder here: the stack's
+# PRICING_WS_URL env var overrides it with this env's Cloud Run pricing
+# URL. The consumer name must match the `pricing_<consumer>_<32-hex>` API
+# key format.
+[pricing]
+ws_url = "ws://st0x-pricing:8080/ws"
+consumer = "oracle"
+
+# --- Robinhood Chain token registry -----------------------------------------
+# FILL IN: replace every 0x0000…000N sentinel with the token's deployed
+# address on 4663. Until then this config does not load.
+#
+# The rows below mirror deploy/config/production.toml's Base registry, all
+# 47 of them. The Robinhood launch set is 41 tokens — DELETE the 6 rows for
+# symbols that are not deployed on 4663 rather than leaving them
+# sentinelled, so the subscription list matches what the chain actually
+# has. Symbols are the st0x.pricing asset names and are chain-independent:
+# only the addresses change.
+# ----------------------------------------------------------------------------
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000001" # TODO wtNVDA on 4663
+symbol = "wtNVDA"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000002" # TODO wtAMZN on 4663
+symbol = "wtAMZN"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000003" # TODO wtTSLA on 4663
+symbol = "wtTSLA"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000004" # TODO wtMSTR on 4663
+symbol = "wtMSTR"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000005" # TODO wtIAU on 4663
+symbol = "wtIAU"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000006" # TODO wtCOIN on 4663
+symbol = "wtCOIN"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000007" # TODO wtSPYM on 4663
+symbol = "wtSPYM"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000008" # TODO wtSIVR on 4663
+symbol = "wtSIVR"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000009" # TODO wtCRCL on 4663
+symbol = "wtCRCL"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000000a" # TODO wtBMNR on 4663
+symbol = "wtBMNR"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000000b" # TODO wtPPLT on 4663
+symbol = "wtPPLT"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000000c" # TODO wtQQQM on 4663
+symbol = "wtQQQM"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000000d" # TODO wtVWO on 4663
+symbol = "wtVWO"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000000e" # TODO wtARKK on 4663
+symbol = "wtARKK"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000000f" # TODO wtSGOV on 4663
+symbol = "wtSGOV"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000010" # TODO wtSPCX on 4663
+symbol = "wtSPCX"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000011" # TODO wtCEG on 4663
+symbol = "wtCEG"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000012" # TODO wtDRAM on 4663
+symbol = "wtDRAM"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000013" # TODO wtTSM on 4663
+symbol = "wtTSM"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000014" # TODO wtRKLB on 4663
+symbol = "wtRKLB"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000015" # TODO wtASML on 4663
+symbol = "wtASML"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000016" # TODO wtSKHY on 4663
+symbol = "wtSKHY"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000017" # TODO wtMU on 4663
+symbol = "wtMU"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000018" # TODO wtAMD on 4663
+symbol = "wtAMD"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000019" # TODO wtAVGO on 4663
+symbol = "wtAVGO"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000001a" # TODO wtAMAT on 4663
+symbol = "wtAMAT"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000001b" # TODO wtLRCX on 4663
+symbol = "wtLRCX"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000001c" # TODO wtTTWO on 4663
+symbol = "wtTTWO"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000001d" # TODO wtAAPL on 4663
+symbol = "wtAAPL"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000001e" # TODO wtBABA on 4663
+symbol = "wtBABA"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000001f" # TODO wtGOOGL on 4663
+symbol = "wtGOOGL"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000020" # TODO wtHOOD on 4663
+symbol = "wtHOOD"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000021" # TODO wtINTC on 4663
+symbol = "wtINTC"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000022" # TODO wtLLY on 4663
+symbol = "wtLLY"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000023" # TODO wtMSFT on 4663
+symbol = "wtMSFT"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000024" # TODO wtORCL on 4663
+symbol = "wtORCL"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000025" # TODO wtPTY on 4663
+symbol = "wtPTY"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000026" # TODO wtSMCI on 4663
+symbol = "wtSMCI"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000027" # TODO wtTQQQ on 4663
+symbol = "wtTQQQ"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000028" # TODO wtMCD on 4663
+symbol = "wtMCD"
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000029" # TODO wtNKE on 4663
+symbol = "wtNKE"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000002a" # TODO wtGRND on 4663
+symbol = "wtGRND"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000002b" # TODO wtDNUT on 4663
+symbol = "wtDNUT"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000002c" # TODO wtFGI on 4663
+symbol = "wtFGI"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000002d" # TODO wtPLBY on 4663
+symbol = "wtPLBY"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000002e" # TODO wtTR on 4663
+symbol = "wtTR"
+
+[[tokens]]
+address = "0x000000000000000000000000000000000000002f" # TODO wtWEN on 4663
+symbol = "wtWEN"
