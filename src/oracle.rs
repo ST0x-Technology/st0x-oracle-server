@@ -155,6 +155,42 @@ pub struct OracleResponse {
     pub signature: Bytes,
 }
 
+/// One slot of a batch response served with `allowFailure=true`.
+///
+/// Without the flag a batch is all-or-nothing: the first failing item
+/// turns the whole HTTP reply into a 4xx/5xx and every item is lost.
+/// With the flag the reply is always `200` and each request item maps
+/// to exactly one of these, in request order, so a caller can keep the
+/// items that signed and surface the ones that did not.
+///
+/// Wire shape (serde adjacently tagged: variant in `status`, payload in
+/// `body`). A plain `OracleResponse` is NOT a valid item — the two modes
+/// never parse as each other, so a client cannot confuse them:
+///
+/// ```json
+/// { "status": "ok",    "body": { "signer": "0x…", "context": ["0x…"], "signature": "0x…" } }
+/// { "status": "error", "body": { "error": "service_unavailable", "detail": "…" } }
+/// ```
+///
+/// The `error` body is the same `ErrorResponse` a non-2xx reply carries,
+/// built by `AppError::to_error_response`, so the `error` code strings
+/// mean the same thing in both modes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", content = "body", rename_all = "lowercase")]
+pub enum BatchItemResponse {
+    Ok(OracleResponse),
+    Error(crate::ErrorResponse),
+}
+
+impl From<Result<OracleResponse, crate::AppError>> for BatchItemResponse {
+    fn from(result: Result<OracleResponse, crate::AppError>) -> Self {
+        match result {
+            Ok(response) => Self::Ok(response),
+            Err(err) => Self::Error(err.to_error_response()),
+        }
+    }
+}
+
 /// Build the signed context array from a pre-computed Rain Float price
 /// and a publish time.
 ///
@@ -900,5 +936,143 @@ mod tests {
         let ctx =
             build_context_v7(bytes, 1, v3_session_bytes(), 1, 2, IN_TOKEN, OUT_TOKEN, 3).unwrap();
         assert_eq!(ctx[1].as_slice(), &bytes[..]);
+    }
+}
+
+#[cfg(test)]
+mod batch_item_tests {
+    use super::*;
+    use crate::{AppError, ErrorResponse};
+    use alloy::primitives::address;
+
+    fn sample_ok() -> OracleResponse {
+        OracleResponse {
+            signer: address!("1111111111111111111111111111111111111111"),
+            context: vec![B256::repeat_byte(0xaa), B256::repeat_byte(0xbb)],
+            signature: Bytes::from_static(&[0x01, 0x02]),
+        }
+    }
+
+    /// Pins the exact wire keys and tag values the client will key on.
+    /// Serde attributes are easy to fat-finger (`tag` vs `content`,
+    /// `rename_all`), and the plain `OracleResponse` JSON must sit
+    /// unchanged inside `body` so the client can reuse its existing
+    /// parser for the ok branch.
+    #[test]
+    fn ok_item_serialises_with_status_ok_and_nested_body() {
+        let item = BatchItemResponse::Ok(sample_ok());
+        let json: serde_json::Value = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(
+            json["body"],
+            serde_json::to_value(sample_ok()).unwrap(),
+            "ok body must be byte-for-byte the plain OracleResponse JSON"
+        );
+        assert_eq!(
+            json.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["status", "body"],
+        );
+    }
+
+    #[test]
+    fn error_item_serialises_with_status_error_and_error_body() {
+        let item = BatchItemResponse::Error(ErrorResponse {
+            error: "service_unavailable".into(),
+            detail: "No live quote for DRAM yet.".into(),
+        });
+        let json = serde_json::to_string(&item).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"error","body":{"error":"service_unavailable","detail":"No live quote for DRAM yet."}}"#
+        );
+    }
+
+    #[test]
+    fn items_round_trip_through_json() {
+        let items = vec![
+            BatchItemResponse::Ok(sample_ok()),
+            BatchItemResponse::Error(ErrorResponse {
+                error: "bad_request".into(),
+                detail: "Invalid input IO index".into(),
+            }),
+        ];
+        let json = serde_json::to_string(&items).unwrap();
+        let back: Vec<BatchItemResponse> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.len(), 2);
+        match &back[0] {
+            BatchItemResponse::Ok(r) => {
+                assert_eq!(r.signer, sample_ok().signer);
+                assert_eq!(r.context, sample_ok().context);
+                assert_eq!(r.signature, sample_ok().signature);
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+        match &back[1] {
+            BatchItemResponse::Error(e) => assert_eq!(e.error, "bad_request"),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    /// The `From<Result<_, AppError>>` impl is what the handlers will use
+    /// per slot; make sure every `AppError` variant lands on the right
+    /// branch with the same code string the non-2xx path emits.
+    #[test]
+    fn from_result_maps_ok_and_every_app_error_variant() {
+        match BatchItemResponse::from(Ok(sample_ok())) {
+            BatchItemResponse::Ok(r) => assert_eq!(r.signer, sample_ok().signer),
+            other => panic!("expected ok, got {other:?}"),
+        }
+        let cases: Vec<(AppError, &str)> = vec![
+            (AppError::BadRequest("x".into()), "bad_request"),
+            (AppError::Unavailable("x".into()), "service_unavailable"),
+            (AppError::Internal(anyhow::anyhow!("x")), "internal_error"),
+        ];
+        for (err, code) in cases {
+            let expected = err.to_error_response();
+            match BatchItemResponse::from(Err(err)) {
+                BatchItemResponse::Error(e) => {
+                    assert_eq!(e.error, code);
+                    assert_eq!(e, expected);
+                }
+                other => panic!("expected error, got {other:?}"),
+            }
+        }
+    }
+
+    /// The two response modes must never parse as each other. A plain
+    /// `OracleResponse` (the non-flag shape) has no `status`, so a client
+    /// that accidentally reads a legacy batch as an envelope fails loudly
+    /// instead of getting an empty or wrong item.
+    #[test]
+    fn plain_oracle_response_is_not_a_valid_item() {
+        let legacy = serde_json::to_string(&sample_ok()).unwrap();
+        let err = serde_json::from_str::<BatchItemResponse>(&legacy).unwrap_err();
+        assert!(err.to_string().contains("status"), "{err}");
+    }
+
+    /// Each variant's payload keeps its own strictness: an ok item with a
+    /// missing signed field, or an error item with a missing `detail`, is
+    /// rejected rather than defaulted.
+    #[test]
+    fn item_with_incomplete_body_is_rejected() {
+        let no_body = r#"{"status":"ok"}"#;
+        assert!(serde_json::from_str::<BatchItemResponse>(no_body).is_err());
+
+        let ok_missing_signature = r#"{"status":"ok","body":{"signer":"0x1111111111111111111111111111111111111111","context":[]}}"#;
+        let err = serde_json::from_str::<BatchItemResponse>(ok_missing_signature).unwrap_err();
+        assert!(err.to_string().contains("signature"), "{err}");
+
+        let error_missing_detail = r#"{"status":"error","body":{"error":"bad_request"}}"#;
+        let err = serde_json::from_str::<BatchItemResponse>(error_missing_detail).unwrap_err();
+        assert!(err.to_string().contains("detail"), "{err}");
+    }
+
+    /// A body that is neither shape must be rejected, not silently
+    /// coerced — this is what protects a client from a malformed slot.
+    #[test]
+    fn unknown_status_tag_is_rejected() {
+        let err = serde_json::from_str::<BatchItemResponse>(r#"{"status":"maybe","body":{}}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("maybe"), "{err}");
     }
 }
