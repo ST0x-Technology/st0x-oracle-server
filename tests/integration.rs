@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use rain_math_float::Float;
 use st0x_oracle_server::market_hours::{MarketHoursCache, SessionWindow};
 use st0x_oracle_server::metrics::MetricsHandle;
-use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
+use st0x_oracle_server::oracle::{BatchItemResponse, OracleResponse, SCHEMA_VERSION};
 use st0x_oracle_server::pricing_client::LiveClient;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
@@ -132,6 +132,16 @@ async fn test_app() -> axum::Router {
 
 async fn test_app_with(entries: &[(&str, &str, Option<f64>)]) -> axum::Router {
     test_app_full(entries, fixed_close_market_hours().await).await
+}
+
+/// Like `test_app_with`, but `now` sits inside a session window that is
+/// fixed when the app is built. Use it for tests that compare the bodies
+/// of SEPARATE requests on v4+ endpoints: with `fixed_close_market_hours`
+/// wall-clock `now` falls after every window, and the server then stamps
+/// slot 5 (session end) with `now` itself, so two requests that straddle
+/// a second boundary sign different bytes and the comparison flakes.
+async fn in_session_app_with(entries: &[(&str, &str, Option<f64>)]) -> axum::Router {
+    test_app_full(entries, always_in_session_market_hours().await).await
 }
 
 /// Same as `test_app_with` but lets a caller plug in any
@@ -1967,8 +1977,9 @@ async fn test_query_string_never_changes_single_tuple_responses() {
         "/context/v6",
         "/context/v7",
     ] {
-        // Happy path: the flag must NOT envelope a single tuple.
-        let app = test_app().await;
+        // Happy path: the flag must NOT envelope a single tuple. In-session
+        // app: the bodies of separate requests are compared below.
+        let app = in_session_app_with(&[(WCOIN, "COIN", Some(100.0))]).await;
         let (base_status, base_body) =
             post(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
         assert_eq!(base_status, 200, "{endpoint}");
@@ -2045,7 +2056,8 @@ async fn test_batch_without_flag_keeps_all_or_nothing_behaviour() {
 
     for endpoint in ["/context/v1", "/context/v7"] {
         // Healthy batch: bare array, identical across non-flag queries.
-        let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+        // In-session app: the bodies of separate requests are compared.
+        let app = in_session_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
         let healthy = encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)]);
         let (status, base) = post(app.clone(), endpoint, healthy.clone()).await;
         assert_eq!(status, 200, "{endpoint}");
@@ -2069,5 +2081,552 @@ async fn test_batch_without_flag_keeps_all_or_nothing_behaviour() {
             assert_eq!(err.error, "no_live_quote", "{uri}");
             assert!(err.detail.contains("DRAM"), "{uri}: {}", err.detail);
         }
+    }
+}
+
+/// Shared helper for the envelope tests: POST and return status + JSON.
+async fn post_json(app: axum::Router, uri: &str, body: Bytes) -> (u16, serde_json::Value) {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// The point of the whole change: a batch with `allowFailure=true` is
+/// `200` with one slot per request item, in request order, and the
+/// failing items do not take the healthy ones down. Failure kinds
+/// covered: a resolution error (unknown token → bad_request) and a
+/// cache miss (no live quote → no_live_quote). The ok slots must
+/// be byte-identical to what a strict request for the same pair signs.
+#[tokio::test]
+async fn test_v1_batch_with_flag_returns_per_item_envelope() {
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+    let unknown = "0x9999999999999999999999999999999999999999";
+
+    // Reference: strict single responses for the two healthy pairs.
+    let (_, buy_ref) = post_json(app.clone(), "/context/v1", encode_single(USDC, WCOIN)).await;
+    let (_, sell_ref) = post_json(app.clone(), "/context/v1", encode_single(WCOIN, USDC)).await;
+
+    let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM), (USDC, unknown), (WCOIN, USDC)]);
+    let (status, body) = post_json(app.clone(), "/context/v1?allowFailure=true", mixed).await;
+    assert_eq!(
+        status, 200,
+        "envelope mode must be 200 even with failures: {body}"
+    );
+    let items: Vec<BatchItemResponse> = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(items.len(), 4, "one slot per request item: {body}");
+
+    match &items[0] {
+        BatchItemResponse::Ok(r) => {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                buy_ref[0],
+                "slot 0 = strict buy"
+            )
+        }
+        other => panic!("slot 0 should be ok, got {other:?}"),
+    }
+    match &items[1] {
+        BatchItemResponse::Error(e) => {
+            assert_eq!(e.error, "no_live_quote");
+            assert!(e.detail.contains("DRAM"), "{}", e.detail);
+        }
+        other => panic!("slot 1 should be no_live_quote, got {other:?}"),
+    }
+    match &items[2] {
+        BatchItemResponse::Error(e) => assert_eq!(e.error, "bad_request"),
+        other => panic!("slot 2 should be bad_request, got {other:?}"),
+    }
+    match &items[3] {
+        BatchItemResponse::Ok(r) => {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                sell_ref[0],
+                "slot 3 = strict sell"
+            )
+        }
+        other => panic!("slot 3 should be ok, got {other:?}"),
+    }
+
+    // Wire shape sanity, independent of the Rust type: every slot has
+    // exactly `status` + `body`.
+    for slot in body.as_array().unwrap() {
+        // Set equality: key ORDER in a parsed map depends on serde_json's
+        // `preserve_order` feature, which only a transitive dependency
+        // enables. The wire order is pinned by the string assertion in
+        // `oracle::batch_item_tests`.
+        let mut keys: Vec<_> = slot.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["body", "status"], "{slot}");
+    }
+}
+
+/// A batch where nothing can be signed is still `200` in envelope mode,
+/// with every slot an error — the client decides what to do, the server
+/// does not escalate to a whole-request error.
+#[tokio::test]
+async fn test_v1_batch_with_flag_all_failed_is_200_with_error_slots() {
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+    let unknown = "0x9999999999999999999999999999999999999999";
+    let body = encode_batch(&[(USDC, WDRAM), (USDC, unknown)]);
+    let (status, json) = post_json(app, "/context/v1?allowFailure=true", body).await;
+    assert_eq!(status, 200);
+    let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+    assert_eq!(items.len(), 2);
+    let codes: Vec<&str> = items
+        .iter()
+        .map(|i| match i {
+            BatchItemResponse::Error(e) => e.error.as_str(),
+            BatchItemResponse::Ok(_) => "ok",
+        })
+        .collect();
+    assert_eq!(codes, vec!["no_live_quote", "bad_request"]);
+}
+
+/// An empty batch with the flag is an empty array — same as without.
+#[tokio::test]
+async fn test_v1_empty_batch_with_flag_returns_empty_array() {
+    let (status, json) = post_json(
+        test_app().await,
+        "/context/v1?allowFailure=true",
+        encode_batch(&[]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json, serde_json::json!([]));
+}
+
+/// The build-phase failure (zero rate → fail closed) is per-item too: it
+/// lands as `internal_error` in its slot and the other direction, which
+/// has a healthy rate, still signs. Without the flag the same batch is
+/// the historical whole-request 500.
+#[tokio::test]
+async fn test_v1_zero_rate_item_is_internal_error_slot_with_flag() {
+    let app = test_app_asymmetric("0", "99").await;
+    let body = encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)]);
+
+    let (status, json) =
+        post_json(app.clone(), "/context/v1?allowFailure=true", body.clone()).await;
+    assert_eq!(status, 200, "{json}");
+    let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+    assert!(
+        matches!(&items[0], BatchItemResponse::Error(e) if e.error == "internal_error"),
+        "{:?}",
+        items[0]
+    );
+    assert!(
+        matches!(&items[1], BatchItemResponse::Ok(_)),
+        "{:?}",
+        items[1]
+    );
+
+    let (status, json) = post_json(app, "/context/v1", body).await;
+    assert_eq!(
+        status, 500,
+        "strict mode keeps the whole-request 500: {json}"
+    );
+}
+
+/// A one-element ARRAY is a batch, so it is envelope-eligible — unlike a
+/// bare single tuple for the same pair, which stays strict.
+#[tokio::test]
+async fn test_v1_one_element_array_with_flag_is_enveloped_but_single_tuple_is_not() {
+    let app = test_app().await;
+    let (status, json) = post_json(
+        app.clone(),
+        "/context/v1?allowFailure=true",
+        encode_batch(&[(USDC, WCOIN)]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(matches!(items[0], BatchItemResponse::Ok(_)));
+
+    let (status, json) = post_json(
+        app,
+        "/context/v1?allowFailure=true",
+        encode_single(USDC, WCOIN),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let plain: Vec<OracleResponse> = serde_json::from_value(json).unwrap();
+    assert_eq!(plain.len(), 1);
+}
+
+/// `/metrics` distinguishes a partially served envelope from a clean one.
+#[tokio::test]
+async fn test_v1_partial_envelope_is_counted_as_partial_outcome() {
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+    let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM)]);
+    let (status, _) = post_json(app.clone(), "/context/v1?allowFailure=true", mixed).await;
+    assert_eq!(status, 200);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let line = text
+        .lines()
+        .find(|l| {
+            l.starts_with("oracle_context_request_total{")
+                && l.contains(r#"endpoint="v1""#)
+                && l.contains(r#"outcome="partial""#)
+        })
+        .unwrap_or_else(|| panic!("no partial outcome sample for v1 in:\n{text}"));
+    let count: f64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(count >= 1.0, "{line}");
+}
+
+/// Strict mode's historical error ordering: every item is RESOLVED
+/// before any is BUILT, so a resolution failure (unknown token → 400)
+/// in a later slot wins over a cache miss (→ 503) in an earlier slot.
+/// The per-item rewrite must keep this, or a deployed client would see
+/// a different status for the same batch. Envelope mode, by contrast,
+/// reports both in their own slots.
+#[tokio::test]
+async fn test_v1_strict_batch_resolve_error_wins_over_earlier_build_error() {
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+    let unknown = "0x9999999999999999999999999999999999999999";
+    // slot 0: resolves, but no live quote (build-phase 503)
+    // slot 1: unknown token (resolve-phase 400)
+    let body = encode_batch(&[(USDC, WDRAM), (USDC, unknown)]);
+
+    let (status, json) = post_json(app.clone(), "/context/v1", body.clone()).await;
+    assert_eq!(status, 400, "resolve error must win in strict mode: {json}");
+    let err: ErrorResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(err.error, "bad_request");
+
+    let (status, json) = post_json(app, "/context/v1?allowFailure=true", body).await;
+    assert_eq!(status, 200);
+    let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+    assert!(matches!(&items[0], BatchItemResponse::Error(e) if e.error == "no_live_quote"));
+    assert!(matches!(&items[1], BatchItemResponse::Error(e) if e.error == "bad_request"));
+}
+
+const PAIR_BOUND_ENDPOINTS: [&str; 4] =
+    ["/context/v4", "/context/v5", "/context/v6", "/context/v7"];
+
+/// Pair-bound schemas share one pipeline, so one route-level sweep pins
+/// all four: a batch with `allowFailure=true` is `200`, one slot per
+/// item in request order, ok slots byte-identical to the strict single
+/// response for the same pair (so the schema-specific slots 6/7/8/9 are
+/// intact), failed slots carrying the per-item error code.
+#[tokio::test]
+async fn test_pair_bound_batch_with_flag_returns_per_item_envelope() {
+    let unknown = "0x9999999999999999999999999999999999999999";
+    for endpoint in PAIR_BOUND_ENDPOINTS {
+        // In-session app: envelope slots are compared with the bodies of
+        // separate strict requests.
+        let app = in_session_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+        let (_, buy_ref) = post_json(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
+        let (_, sell_ref) = post_json(app.clone(), endpoint, encode_single(WCOIN, USDC)).await;
+
+        let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM), (USDC, unknown), (WCOIN, USDC)]);
+        let uri = format!("{endpoint}?allowFailure=true");
+        let (status, body) = post_json(app.clone(), &uri, mixed).await;
+        assert_eq!(status, 200, "{uri}: {body}");
+        let items: Vec<BatchItemResponse> = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(items.len(), 4, "{uri}: {body}");
+
+        match &items[0] {
+            BatchItemResponse::Ok(r) => {
+                assert_eq!(serde_json::to_value(r).unwrap(), buy_ref[0], "{uri} slot 0")
+            }
+            other => panic!("{uri} slot 0 should be ok, got {other:?}"),
+        }
+        match &items[1] {
+            BatchItemResponse::Error(e) => {
+                assert_eq!(e.error, "no_live_quote", "{uri}");
+                assert!(e.detail.contains("DRAM"), "{uri}: {}", e.detail);
+            }
+            other => panic!("{uri} slot 1 should be no_live_quote, got {other:?}"),
+        }
+        match &items[2] {
+            BatchItemResponse::Error(e) => assert_eq!(e.error, "bad_request", "{uri}"),
+            other => panic!("{uri} slot 2 should be bad_request, got {other:?}"),
+        }
+        match &items[3] {
+            BatchItemResponse::Ok(r) => {
+                assert_eq!(
+                    serde_json::to_value(r).unwrap(),
+                    sell_ref[0],
+                    "{uri} slot 3"
+                )
+            }
+            other => panic!("{uri} slot 3 should be ok, got {other:?}"),
+        }
+        for slot in body.as_array().unwrap() {
+            let mut keys: Vec<_> = slot.as_object().unwrap().keys().collect();
+            keys.sort();
+            assert_eq!(keys, vec!["body", "status"], "{uri}: {slot}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_pair_bound_all_failed_and_empty_batches_with_flag() {
+    let unknown = "0x9999999999999999999999999999999999999999";
+    for endpoint in PAIR_BOUND_ENDPOINTS {
+        let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+        let uri = format!("{endpoint}?allowFailure=true");
+
+        let (status, json) = post_json(
+            app.clone(),
+            &uri,
+            encode_batch(&[(USDC, WDRAM), (USDC, unknown)]),
+        )
+        .await;
+        assert_eq!(status, 200, "{uri}");
+        let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+        let codes: Vec<&str> = items
+            .iter()
+            .map(|i| match i {
+                BatchItemResponse::Error(e) => e.error.as_str(),
+                BatchItemResponse::Ok(_) => "ok",
+            })
+            .collect();
+        assert_eq!(codes, vec!["no_live_quote", "bad_request"], "{uri}");
+
+        let (status, json) = post_json(app, &uri, encode_batch(&[])).await;
+        assert_eq!(status, 200, "{uri}");
+        assert_eq!(json, serde_json::json!([]), "{uri}");
+    }
+}
+
+/// Build-phase failure per item on the pair-bound path. The fixture's
+/// underlying rates mirror the vault rates, so a zero quote_to_base
+/// fails the buy direction on v4/v5/v6 (vault rate) AND v7 (underlying
+/// rate) alike, while the sell direction signs. Strict stays 500.
+#[tokio::test]
+async fn test_pair_bound_zero_rate_item_is_internal_error_slot_with_flag() {
+    for endpoint in PAIR_BOUND_ENDPOINTS {
+        let app = test_app_asymmetric("0", "99").await;
+        let body = encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)]);
+        let uri = format!("{endpoint}?allowFailure=true");
+
+        let (status, json) = post_json(app.clone(), &uri, body.clone()).await;
+        assert_eq!(status, 200, "{uri}: {json}");
+        let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(&items[0], BatchItemResponse::Error(e) if e.error == "internal_error"),
+            "{uri}: {:?}",
+            items[0]
+        );
+        assert!(
+            matches!(&items[1], BatchItemResponse::Ok(_)),
+            "{uri}: {:?}",
+            items[1]
+        );
+
+        let (status, json) = post_json(app, endpoint, body).await;
+        assert_eq!(
+            status, 500,
+            "{endpoint} strict keeps the whole-request 500: {json}"
+        );
+    }
+}
+
+/// Same historical ordering pin as v1, on the shared pair-bound path.
+#[tokio::test]
+async fn test_pair_bound_strict_resolve_error_wins_over_earlier_build_error() {
+    let unknown = "0x9999999999999999999999999999999999999999";
+    for endpoint in PAIR_BOUND_ENDPOINTS {
+        let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+        let body = encode_batch(&[(USDC, WDRAM), (USDC, unknown)]);
+
+        let (status, json) = post_json(app.clone(), endpoint, body.clone()).await;
+        assert_eq!(
+            status, 400,
+            "{endpoint}: resolve error must win in strict mode: {json}"
+        );
+        let err: ErrorResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(err.error, "bad_request", "{endpoint}");
+
+        let uri = format!("{endpoint}?allowFailure=true");
+        let (status, json) = post_json(app, &uri, body).await;
+        assert_eq!(status, 200, "{uri}");
+        let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(&items[0], BatchItemResponse::Error(e) if e.error == "no_live_quote"),
+            "{uri}"
+        );
+        assert!(
+            matches!(&items[1], BatchItemResponse::Error(e) if e.error == "bad_request"),
+            "{uri}"
+        );
+    }
+}
+
+/// `/metrics` labels the pair-bound endpoints by their own tag.
+#[tokio::test]
+async fn test_v7_partial_envelope_is_counted_as_partial_outcome() {
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+    let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM)]);
+    let (status, _) = post_json(app.clone(), "/context/v7?allowFailure=true", mixed).await;
+    assert_eq!(status, 200);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("oracle_context_request_total{")
+                && l.contains(r#"endpoint="v7""#)
+                && l.contains(r#"outcome="partial""#)),
+        "no partial outcome sample for v7 in:\n{text}"
+    );
+}
+
+const ALL_ENDPOINTS: [&str; 5] = [
+    "/context/v1",
+    "/context/v4",
+    "/context/v5",
+    "/context/v6",
+    "/context/v7",
+];
+
+/// The other resolve-phase failure: an IO index outside the order's
+/// `validInputs` / `validOutputs`. Per-item in envelope mode (with the
+/// index-specific detail), first-error-wins in strict mode. A `U256`
+/// index too large for `usize` takes the same path. Covers both the v1
+/// resolver and the pair-bound `io_tokens_for`.
+#[tokio::test]
+async fn test_invalid_io_index_is_per_item_bad_request_with_flag() {
+    fn with_indices(input: U256, output: U256) -> (OrderV4, U256, U256, Address) {
+        let mut t = test_order_tuple(USDC, WCOIN);
+        t.1 = input;
+        t.2 = output;
+        t
+    }
+    let batch = Bytes::from(
+        vec![
+            test_order_tuple(USDC, WCOIN),
+            with_indices(U256::from(5u64), U256::ZERO),
+            with_indices(U256::ZERO, U256::from(7u64)),
+            with_indices(U256::MAX, U256::ZERO),
+            test_order_tuple(WCOIN, USDC),
+        ]
+        .abi_encode(),
+    );
+
+    for endpoint in ALL_ENDPOINTS {
+        let app = test_app().await;
+        let uri = format!("{endpoint}?allowFailure=true");
+        let (status, json) = post_json(app.clone(), &uri, batch.clone()).await;
+        assert_eq!(status, 200, "{uri}: {json}");
+        let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+        assert_eq!(items.len(), 5, "{uri}");
+        assert!(matches!(items[0], BatchItemResponse::Ok(_)), "{uri}");
+        match &items[1] {
+            BatchItemResponse::Error(e) => {
+                assert_eq!(e.error, "bad_request", "{uri}");
+                assert!(
+                    e.detail.contains("Invalid input IO index: 5"),
+                    "{uri}: {}",
+                    e.detail
+                );
+            }
+            other => panic!("{uri} slot 1: {other:?}"),
+        }
+        match &items[2] {
+            BatchItemResponse::Error(e) => {
+                assert_eq!(e.error, "bad_request", "{uri}");
+                assert!(
+                    e.detail.contains("Invalid output IO index: 7"),
+                    "{uri}: {}",
+                    e.detail
+                );
+            }
+            other => panic!("{uri} slot 2: {other:?}"),
+        }
+        match &items[3] {
+            BatchItemResponse::Error(e) => {
+                assert_eq!(e.error, "bad_request", "{uri}");
+                assert!(
+                    e.detail.contains("Invalid input IO index"),
+                    "{uri}: {}",
+                    e.detail
+                );
+            }
+            other => panic!("{uri} slot 3: {other:?}"),
+        }
+        assert!(matches!(items[4], BatchItemResponse::Ok(_)), "{uri}");
+
+        // Strict: the first bad slot's detail is the whole-request error.
+        let (status, json) = post_json(app, endpoint, batch.clone()).await;
+        assert_eq!(status, 400, "{endpoint}: {json}");
+        let err: ErrorResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(err.error, "bad_request", "{endpoint}");
+        assert!(
+            err.detail.contains("Invalid input IO index: 5"),
+            "{endpoint}: {}",
+            err.detail
+        );
+    }
+}
+
+/// Snapshot-once coherence survives the per-item rewrite: repeated
+/// symbols in one batch are served from the same snapshot, so two
+/// identical requests in the same envelope sign identical contexts.
+#[tokio::test]
+async fn test_repeated_symbol_in_envelope_batch_signs_identically() {
+    for endpoint in ALL_ENDPOINTS {
+        let app = test_app().await;
+        let uri = format!("{endpoint}?allowFailure=true");
+        let body = encode_batch(&[(USDC, WCOIN), (WCOIN, USDC), (USDC, WCOIN)]);
+        let (status, json) = post_json(app, &uri, body).await;
+        assert_eq!(status, 200, "{uri}");
+        let slots = json.as_array().unwrap();
+        assert_eq!(slots.len(), 3, "{uri}");
+        for slot in slots {
+            assert_eq!(slot["status"], "ok", "{uri}: {slot}");
+        }
+        assert_eq!(
+            slots[0], slots[2],
+            "{uri}: same pair, same snapshot, same signature"
+        );
+        assert_ne!(slots[0], slots[1], "{uri}: opposite direction must differ");
     }
 }
