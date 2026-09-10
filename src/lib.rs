@@ -268,7 +268,7 @@ async fn post_signed_context_v1(
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
     body: Bytes,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<ContextResponse, AppError> {
     let query = ContextQuery::parse(query.as_deref());
     let result = post_signed_context_v1_inner(state, query, body).await;
     record_request_outcome("v1", &result);
@@ -279,16 +279,15 @@ async fn post_signed_context_v1_inner(
     state: Arc<AppState>,
     query: ContextQuery,
     body: Bytes,
-) -> Result<axum::Json<Vec<oracle::OracleResponse>>, AppError> {
+) -> Result<ContextResponse, AppError> {
     let decoded = decode_request_body(&body)?;
-    // Envelope mode is only reachable for the array form. The per-item
-    // pipeline (plan steps 4/6) consumes this; until then the flag is
-    // parsed and decided here but does not change the response.
-    let _envelope = query.allow_failure && decoded.is_batch;
+    // Envelope mode is only reachable for the array form; a single tuple
+    // keeps the whole-request error path whatever the flag says.
+    let envelope = query.allow_failure && decoded.is_batch;
     let requests = decoded.items;
 
     if requests.is_empty() {
-        return Ok(Json(Vec::<oracle::OracleResponse>::new()));
+        return finish("v1", Vec::new(), envelope);
     }
 
     // Resolve every request's token pair first so we know which symbols
@@ -296,28 +295,147 @@ async fn post_signed_context_v1_inner(
     // exactly those entries, so a poll loop update mid-iteration can't
     // mix quotes (or publish_time values) for the same symbol within
     // one HTTP response.
-    let mut resolved: Vec<(OrderV4, ResolvedPair)> = Vec::with_capacity(requests.len());
-    for (order, input_io_index, output_io_index, _counterparty) in requests {
-        let pair = resolve_pair_for_order(&state, &order, input_io_index, output_io_index)?;
-        resolved.push((order, pair));
+    //
+    // Per-item: a failed resolution is kept in its slot rather than
+    // aborting, so envelope mode can report it alongside the items that
+    // did resolve. Strict mode surfaces the FIRST resolution failure
+    // before touching the cache — exactly the order the all-or-nothing
+    // path has always used.
+    let resolved: Vec<Result<ResolvedPair, AppError>> = requests
+        .iter()
+        .map(|(order, input_io_index, output_io_index, _counterparty)| {
+            resolve_pair_for_order(&state, order, *input_io_index, *output_io_index)
+        })
+        .collect();
+    if !envelope && resolved.iter().any(Result::is_err) {
+        // Move the error out rather than rebuild it: `AppError` is not
+        // `Clone`, and rebuilding an `Internal` would lose its anyhow
+        // chain and change the wire `detail`.
+        return Err(resolved
+            .into_iter()
+            .find_map(Result::err)
+            .expect("checked above"));
     }
 
-    let needed_symbols: Vec<&str> = resolved.iter().map(|(_, p)| p.symbol.as_str()).collect();
+    let needed_symbols: Vec<&str> = resolved
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|p| p.symbol.as_str())
+        .collect();
     let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
 
-    let mut responses = Vec::with_capacity(resolved.len());
-    for (_, pair) in &resolved {
-        let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
-            AppError::Unavailable(format!(
-                "No live quote for {} yet. The pricing WS has not delivered a frame since startup.",
-                pair.symbol
-            ))
-        })?;
-        let resp = build_response_from_quote(&state, pair, &quote).await?;
-        responses.push(resp);
+    let mut items: Vec<Result<oracle::OracleResponse, AppError>> =
+        Vec::with_capacity(resolved.len());
+    for pair in resolved {
+        let item = match pair {
+            Err(err) => Err(err),
+            Ok(pair) => match snapshot.get(&pair.symbol) {
+                None => Err(no_live_quote(&pair.symbol)),
+                Some(quote) => build_response_from_quote(&state, &pair, quote).await,
+            },
+        };
+        // Strict mode stops at the first failure, as before: nothing
+        // after it is signed.
+        if !envelope {
+            if let Err(err) = item {
+                return Err(err);
+            }
+        }
+        items.push(item);
     }
 
-    Ok(Json(responses))
+    finish("v1", items, envelope)
+}
+
+/// The transient "cache has nothing for this symbol yet" error, shared by
+/// every schema so the wording (which ops grep for) stays identical.
+fn no_live_quote(symbol: &str) -> AppError {
+    AppError::Unavailable(format!(
+        "No live quote for {symbol} yet. The pricing WS has not delivered a frame since startup."
+    ))
+}
+
+/// What a `/context/v*` handler returns on `200`. The two arms are the
+/// two wire shapes described on `oracle::BatchItemResponse`; which one a
+/// request gets is decided by `finish`, never by the caller of `finish`.
+pub enum ContextResponse {
+    /// The historical shape: a bare `OracleResponse` array whose length
+    /// equals the request length. Served for every single-tuple request
+    /// and for batches without `allowFailure`.
+    Strict(Vec<oracle::OracleResponse>),
+    /// One `BatchItemResponse` per request item, in request order. Served
+    /// only for batches with `allowFailure=true`.
+    Envelope(Vec<oracle::BatchItemResponse>),
+}
+
+impl ContextResponse {
+    /// Label for the `oracle_context_request_total{outcome}` counter.
+    /// `empty` / `ok` keep their historical meaning; `partial` and
+    /// `failed` are envelope-only, because only an envelope can carry a
+    /// failed item inside a `200`.
+    fn outcome(&self) -> &'static str {
+        match self {
+            Self::Strict(items) if items.is_empty() => "empty",
+            Self::Strict(_) => "ok",
+            Self::Envelope(items) if items.is_empty() => "empty",
+            Self::Envelope(items) => {
+                let failed = items
+                    .iter()
+                    .filter(|i| matches!(i, oracle::BatchItemResponse::Error(_)))
+                    .count();
+                if failed == 0 {
+                    "ok"
+                } else if failed == items.len() {
+                    "failed"
+                } else {
+                    "partial"
+                }
+            }
+        }
+    }
+}
+
+impl IntoResponse for ContextResponse {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Strict(items) => Json(items).into_response(),
+            Self::Envelope(items) => Json(items).into_response(),
+        }
+    }
+}
+
+/// Turn the per-item results of one request into its response. This is
+/// the single place the strict/envelope decision is applied, shared by
+/// every schema so they cannot drift.
+///
+/// - Envelope: always `Ok`, every slot mapped to a `BatchItemResponse`;
+///   failed slots are logged here with their index (the HTTP status is
+///   `200`, so this is the only trace they leave).
+/// - Strict: the first `Err` becomes the whole-request error. Callers
+///   already short-circuit before reaching here in strict mode, so the
+///   `Err` arm is a fallback that keeps the function total.
+fn finish(
+    endpoint: &'static str,
+    items: Vec<Result<oracle::OracleResponse, AppError>>,
+    envelope: bool,
+) -> Result<ContextResponse, AppError> {
+    if !envelope {
+        return items
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map(ContextResponse::Strict);
+    }
+    let items = items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            if let Err(err) = &item {
+                err.log_batch_item(endpoint, index);
+            }
+            oracle::BatchItemResponse::from(item)
+        })
+        .collect();
+    Ok(ContextResponse::Envelope(items))
 }
 
 /// Record a `/context/v{N}` request's outcome on the `oracle_context_request_total`
@@ -325,13 +443,9 @@ async fn post_signed_context_v1_inner(
 /// `empty` (no requests in the body — Raindex's quote crate posts an empty
 /// batch when an order's IO list is empty), and `error` (any `AppError`).
 /// Keep the labels stable — the obs dashboard joins on these.
-fn record_request_outcome(
-    endpoint: &'static str,
-    result: &Result<axum::Json<Vec<oracle::OracleResponse>>, AppError>,
-) {
+fn record_request_outcome(endpoint: &'static str, result: &Result<ContextResponse, AppError>) {
     let outcome = match result {
-        Ok(json) if json.0.is_empty() => "empty",
-        Ok(_) => "ok",
+        Ok(response) => response.outcome(),
         Err(_) => "error",
     };
     ::metrics::counter!(
@@ -358,7 +472,7 @@ async fn post_signed_context_v4(
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
     body: Bytes,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<ContextResponse, AppError> {
     let query = ContextQuery::parse(query.as_deref());
     let result = post_signed_context_pair_bound(state, query, body, PairSchema::V4).await;
     record_request_outcome("v4", &result);
@@ -379,7 +493,7 @@ async fn post_signed_context_v5(
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
     body: Bytes,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<ContextResponse, AppError> {
     let query = ContextQuery::parse(query.as_deref());
     let result = post_signed_context_pair_bound(state, query, body, PairSchema::V5).await;
     record_request_outcome("v5", &result);
@@ -404,7 +518,7 @@ async fn post_signed_context_v6(
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
     body: Bytes,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<ContextResponse, AppError> {
     let query = ContextQuery::parse(query.as_deref());
     let result = post_signed_context_pair_bound(state, query, body, PairSchema::V6).await;
     record_request_outcome("v6", &result);
@@ -432,7 +546,7 @@ async fn post_signed_context_v7(
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
     body: Bytes,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<ContextResponse, AppError> {
     let query = ContextQuery::parse(query.as_deref());
     let result = post_signed_context_pair_bound(state, query, body, PairSchema::V7).await;
     record_request_outcome("v7", &result);
@@ -487,68 +601,96 @@ async fn post_signed_context_pair_bound(
     query: ContextQuery,
     body: Bytes,
     schema: PairSchema,
-) -> Result<axum::Json<Vec<oracle::OracleResponse>>, AppError> {
+) -> Result<ContextResponse, AppError> {
+    let endpoint = schema.tag();
     let decoded = decode_request_body(&body)?;
-    // Envelope mode is only reachable for the array form. The per-item
-    // pipeline (plan steps 5/6) consumes this; until then the flag is
-    // parsed and decided here but does not change the response.
-    let _envelope = query.allow_failure && decoded.is_batch;
+    // Envelope mode is only reachable for the array form; a single tuple
+    // keeps the whole-request error path whatever the flag says.
+    let envelope = query.allow_failure && decoded.is_batch;
     let requests = decoded.items;
 
     if requests.is_empty() {
-        return Ok(Json(Vec::<oracle::OracleResponse>::new()));
+        return finish(endpoint, Vec::new(), envelope);
     }
 
     // Same resolution + batching shape as v1, but also keep the raw
     // input_token/output_token per request so we can bind them into the
     // signed context — that binding is the whole point of v4.
-    let mut resolved: Vec<(Address, Address, ResolvedPair)> = Vec::with_capacity(requests.len());
-    for (order, input_io_index, output_io_index, _counterparty) in requests {
-        let (input_token, output_token) = io_tokens_for(&order, input_io_index, output_io_index)?;
-        let pair = state
-            .registry
-            .resolve(input_token, output_token)
-            .map_err(|e| AppError::BadRequest(e.to_string()))?;
-        tracing::info!(
-            symbol = %pair.symbol,
-            direction = pair.direction.as_str(),
-            input = %input_token,
-            output = %output_token,
-            schema = schema.tag(),
-            "Oracle request"
-        );
-        resolved.push((input_token, output_token, pair));
+    //
+    // Per-item, same as v1: a failed resolution stays in its slot for
+    // envelope mode; strict mode surfaces the FIRST one before touching
+    // the cache, preserving the historical resolve-before-build order.
+    let resolved: Vec<Result<(Address, Address, ResolvedPair), AppError>> = requests
+        .iter()
+        .map(|(order, input_io_index, output_io_index, _counterparty)| {
+            let (input_token, output_token) =
+                io_tokens_for(order, *input_io_index, *output_io_index)?;
+            let pair = state
+                .registry
+                .resolve(input_token, output_token)
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            tracing::info!(
+                symbol = %pair.symbol,
+                direction = pair.direction.as_str(),
+                input = %input_token,
+                output = %output_token,
+                schema = endpoint,
+                "Oracle request"
+            );
+            Ok((input_token, output_token, pair))
+        })
+        .collect();
+    if !envelope && resolved.iter().any(Result::is_err) {
+        // Move, don't rebuild: see the v1 path for why.
+        return Err(resolved
+            .into_iter()
+            .find_map(Result::err)
+            .expect("checked above"));
     }
 
-    let needed_symbols: Vec<&str> = resolved.iter().map(|(_, _, p)| p.symbol.as_str()).collect();
+    let needed_symbols: Vec<&str> = resolved
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|(_, _, p)| p.symbol.as_str())
+        .collect();
     let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
 
     // Session classification is snapshot once per batch; publish_time is
     // per-quote (the pricing quote's own source_ts), read inside the builder.
     let session_info = state.market_hours.session_info_for(Utc::now()).await;
 
-    let mut responses = Vec::with_capacity(resolved.len());
-    for (input_token, output_token, pair) in &resolved {
-        let quote = snapshot.get(&pair.symbol).cloned().ok_or_else(|| {
-            AppError::Unavailable(format!(
-                "No live quote for {} yet. The pricing WS has not delivered a frame since startup.",
-                pair.symbol
-            ))
-        })?;
-        let resp = build_response_from_quote_pair_bound(
-            &state,
-            pair,
-            &quote,
-            *input_token,
-            *output_token,
-            &session_info,
-            schema,
-        )
-        .await?;
-        responses.push(resp);
+    let mut items: Vec<Result<oracle::OracleResponse, AppError>> =
+        Vec::with_capacity(resolved.len());
+    for slot in resolved {
+        let item = match slot {
+            Err(err) => Err(err),
+            Ok((input_token, output_token, pair)) => match snapshot.get(&pair.symbol) {
+                None => Err(no_live_quote(&pair.symbol)),
+                Some(quote) => {
+                    build_response_from_quote_pair_bound(
+                        &state,
+                        &pair,
+                        quote,
+                        input_token,
+                        output_token,
+                        &session_info,
+                        schema,
+                    )
+                    .await
+                }
+            },
+        };
+        // Strict mode stops at the first failure, as before: nothing
+        // after it is signed.
+        if !envelope {
+            if let Err(err) = item {
+                return Err(err);
+            }
+        }
+        items.push(item);
     }
 
-    Ok(Json(responses))
+    finish(endpoint, items, envelope)
 }
 
 /// Extract the raw `(input_token, output_token)` addresses that the
@@ -1039,6 +1181,35 @@ impl AppError {
             AppError::Unavailable(detail) => tracing::warn!("Service unavailable: {}", detail),
         }
     }
+
+    /// Same severities as `log`, for a failed slot inside a `200`
+    /// envelope. Carries the endpoint and the item's position so an
+    /// operator can tie the line to one request in a batch that
+    /// otherwise left no non-2xx trace.
+    pub fn log_batch_item(&self, endpoint: &'static str, index: usize) {
+        match self {
+            AppError::Internal(err) => tracing::error!(
+                endpoint,
+                index,
+                "Batch item failed (internal error): {:?}",
+                err
+            ),
+            AppError::BadRequest(detail) => {
+                tracing::warn!(
+                    endpoint,
+                    index,
+                    "Batch item failed (bad request): {}",
+                    detail
+                )
+            }
+            AppError::Unavailable(detail) => tracing::warn!(
+                endpoint,
+                index,
+                "Batch item failed (service unavailable): {}",
+                detail
+            ),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -1108,6 +1279,122 @@ mod app_error_tests {
         );
         let back: ErrorResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, original);
+    }
+}
+
+#[cfg(test)]
+mod context_response_tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    fn ok() -> oracle::OracleResponse {
+        oracle::OracleResponse {
+            signer: address!("1111111111111111111111111111111111111111"),
+            context: vec![],
+            signature: alloy::primitives::Bytes::new(),
+        }
+    }
+
+    fn err() -> AppError {
+        AppError::Unavailable("x".into())
+    }
+
+    /// The counter labels the dashboard joins on. `partial` and `failed`
+    /// exist only for envelopes; strict can never carry a failed item.
+    #[test]
+    fn outcome_labels() {
+        assert_eq!(ContextResponse::Strict(vec![]).outcome(), "empty");
+        assert_eq!(ContextResponse::Strict(vec![ok()]).outcome(), "ok");
+        assert_eq!(ContextResponse::Envelope(vec![]).outcome(), "empty");
+        assert_eq!(finish("t", vec![Ok(ok())], true).unwrap().outcome(), "ok");
+        assert_eq!(
+            finish("t", vec![Ok(ok()), Err(err())], true)
+                .unwrap()
+                .outcome(),
+            "partial"
+        );
+        assert_eq!(
+            finish("t", vec![Err(err()), Err(err())], true)
+                .unwrap()
+                .outcome(),
+            "failed"
+        );
+    }
+
+    /// Both arms render as `200 application/json`; the strict arm is the
+    /// historical bare array, the envelope arm the tagged items. This is
+    /// the seam every route goes through, so pin it once here.
+    #[tokio::test]
+    async fn into_response_renders_both_shapes_as_200_json() {
+        async fn render(resp: ContextResponse) -> (StatusCode, String, serde_json::Value) {
+            let http = resp.into_response();
+            let status = http.status();
+            let content_type = http
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let bytes = axum::body::to_bytes(http.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                content_type,
+                serde_json::from_slice(&bytes).unwrap(),
+            )
+        }
+
+        let (status, ct, json) = render(ContextResponse::Strict(vec![ok()])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("application/json"), "{ct}");
+        assert_eq!(
+            json,
+            serde_json::json!([serde_json::to_value(ok()).unwrap()])
+        );
+
+        let (status, ct, json) =
+            render(finish("t", vec![Ok(ok()), Err(err())], true).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("application/json"), "{ct}");
+        assert_eq!(
+            json,
+            serde_json::json!([
+                { "status": "ok", "body": serde_json::to_value(ok()).unwrap() },
+                { "status": "error", "body": { "error": "service_unavailable", "detail": "x" } },
+            ])
+        );
+
+        // Both empty arms are the same `[]` on the wire — the upstream
+        // client's length check passes for an empty batch either way.
+        let (status, _, json) = render(ContextResponse::Envelope(vec![])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!([]));
+        let (status, _, json) = render(ContextResponse::Strict(vec![])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!([]));
+    }
+
+    /// `finish` is the only place the mode is applied: strict collapses
+    /// to the first error, envelope keeps every slot in order.
+    #[test]
+    fn finish_applies_mode() {
+        let strict = finish("t", vec![Ok(ok()), Err(err()), Ok(ok())], false);
+        assert!(matches!(strict, Err(AppError::Unavailable(_))));
+
+        let strict_ok = finish("t", vec![Ok(ok()), Ok(ok())], false).unwrap();
+        assert!(matches!(strict_ok, ContextResponse::Strict(v) if v.len() == 2));
+
+        let env = finish("t", vec![Ok(ok()), Err(err()), Ok(ok())], true).unwrap();
+        let ContextResponse::Envelope(items) = env else {
+            panic!("expected envelope");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], oracle::BatchItemResponse::Ok(_)));
+        assert!(
+            matches!(&items[1], oracle::BatchItemResponse::Error(e) if e.error == "service_unavailable")
+        );
+        assert!(matches!(items[2], oracle::BatchItemResponse::Ok(_)));
     }
 }
 
