@@ -5,6 +5,7 @@ pub mod metrics;
 pub mod oracle;
 pub mod pricing_client;
 pub mod registry;
+pub mod reuse;
 pub mod sign;
 
 use alloy::primitives::{Address, B256};
@@ -83,6 +84,8 @@ pub struct AppState {
     market_hours: Arc<MarketHoursCache>,
     /// Prometheus exposition format renderer for `/metrics`.
     metrics: MetricsHandle,
+    /// Cross-frame signature reuse for v5/v6/v7 (see `reuse`).
+    reuse: reuse::ReuseCache,
 }
 
 impl AppState {
@@ -101,7 +104,19 @@ impl AppState {
             configured_symbols,
             market_hours,
             metrics,
+            // Off until `with_signature_reuse` is called: `main.rs` passes
+            // the configured margin, tests opt in explicitly so nothing
+            // silently serves a previous frame.
+            reuse: reuse::ReuseCache::new(0),
         }
+    }
+
+    /// Set how many seconds a previous v5/v6/v7 quote must still have before
+    /// its expiry to be served again instead of signing an unchanged price
+    /// under a new publish_time. Zero disables the reuse.
+    pub fn with_signature_reuse(mut self, min_remaining_secs: u64) -> Self {
+        self.reuse = reuse::ReuseCache::new(min_remaining_secs);
+        self
     }
 
     pub fn signer_address(&self) -> Address {
@@ -376,6 +391,13 @@ impl PairSchema {
     /// from.
     fn signs_underlying(self) -> bool {
         matches!(self, Self::V7)
+    }
+
+    /// v5, v6 and v7 sign the model's expiry at slot 8; v4 signs only
+    /// publish_time. Only the expiry-bearing schemas take part in
+    /// cross-frame signature reuse (see `reuse`).
+    fn signs_expiry(self) -> bool {
+        !matches!(self, Self::V4)
     }
 }
 
@@ -652,6 +674,13 @@ fn pick_underlying_rate_bytes(
 /// the signed timestamp goes stale, and the strategy's `max-staleness`
 /// rejects. The oracle's own `MarketHoursCache` is used only for the
 /// v4/v5 session slots, never for `publish_time`.
+///
+/// One deliberate exception: while a v5/v6/v7 price is unchanged, the
+/// `reuse` layer serves the previous frame's signature, whose
+/// `publish_time` can trail the live frame by up to the expiry horizon
+/// minus the reuse margin (~20s today). That lag is bounded and visible
+/// in the signed bytes; a stalled feed still shows as `source_ts`
+/// stopping altogether.
 /// Derive the signed `publish_time` (Unix seconds) from a pricing-service
 /// `Quote.source_ts_unix_ms` (Unix milliseconds). st0x.pricing already
 /// stamps `source_ts` with the mark's honest as-of instant (RAI-732), so
@@ -747,6 +776,104 @@ async fn build_response_from_quote_pair_bound(
     }
     .map_err(AppError::Internal)?;
 
+    // Build the context first: it is cheap (no KMS), and the reuse layer
+    // compares the built slots rather than a hand-kept list of them.
+    let session_bytes = session_info.session.to_bytes32_v3();
+    let expiry = if schema.signs_expiry() {
+        Some(expiry_from_quote(quote)?)
+    } else {
+        None
+    };
+    let context = match (schema, expiry) {
+        (PairSchema::V4, _) => oracle::build_context_v4(
+            price_bytes,
+            publish_time,
+            session_bytes,
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+        )?,
+        (PairSchema::V5, Some(expiry)) => oracle::build_context_v5(
+            price_bytes,
+            publish_time,
+            session_bytes,
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+            expiry,
+        )?,
+        // The NAV ratio is read off the SAME `quote` as the rate at
+        // slot 1 — both came out of one `snapshot_many` entry, and the
+        // pricing client only ever stores whole frames — so the signed
+        // context can never pair a rate from one frame with a ratio
+        // from another.
+        (PairSchema::V6, Some(expiry)) => oracle::build_context_v6(
+            price_bytes,
+            publish_time,
+            session_bytes,
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+            expiry,
+            quote.nav_ratio.0,
+        )?,
+        // v7 signs the UNDERLYING price at slot 1 (already selected into
+        // `price_bytes` above) and NO NAV ratio — the strategy derives the
+        // vault price on-chain from the live ratio (RAI-2198).
+        (PairSchema::V7, Some(expiry)) => oracle::build_context_v7(
+            price_bytes,
+            publish_time,
+            session_bytes,
+            session_start,
+            session_end,
+            input_token,
+            output_token,
+            expiry,
+        )?,
+        (_, None) => {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "{} signs an expiry but none was derived from the quote",
+                schema.tag()
+            )))
+        }
+    };
+
+    // v5/v6/v7: if the previous signature for this pair states the same
+    // price under the same session for the same tokens, does not outlive
+    // this frame's expiry, and is still good for the configured margin,
+    // serve it instead of signing an unchanged price under a new
+    // publish_time. See the `reuse` module.
+    let reuse = expiry.map(|expiry| {
+        (
+            reuse::ReuseKey {
+                schema: schema.tag(),
+                symbol: pair.symbol.clone(),
+                direction: pair.direction.as_str(),
+                input_token,
+                output_token,
+            },
+            expiry,
+        )
+    });
+    if let Some((key, expiry)) = &reuse {
+        let now_secs = u64::try_from(Utc::now().timestamp())
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("system clock before 1970")))?;
+        if let Some(previous) = state.reuse.lookup(key, &context, *expiry, now_secs) {
+            ::metrics::counter!("oracle_signature_reuse_total").increment(1);
+            tracing::debug!(
+                symbol = %pair.symbol,
+                direction = pair.direction.as_str(),
+                schema = schema.tag(),
+                source_ts_unix_ms = quote.source_ts_unix_ms,
+                "Price unchanged and previous quote still valid; reusing its signature"
+            );
+            return Ok(previous);
+        }
+    }
+
     tracing::info!(
         symbol = %pair.symbol,
         direction = pair.direction.as_str(),
@@ -762,63 +889,17 @@ async fn build_response_from_quote_pair_bound(
         "Building pair-bound signed context from live pricing quote"
     );
 
-    let context = match schema {
-        PairSchema::V4 => oracle::build_context_v4(
-            price_bytes,
-            publish_time,
-            session_info.session.to_bytes32_v3(),
-            session_start,
-            session_end,
-            input_token,
-            output_token,
-        )?,
-        PairSchema::V5 => oracle::build_context_v5(
-            price_bytes,
-            publish_time,
-            session_info.session.to_bytes32_v3(),
-            session_start,
-            session_end,
-            input_token,
-            output_token,
-            expiry_from_quote(quote)?,
-        )?,
-        // The NAV ratio is read off the SAME `quote` as the rate at
-        // slot 1 — both came out of one `snapshot_many` entry, and the
-        // pricing client only ever stores whole frames — so the signed
-        // context can never pair a rate from one frame with a ratio
-        // from another.
-        PairSchema::V6 => oracle::build_context_v6(
-            price_bytes,
-            publish_time,
-            session_info.session.to_bytes32_v3(),
-            session_start,
-            session_end,
-            input_token,
-            output_token,
-            expiry_from_quote(quote)?,
-            quote.nav_ratio.0,
-        )?,
-        // v7 signs the UNDERLYING price at slot 1 (already selected into
-        // `price_bytes` above) and NO NAV ratio — the strategy derives the
-        // vault price on-chain from the live ratio (RAI-2198).
-        PairSchema::V7 => oracle::build_context_v7(
-            price_bytes,
-            publish_time,
-            session_info.session.to_bytes32_v3(),
-            session_start,
-            session_end,
-            input_token,
-            output_token,
-            expiry_from_quote(quote)?,
-        )?,
-    };
     let (signature, signer) = state.signer.sign_context(&context).await?;
 
-    Ok(oracle::OracleResponse {
+    let response = oracle::OracleResponse {
         signer,
         context,
         signature,
-    })
+    };
+    if let Some((key, expiry)) = reuse {
+        state.reuse.store(key, expiry, response.clone());
+    }
+    Ok(response)
 }
 
 pub enum AppError {

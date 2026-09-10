@@ -112,6 +112,13 @@ impl LiveClient {
         }
     }
 
+    /// Test helper: replace the cached quote for one asset, as a new WS
+    /// frame would. Lets integration tests advance the price feed
+    /// between requests without a live pricing server.
+    pub async fn seed(&self, quote: Quote) {
+        self.cache.write().await.insert(quote.asset.clone(), quote);
+    }
+
     pub async fn latest(&self, symbol: &str) -> Option<Quote> {
         self.cache.read().await.get(symbol).cloned()
     }
