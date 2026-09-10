@@ -58,8 +58,13 @@ sol! {
 /// - single: `(OrderV4, uint256 inputIOIndex, uint256 outputIOIndex, address counterparty)`
 /// - batch:  `(OrderV4, uint256, uint256, address)[]`
 ///
-/// We decode either. The response is always a JSON array of
-/// `OracleResponse` whose length matches the number of requests.
+/// We decode either. The response is a JSON array whose length matches
+/// the number of requests. By default (and always for the single form)
+/// it is a bare `OracleResponse` array and any failing item fails the
+/// whole request; with `?allowFailure=true` on the batch form it is a
+/// `BatchItemResponse` array, one `ok`/`error` slot per item. See
+/// `ContextQuery` for the flag and `finish` for where the two shapes
+/// diverge.
 type OracleRequestTuple = (
     OrderV4,
     alloy::primitives::U256,
@@ -280,6 +285,7 @@ async fn post_signed_context_v1_inner(
     query: ContextQuery,
     body: Bytes,
 ) -> Result<ContextResponse, AppError> {
+    let endpoint = "v1";
     let decoded = decode_request_body(&body)?;
     // Envelope mode is only reachable for the array form; a single tuple
     // keeps the whole-request error path whatever the flag says.
@@ -287,7 +293,7 @@ async fn post_signed_context_v1_inner(
     let requests = decoded.items;
 
     if requests.is_empty() {
-        return finish("v1", Vec::new(), envelope);
+        return finish(endpoint, Vec::new(), envelope);
     }
 
     // Resolve every request's token pair first so we know which symbols
@@ -311,10 +317,11 @@ async fn post_signed_context_v1_inner(
         // Move the error out rather than rebuild it: `AppError` is not
         // `Clone`, and rebuilding an `Internal` would lose its anyhow
         // chain and change the wire `detail`.
-        return Err(resolved
+        let err = resolved
             .into_iter()
             .find_map(Result::err)
-            .expect("checked above"));
+            .expect("checked above");
+        return Err(strict_abort(endpoint, err));
     }
 
     let needed_symbols: Vec<&str> = resolved
@@ -338,13 +345,13 @@ async fn post_signed_context_v1_inner(
         // after it is signed.
         if !envelope {
             if let Err(err) = item {
-                return Err(err);
+                return Err(strict_abort(endpoint, err));
             }
         }
         items.push(item);
     }
 
-    finish("v1", items, envelope)
+    finish(endpoint, items, envelope)
 }
 
 /// The transient "cache has nothing for this symbol yet" error, shared by
@@ -420,29 +427,75 @@ fn finish(
     envelope: bool,
 ) -> Result<ContextResponse, AppError> {
     if !envelope {
-        return items
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map(ContextResponse::Strict);
+        // Every item here reached the wire as a signed response (callers
+        // abort strict mode before `finish` on the first failure, via
+        // `strict_abort`, which counts that one error). The `Err` arm is
+        // a fallback that keeps the function total.
+        let mut responses = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                Ok(response) => responses.push(response),
+                Err(err) => return Err(strict_abort(endpoint, err)),
+            }
+        }
+        record_item_outcome(endpoint, "ok", responses.len());
+        return Ok(ContextResponse::Strict(responses));
     }
     let items = items
         .into_iter()
         .enumerate()
         .map(|(index, item)| {
-            if let Err(err) = &item {
-                err.log_batch_item(endpoint, index);
-            }
+            let outcome = match &item {
+                Ok(_) => "ok",
+                Err(err) => {
+                    err.log_batch_item(endpoint, index);
+                    err.code()
+                }
+            };
+            record_item_outcome(endpoint, outcome, 1);
             oracle::BatchItemResponse::from(item)
         })
         .collect();
     Ok(ContextResponse::Envelope(items))
 }
 
+/// Strict-mode abort: the one item whose failure becomes the whole
+/// request's error. Counted on the item counter so the per-item view
+/// stays complete across both modes, then handed back unchanged.
+fn strict_abort(endpoint: &'static str, err: AppError) -> AppError {
+    record_item_outcome(endpoint, err.code(), 1);
+    err
+}
+
+/// Increment `oracle_context_item_total` — the per-item counterpart of
+/// `oracle_context_request_total`. It counts item VERDICTS THAT REACHED
+/// THE WIRE: in an `allowFailure` batch every slot (ok or its error
+/// code); in strict mode either N `ok` for a fully signed batch, or the
+/// single aborting error. Items resolved but never signed because an
+/// earlier strict abort stopped the batch are not counted — they were
+/// never served. Keep the labels stable — the obs dashboard joins on
+/// these.
+fn record_item_outcome(endpoint: &'static str, outcome: &'static str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    ::metrics::counter!(
+        "oracle_context_item_total",
+        "endpoint" => endpoint,
+        "outcome" => outcome,
+    )
+    .increment(count as u64);
+}
+
 /// Record a `/context/v{N}` request's outcome on the `oracle_context_request_total`
-/// counter. `outcome` labels split into `ok` (signed responses returned),
-/// `empty` (no requests in the body — Raindex's quote crate posts an empty
-/// batch when an order's IO list is empty), and `error` (any `AppError`).
-/// Keep the labels stable — the obs dashboard joins on these.
+/// counter. `outcome` labels: `ok` (every item signed), `empty` (no
+/// requests in the body — Raindex's quote crate posts an empty batch when
+/// an order's IO list is empty), `error` (the whole request failed: a
+/// single tuple, or a batch without `allowFailure`), and the two
+/// envelope-only labels `partial` (some slots failed) and `failed` (every
+/// slot failed) — see `ContextResponse::outcome`. Per-item detail lives on
+/// `oracle_context_item_total`. Keep the labels stable — the obs dashboard
+/// joins on these.
 fn record_request_outcome(endpoint: &'static str, result: &Result<ContextResponse, AppError>) {
     let outcome = match result {
         Ok(response) => response.outcome(),
@@ -642,10 +695,11 @@ async fn post_signed_context_pair_bound(
         .collect();
     if !envelope && resolved.iter().any(Result::is_err) {
         // Move, don't rebuild: see the v1 path for why.
-        return Err(resolved
+        let err = resolved
             .into_iter()
             .find_map(Result::err)
-            .expect("checked above"));
+            .expect("checked above");
+        return Err(strict_abort(endpoint, err));
     }
 
     let needed_symbols: Vec<&str> = resolved
@@ -684,7 +738,7 @@ async fn post_signed_context_pair_bound(
         // after it is signed.
         if !envelope {
             if let Err(err) = item {
-                return Err(err);
+                return Err(strict_abort(endpoint, err));
             }
         }
         items.push(item);
@@ -1151,23 +1205,28 @@ impl AppError {
         }
     }
 
+    /// Stable machine-readable code. This is the `error` field of the
+    /// JSON body AND the `outcome` label of `oracle_context_item_total`,
+    /// so a dashboard and a client see the same vocabulary.
+    pub fn code(&self) -> &'static str {
+        match self {
+            AppError::Internal(_) => "internal_error",
+            AppError::BadRequest(_) => "bad_request",
+            AppError::Unavailable(_) => "service_unavailable",
+        }
+    }
+
     /// The JSON body for this error. Used both as the body of a non-2xx
     /// response and as the per-item `body` of a batch envelope error, so
     /// the two paths can never disagree on the `error` code strings.
     pub fn to_error_response(&self) -> ErrorResponse {
-        match self {
-            AppError::Internal(err) => ErrorResponse {
-                error: "internal_error".to_string(),
-                detail: format!("{}", err),
-            },
-            AppError::BadRequest(detail) => ErrorResponse {
-                error: "bad_request".to_string(),
-                detail: detail.clone(),
-            },
-            AppError::Unavailable(detail) => ErrorResponse {
-                error: "service_unavailable".to_string(),
-                detail: detail.clone(),
-            },
+        let detail = match self {
+            AppError::Internal(err) => format!("{}", err),
+            AppError::BadRequest(detail) | AppError::Unavailable(detail) => detail.clone(),
+        };
+        ErrorResponse {
+            error: self.code().to_string(),
+            detail,
         }
     }
 
@@ -1373,6 +1432,66 @@ mod context_response_tests {
         let (status, _, json) = render(ContextResponse::Strict(vec![])).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json, serde_json::json!([]));
+    }
+
+    /// Exact per-item counting for `oracle_context_item_total`, under a
+    /// thread-local recorder so the process-global Prometheus recorder
+    /// (and tests running in parallel against it) cannot interfere.
+    /// Pins the "verdicts that reached the wire" rule in both modes.
+    #[test]
+    fn item_counter_counts_wire_verdicts_exactly() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::collections::HashMap;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        ::metrics::with_local_recorder(&recorder, || {
+            // Envelope, mixed: every slot counted under its own code.
+            let _ = finish(
+                "t",
+                vec![
+                    Ok(ok()),
+                    Err(err()),
+                    Err(AppError::BadRequest("b".into())),
+                    Ok(ok()),
+                ],
+                true,
+            );
+            // Strict, fully signed: N ok.
+            let _ = finish("t", vec![Ok(ok()), Ok(ok()), Ok(ok())], false);
+            // Strict abort from a handler: the single aborting error.
+            let _ = strict_abort("t", AppError::Internal(anyhow::anyhow!("x")));
+            // Strict fallback inside `finish`: the error counts once, the
+            // ok items before it do NOT (they never reached the wire).
+            let _ = finish("t", vec![Ok(ok()), Err(err())], false);
+            // Empty batches record nothing in either mode.
+            let _ = finish("t", vec![], false);
+            let _ = finish("t", vec![], true);
+        });
+
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for (key, _unit, _desc, value) in snapshotter.snapshot().into_vec() {
+            let key = key.key();
+            if key.name() != "oracle_context_item_total" {
+                continue;
+            }
+            let label = |name: &str| {
+                key.labels()
+                    .find(|l| l.key() == name)
+                    .map(|l| l.value().to_string())
+                    .unwrap_or_else(|| panic!("missing label {name} on {key:?}"))
+            };
+            assert_eq!(label("endpoint"), "t");
+            let DebugValue::Counter(n) = value else {
+                panic!("item counter must be a counter, got {value:?}");
+            };
+            counts.insert(label("outcome"), n);
+        }
+        assert_eq!(counts.get("ok"), Some(&5), "{counts:?}");
+        assert_eq!(counts.get("service_unavailable"), Some(&2), "{counts:?}");
+        assert_eq!(counts.get("bad_request"), Some(&1), "{counts:?}");
+        assert_eq!(counts.get("internal_error"), Some(&1), "{counts:?}");
+        assert_eq!(counts.len(), 4, "no other outcome labels: {counts:?}");
     }
 
     /// `finish` is the only place the mode is applied: strict collapses
