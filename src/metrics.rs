@@ -11,8 +11,9 @@
 //! Minimal initial set — PR 2 (pricing-client integration) will
 //! add pricing-link gauges; the obs dashboard PR consumes whatever
 //! is declared here. Keep new metric names registered in `declare`
-//! so they show up in `/metrics` output even before the first
-//! sample is recorded.
+//! so their `# HELP` text is attached in `/metrics` output. (The
+//! exporter prints a family only once it has a sample; the description
+//! is what makes that first sample self-explanatory.)
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::{Mutex, OnceLock};
@@ -58,7 +59,17 @@ impl MetricsHandle {
     fn declare() {
         metrics::describe_counter!(
             "oracle_context_request_total",
-            "Signed-context requests received, labelled by endpoint (v1 / v2) and outcome (signed / rejected)"
+            "Signed-context requests received, labelled by endpoint (v1 / v4 / v5 / v6 / v7) and outcome: \
+             ok (every item signed), empty (no items in the body), error (whole request failed — a single \
+             tuple, or a batch without allowFailure), partial (allowFailure batch with some failed slots), \
+             failed (allowFailure batch with every slot failed)"
+        );
+        metrics::describe_counter!(
+            "oracle_context_item_total",
+            "Per-item verdicts that reached the wire, labelled by endpoint and outcome \
+             (ok / bad_request / service_unavailable / internal_error). In an allowFailure batch every \
+             slot is counted; in strict mode a fully signed batch counts N ok and a failed one counts the \
+             single aborting error. Join with oracle_context_request_total for a per-item failure rate."
         );
         metrics::describe_counter!(
             "oracle_upstream_failure_total",

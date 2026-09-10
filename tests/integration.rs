@@ -1051,7 +1051,10 @@ async fn test_zero_rate_fails_closed_with_500() {
     // A zero directional rate cannot be inverted; the request must fail
     // before signing (previously a zero would have been signed, leaving
     // the strategy's greater-than(price 0) guard as the only backstop).
-    // Note the blast radius: one bad symbol 500s the whole batch.
+    // Without `allowFailure` one bad symbol still 500s the whole batch;
+    // the per-item behaviour behind the flag is pinned in
+    // `test_v1_zero_rate_item_is_internal_error_slot_with_flag` and its
+    // pair-bound twin.
     let app = test_app_asymmetric("0", "99").await;
     let resp = app
         .oneshot(
@@ -1331,7 +1334,9 @@ async fn test_v5_v6_still_sign_vault_rate_when_underlying_differs() {
 async fn test_v7_fails_closed_on_absent_underlying_rate() {
     // A quote from a producer predating the underlying_rate_* fields
     // decodes them to the all-zero sentinel. v7 must refuse to sign a
-    // zero underlying price — one bad symbol 500s the request — rather
+    // zero underlying price — without `allowFailure` one bad symbol 500s
+    // the request; with it, the item is an `internal_error` slot (see
+    // `test_v7_absent_underlying_rate_is_per_item_with_flag`) — rather
     // than hand the strategy a garbage mark. The vault rate is present and
     // valid, so v5/v6 would happily serve; only v7 fails closed.
     let signer = Signer::new(TEST_KEY).unwrap();
@@ -1727,6 +1732,7 @@ async fn test_batch_without_flag_keeps_all_or_nothing_behaviour() {
         "",
         "?allowFailure=false",
         "?allowFailure=0",
+        "?allowFailure=nonsense",
         "?foo=bar",
         "?%%%&==",
     ];
@@ -2296,5 +2302,270 @@ async fn test_repeated_symbol_in_envelope_batch_signs_identically() {
             "{uri}: same pair, same snapshot, same signature"
         );
         assert_ne!(slots[0], slots[1], "{uri}: opposite direction must differ");
+    }
+}
+
+/// Read one counter sample (by name + label subset) out of a Prometheus
+/// exposition dump. Missing → 0, which is what a never-incremented
+/// counter reads as.
+fn counter_value(text: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
+    text.lines()
+        .find(|l| {
+            l.starts_with(&format!("{name}{{"))
+                && labels
+                    .iter()
+                    .all(|(k, v)| l.contains(&format!(r#"{k}="{v}""#)))
+        })
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+async fn scrape_metrics(app: axum::Router) -> String {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+/// `oracle_context_item_total` reaches `/metrics` with the endpoint and
+/// outcome labels, and moves in the right direction for every path.
+///
+/// The Prometheus recorder is process-global and the integration tests
+/// run in parallel against it, so this test only asserts that each
+/// counter grew by AT LEAST the expected amount between two scrapes —
+/// another test may have added to it in between. The exact counts
+/// (including the "nothing counted" cases) are pinned in the lib unit
+/// test `item_counter_counts_wire_verdicts_exactly` under a thread-local
+/// recorder.
+#[tokio::test]
+async fn test_item_counter_reaches_metrics_for_every_path() {
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+    let unknown = "0x9999999999999999999999999999999999999999";
+    let item = |text: &str, outcome: &str| {
+        counter_value(
+            text,
+            "oracle_context_item_total",
+            &[("endpoint", "v1"), ("outcome", outcome)],
+        )
+    };
+    let grew_by_at_least = |before: &str, after: &str, outcome: &str, n: f64| {
+        let delta = item(after, outcome) - item(before, outcome);
+        assert!(delta >= n, "{outcome}: grew by {delta}, expected >= {n}");
+    };
+
+    // Envelope, mixed: every slot counted under its own code.
+    let before = scrape_metrics(app.clone()).await;
+    let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM), (USDC, unknown), (WCOIN, USDC)]);
+    let (status, _) = post_json(app.clone(), "/context/v1?allowFailure=true", mixed.clone()).await;
+    assert_eq!(status, 200);
+    let after = scrape_metrics(app.clone()).await;
+    grew_by_at_least(&before, &after, "ok", 2.0);
+    grew_by_at_least(&before, &after, "service_unavailable", 1.0);
+    grew_by_at_least(&before, &after, "bad_request", 1.0);
+
+    // Strict, mixed: the aborting error (resolve wins → bad_request).
+    let before = after;
+    let (status, _) = post_json(app.clone(), "/context/v1", mixed).await;
+    assert_eq!(status, 400);
+    let after = scrape_metrics(app.clone()).await;
+    grew_by_at_least(&before, &after, "bad_request", 1.0);
+
+    // Strict, healthy: N ok.
+    let before = after;
+    let (status, _) = post_json(
+        app.clone(),
+        "/context/v1",
+        encode_batch(&[(USDC, WCOIN), (WCOIN, USDC), (USDC, WCOIN)]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let after = scrape_metrics(app.clone()).await;
+    grew_by_at_least(&before, &after, "ok", 3.0);
+
+    // Strict, single tuple failing in the build phase: one error.
+    let before = after;
+    let (status, _) = post_json(app.clone(), "/context/v1", encode_single(USDC, WDRAM)).await;
+    assert_eq!(status, 503);
+    let after = scrape_metrics(app.clone()).await;
+    grew_by_at_least(&before, &after, "service_unavailable", 1.0);
+
+    // Request-level: an all-failed envelope lands on `failed`.
+    let before = after;
+    let (status, _) = post_json(
+        app.clone(),
+        "/context/v1?allowFailure=true",
+        encode_batch(&[(USDC, WDRAM), (USDC, unknown)]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let after = scrape_metrics(app.clone()).await;
+    let failed = |t: &str| {
+        counter_value(
+            t,
+            "oracle_context_request_total",
+            &[("endpoint", "v1"), ("outcome", "failed")],
+        )
+    };
+    assert!(failed(&after) - failed(&before) >= 1.0);
+}
+
+/// The `describe_counter!` text registered in `metrics.rs` is what the
+/// exporter prints as `# HELP`. The exporter only prints a family once
+/// it has a sample, so drive one request first, then check both
+/// counters carry the new outcome vocabulary in their HELP line.
+#[tokio::test]
+async fn test_metrics_help_text_describes_both_context_counters() {
+    let app = test_app().await;
+    let (status, _) = post_json(app.clone(), "/context/v1", encode_single(USDC, WCOIN)).await;
+    assert_eq!(status, 200);
+    let text = scrape_metrics(app).await;
+
+    let help = |name: &str| {
+        text.lines()
+            .find(|l| l.starts_with(&format!("# HELP {name} ")))
+            .unwrap_or_else(|| panic!("no HELP line for {name} in:\n{text}"))
+            .to_string()
+    };
+    let request_help = help("oracle_context_request_total");
+    for word in ["partial", "failed", "allowFailure", "v7"] {
+        assert!(request_help.contains(word), "{request_help}");
+    }
+    let item_help = help("oracle_context_item_total");
+    for word in [
+        "ok",
+        "bad_request",
+        "service_unavailable",
+        "internal_error",
+        "allowFailure",
+    ] {
+        assert!(item_help.contains(word), "{item_help}");
+    }
+}
+
+/// The v7-only fail-closed path (`pick_underlying_rate_bytes` on the
+/// all-zero sentinel) is per-item too, and per-schema: the same batch
+/// that yields an `internal_error` slot on v7 signs cleanly on v5, and a
+/// second symbol with a valid underlying rate signs on v7 alongside the
+/// failed one. Strict v7 keeps the whole-request 500.
+#[tokio::test]
+async fn test_v7_absent_underlying_rate_is_per_item_with_flag() {
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(
+        vec![
+            (WCOIN.to_string(), "COIN".to_string()),
+            (WDRAM.to_string(), "DRAM".to_string()),
+        ],
+        USDC,
+    )
+    .unwrap();
+    let mut coin = fake_quote("COIN", WCOIN, "0.01", "100");
+    coin.underlying_rate_quote_to_base = WireFloat::from_bytes([0u8; 32]);
+    coin.underlying_rate_base_to_quote = WireFloat::from_bytes([0u8; 32]);
+    let dram = fake_quote("DRAM", WDRAM, "0.02", "50");
+    let pricing = LiveClient::with_seeded(vec![coin, dram]).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let app = create_app(AppState::new(
+        signer,
+        registry,
+        pricing,
+        vec!["COIN".to_string(), "DRAM".to_string()],
+        fixed_close_market_hours().await,
+        metrics,
+    ));
+    let body = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM)]);
+
+    let (status, json) =
+        post_json(app.clone(), "/context/v7?allowFailure=true", body.clone()).await;
+    assert_eq!(status, 200, "{json}");
+    let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+    assert!(
+        matches!(&items[0], BatchItemResponse::Error(e) if e.error == "internal_error"),
+        "{:?}",
+        items[0]
+    );
+    assert!(
+        matches!(&items[1], BatchItemResponse::Ok(_)),
+        "{:?}",
+        items[1]
+    );
+
+    let (status, json) =
+        post_json(app.clone(), "/context/v5?allowFailure=true", body.clone()).await;
+    assert_eq!(status, 200, "{json}");
+    let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+    assert!(
+        items.iter().all(|i| matches!(i, BatchItemResponse::Ok(_))),
+        "v5 ignores the underlying rate"
+    );
+
+    let (status, json) = post_json(app, "/context/v7", body).await;
+    assert_eq!(status, 500, "strict v7 keeps the whole-request 500: {json}");
+}
+
+/// Cryptographic check, not a field comparison: recover the EIP-191
+/// signer from `signature` over `keccak256(abi.encodePacked(context))`
+/// — the exact scheme `LibContext.build` verifies on-chain — and demand
+/// it equals both the claimed `signer` field and the test key's address.
+fn assert_signed_by_test_key(resp: &OracleResponse, what: &str) {
+    let expected = Signer::new(TEST_KEY).unwrap().address();
+    assert_eq!(resp.signer, expected, "{what}: signer field");
+    let packed: Vec<u8> = resp.context.iter().flat_map(|b| b.to_vec()).collect();
+    let hash = alloy::primitives::keccak256(&packed);
+    let sig = alloy::primitives::Signature::from_raw(&resp.signature)
+        .unwrap_or_else(|e| panic!("{what}: signature bytes: {e}"));
+    let recovered = sig
+        .recover_address_from_msg(hash)
+        .unwrap_or_else(|e| panic!("{what}: recover: {e}"));
+    assert_eq!(recovered, expected, "{what}: recovered signer");
+}
+
+/// Plan case 1's last clause: the ok slots of an envelope are real
+/// signatures from the configured key, recoverable exactly as the
+/// orderbook contract recovers them — not merely equal to some other
+/// response. Also covers the strict array so the two modes are held to
+/// the same standard.
+#[tokio::test]
+async fn test_envelope_ok_slots_carry_recoverable_signatures() {
+    let unknown = "0x9999999999999999999999999999999999999999";
+    for endpoint in ALL_ENDPOINTS {
+        let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+        let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM), (USDC, unknown), (WCOIN, USDC)]);
+
+        let uri = format!("{endpoint}?allowFailure=true");
+        let (status, json) = post_json(app.clone(), &uri, mixed).await;
+        assert_eq!(status, 200, "{uri}");
+        let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
+        let mut ok_slots = 0;
+        for (i, item) in items.iter().enumerate() {
+            if let BatchItemResponse::Ok(resp) = item {
+                assert_signed_by_test_key(resp, &format!("{uri} slot {i}"));
+                ok_slots += 1;
+            }
+        }
+        assert_eq!(ok_slots, 2, "{uri}");
+
+        let (status, json) =
+            post_json(app, endpoint, encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)])).await;
+        assert_eq!(status, 200, "{endpoint}");
+        let strict: Vec<OracleResponse> = serde_json::from_value(json).unwrap();
+        for (i, resp) in strict.iter().enumerate() {
+            assert_signed_by_test_key(resp, &format!("{endpoint} strict {i}"));
+        }
     }
 }
