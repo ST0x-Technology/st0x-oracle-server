@@ -10,7 +10,7 @@ use st0x_oracle_server::oracle::{OracleResponse, SCHEMA_VERSION};
 use st0x_oracle_server::pricing_client::LiveClient;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
-use st0x_oracle_server::{create_app, AppState, EvaluableV4, OrderV4, IOV2};
+use st0x_oracle_server::{create_app, AppState, ErrorResponse, EvaluableV4, OrderV4, IOV2};
 use st0x_pricing_types::{Quote, WireAddress, WireFloat, WireU256};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -1549,4 +1549,213 @@ async fn test_v6_reuse_requires_same_nav_ratio() {
     let third = response_of(app, "/context/v6").await;
     assert_eq!(publish_time_of(&third), secs(FIXED_PUBLISH_TIME + 10));
     assert_ne!(third.context[9], first.context[9]);
+}
+
+/// Wire-level pin for the error body shape. `AppError::into_response`
+/// is the single funnel for every non-2xx `/context/v*` reply, and the
+/// batch envelope (`allowFailure=true`) reuses the same body per failed
+/// item, so downstream clients will key on `error`. Hit all three
+/// status paths through the real router and check the code strings and
+/// the JSON content type, not just the status.
+#[tokio::test]
+async fn test_error_body_shape_is_stable_across_status_codes() {
+    async fn post(app: axum::Router, body: Bytes) -> (u16, String, ErrorResponse) {
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/context/v1")
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: ErrorResponse = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("error body must be {{error, detail}}: {e}: {bytes:?}"));
+        (status, content_type, body)
+    }
+
+    // 400: body is not ABI-decodable as either request shape.
+    let (status, content_type, body) = post(test_app().await, Bytes::from_static(b"nope")).await;
+    assert_eq!(status, 400);
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    assert_eq!(body.error, "bad_request");
+    assert!(
+        body.detail.contains("Invalid ABI-encoded body"),
+        "{}",
+        body.detail
+    );
+
+    // 503: configured symbol with no live quote yet.
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+    let (status, content_type, body) = post(app, encode_single(USDC, WDRAM)).await;
+    assert_eq!(status, 503);
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    assert_eq!(body.error, "service_unavailable");
+    assert!(body.detail.contains("DRAM"), "{}", body.detail);
+
+    // 500: zero directional rate cannot be inverted, fails closed.
+    let (status, content_type, body) = post(
+        test_app_asymmetric("0", "99").await,
+        encode_single(USDC, WCOIN),
+    )
+    .await;
+    assert_eq!(status, 500);
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    assert_eq!(body.error, "internal_error");
+    assert!(!body.detail.is_empty());
+}
+
+/// Query-string handling must never reject an otherwise valid oracle
+/// request: unknown keys, garbage, and the `allowFailure` flag on a
+/// SINGLE-tuple body all leave the response exactly as it is without a
+/// query string. (Batch + flag is pinned separately once the envelope
+/// path lands.)
+#[tokio::test]
+async fn test_query_string_never_changes_single_tuple_responses() {
+    async fn post(app: axum::Router, uri: &str, body: Bytes) -> (u16, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    for endpoint in [
+        "/context/v1",
+        "/context/v4",
+        "/context/v5",
+        "/context/v6",
+        "/context/v7",
+    ] {
+        // Happy path: the flag must NOT envelope a single tuple.
+        let app = test_app().await;
+        let (base_status, base_body) =
+            post(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
+        assert_eq!(base_status, 200, "{endpoint}");
+        let responses: Vec<OracleResponse> = serde_json::from_value(base_body.clone()).unwrap();
+        assert_eq!(responses.len(), 1, "{endpoint}");
+
+        for query in [
+            "?allowFailure=true",
+            "?allowFailure=1",
+            "?allowFailure=false",
+            "?foo=bar",
+            "?%%%&==",
+            "?allowFailure=true&foo=bar",
+        ] {
+            let uri = format!("{endpoint}{query}");
+            let (status, body) = post(app.clone(), &uri, encode_single(USDC, WCOIN)).await;
+            assert_eq!(status, 200, "{uri}");
+            // Same shape: a bare one-element array of OracleResponse, not
+            // an envelope. Signatures are deterministic for a fixed key +
+            // fixed context, so the body should be identical too.
+            assert_eq!(body, base_body, "{uri} must equal the no-query response");
+        }
+
+        // Error path: a single tuple still gets the whole-request error
+        // with the flag set — never a 200 with an error item.
+        let uri = format!("{endpoint}?allowFailure=true");
+        let (status, body) = post(
+            test_app().await,
+            &uri,
+            encode_single(
+                "0x9999999999999999999999999999999999999999",
+                "0x8888888888888888888888888888888888888888",
+            ),
+        )
+        .await;
+        assert_eq!(status, 400, "{uri}");
+        let err: ErrorResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(err.error, "bad_request", "{uri}");
+    }
+}
+
+/// Batch bodies WITHOUT the flag (absent, `false`, unknown keys, garbage)
+/// must keep the all-or-nothing behaviour byte-for-byte: a healthy batch
+/// returns the bare array, and a batch with one bad item returns the
+/// whole-request error. This is the compatibility promise to deployed
+/// Raindex clients that batch in normal mode, and it must hold both
+/// before and after the envelope path lands.
+#[tokio::test]
+async fn test_batch_without_flag_keeps_all_or_nothing_behaviour() {
+    async fn post(app: axum::Router, uri: &str, body: Bytes) -> (u16, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    let non_flag_queries = [
+        "",
+        "?allowFailure=false",
+        "?allowFailure=0",
+        "?foo=bar",
+        "?%%%&==",
+    ];
+
+    for endpoint in ["/context/v1", "/context/v7"] {
+        // Healthy batch: bare array, identical across non-flag queries.
+        let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+        let healthy = encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)]);
+        let (status, base) = post(app.clone(), endpoint, healthy.clone()).await;
+        assert_eq!(status, 200, "{endpoint}");
+        let responses: Vec<OracleResponse> = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(responses.len(), 2, "{endpoint}");
+        for query in non_flag_queries {
+            let uri = format!("{endpoint}{query}");
+            let (status, body) = post(app.clone(), &uri, healthy.clone()).await;
+            assert_eq!(status, 200, "{uri}");
+            assert_eq!(body, base, "{uri} must equal the no-query response");
+        }
+
+        // Mixed batch (valid, no-quote, valid): whole request fails with
+        // the first item's error, and no envelope appears.
+        let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM), (WCOIN, USDC)]);
+        for query in non_flag_queries {
+            let uri = format!("{endpoint}{query}");
+            let (status, body) = post(app.clone(), &uri, mixed.clone()).await;
+            assert_eq!(status, 503, "{uri}: one uncached item must 503 the batch");
+            let err: ErrorResponse = serde_json::from_value(body).unwrap();
+            assert_eq!(err.error, "service_unavailable", "{uri}");
+            assert!(err.detail.contains("DRAM"), "{uri}: {}", err.detail);
+        }
+    }
 }

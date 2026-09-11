@@ -13,14 +13,14 @@ use alloy::sol;
 use alloy::sol_types::SolValue;
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{RawQuery, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use rain_math_float::Float;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sign::Signer;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -177,14 +177,34 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     })
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-    detail: String,
+/// JSON error body. Today it is the body of every non-2xx `/context/v*`
+/// response; the batch envelope (`allowFailure=true`) reuses the same
+/// shape per failed item, so it is public and round-trippable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    /// Stable machine-readable code: `bad_request`, `service_unavailable`
+    /// or `internal_error`. Mirrors the HTTP status `AppError` maps to.
+    pub error: String,
+    /// Human-readable detail for logs and debugging.
+    pub detail: String,
+}
+
+/// A decoded `/context/v*` body plus the wire shape it arrived in.
+///
+/// The shape matters beyond decoding: only the array form can be served
+/// as a per-item envelope (`allowFailure=true`). A single tuple is never
+/// enveloped, flag or not, so the caller that sent it keeps getting the
+/// one-element array or the whole-request error it always got.
+struct DecodedRequest {
+    items: Vec<OracleRequestTuple>,
+    /// `true` when the body decoded as `(OrderV4, uint256, uint256,
+    /// address)[]` — including the empty and one-element arrays.
+    is_batch: bool,
 }
 
 /// Decode the POST body as either a single tuple or a batch array.
-/// Returns a `Vec` in either case so downstream logic is uniform.
+/// Returns a `Vec` in either case so downstream logic is uniform, and
+/// remembers which form it was.
 ///
 /// We try the batch form first because the empty-batch case (`[]`) is
 /// a valid input upstream — returning an empty response array preserves
@@ -192,29 +212,80 @@ struct ErrorResponse {
 /// containing one element will also decode correctly here. Only when
 /// the batch decoder rejects the body do we fall back to the single
 /// tuple form (which is what most current callers send).
-fn decode_request_body(body: &[u8]) -> Result<Vec<OracleRequestTuple>, AppError> {
-    if let Ok(batch) = <Vec<OracleRequestTuple>>::abi_decode(body) {
-        return Ok(batch);
+fn decode_request_body(body: &[u8]) -> Result<DecodedRequest, AppError> {
+    if let Ok(items) = <Vec<OracleRequestTuple>>::abi_decode(body) {
+        return Ok(DecodedRequest {
+            items,
+            is_batch: true,
+        });
     }
     let single = <OracleRequestTuple>::abi_decode(body)
         .map_err(|e| AppError::BadRequest(format!("Invalid ABI-encoded body: {}", e)))?;
-    Ok(vec![single])
+    Ok(DecodedRequest {
+        items: vec![single],
+        is_batch: false,
+    })
+}
+
+/// Per-request options carried in the query string of a `/context/v*`
+/// POST. The body is opaque ABI, so the query string is the only place a
+/// caller can put a flag without changing the upstream body encoding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextQuery {
+    /// `?allowFailure=true` (or `=1`, case-insensitive). When set on a
+    /// BATCH body the response is always `200` with one
+    /// `BatchItemResponse` per request item, so a failing item no longer
+    /// takes the whole batch down. Absent, `false`, or any other value
+    /// keeps the all-or-nothing behaviour every existing caller relies
+    /// on. Ignored for single-tuple bodies.
+    pub allow_failure: bool,
+}
+
+impl ContextQuery {
+    /// Lenient parse of a raw query string. Unknown keys are ignored,
+    /// garbage never errors, a missing value reads as `false`, and if the
+    /// key repeats the last occurrence wins. This is deliberately not a
+    /// typed `Query<T>` extractor: a malformed query must not turn an
+    /// otherwise valid oracle request into a 400.
+    pub fn parse(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::default();
+        };
+        let allow_failure = raw
+            .split('&')
+            .filter_map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (key == "allowFailure").then_some(value)
+            })
+            .next_back()
+            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            .unwrap_or(false);
+        Self { allow_failure }
+    }
 }
 
 async fn post_signed_context_v1(
     State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let result = post_signed_context_v1_inner(state, body).await;
+    let query = ContextQuery::parse(query.as_deref());
+    let result = post_signed_context_v1_inner(state, query, body).await;
     record_request_outcome("v1", &result);
     result
 }
 
 async fn post_signed_context_v1_inner(
     state: Arc<AppState>,
+    query: ContextQuery,
     body: Bytes,
 ) -> Result<axum::Json<Vec<oracle::OracleResponse>>, AppError> {
-    let requests = decode_request_body(&body)?;
+    let decoded = decode_request_body(&body)?;
+    // Envelope mode is only reachable for the array form. The per-item
+    // pipeline (plan steps 4/6) consumes this; until then the flag is
+    // parsed and decided here but does not change the response.
+    let _envelope = query.allow_failure && decoded.is_batch;
+    let requests = decoded.items;
 
     if requests.is_empty() {
         return Ok(Json(Vec::<oracle::OracleResponse>::new()));
@@ -285,9 +356,11 @@ fn record_request_outcome(
 /// for the full context layout.
 async fn post_signed_context_v4(
     State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let result = post_signed_context_pair_bound(state, body, PairSchema::V4).await;
+    let query = ContextQuery::parse(query.as_deref());
+    let result = post_signed_context_pair_bound(state, query, body, PairSchema::V4).await;
     record_request_outcome("v4", &result);
     result
 }
@@ -304,9 +377,11 @@ async fn post_signed_context_v4(
 /// `oracle::SCHEMA_VERSION_V5` for the full layout.
 async fn post_signed_context_v5(
     State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let result = post_signed_context_pair_bound(state, body, PairSchema::V5).await;
+    let query = ContextQuery::parse(query.as_deref());
+    let result = post_signed_context_pair_bound(state, query, body, PairSchema::V5).await;
     record_request_outcome("v5", &result);
     result
 }
@@ -327,9 +402,11 @@ async fn post_signed_context_v5(
 /// rationale and the zero sentinel.
 async fn post_signed_context_v6(
     State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let result = post_signed_context_pair_bound(state, body, PairSchema::V6).await;
+    let query = ContextQuery::parse(query.as_deref());
+    let result = post_signed_context_pair_bound(state, query, body, PairSchema::V6).await;
     record_request_outcome("v6", &result);
     result
 }
@@ -353,9 +430,11 @@ async fn post_signed_context_v6(
 /// handling of an absent underlying rate.
 async fn post_signed_context_v7(
     State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let result = post_signed_context_pair_bound(state, body, PairSchema::V7).await;
+    let query = ContextQuery::parse(query.as_deref());
+    let result = post_signed_context_pair_bound(state, query, body, PairSchema::V7).await;
     record_request_outcome("v7", &result);
     result
 }
@@ -405,10 +484,16 @@ impl PairSchema {
 /// `/context/v7`.
 async fn post_signed_context_pair_bound(
     state: Arc<AppState>,
+    query: ContextQuery,
     body: Bytes,
     schema: PairSchema,
 ) -> Result<axum::Json<Vec<oracle::OracleResponse>>, AppError> {
-    let requests = decode_request_body(&body)?;
+    let decoded = decode_request_body(&body)?;
+    // Envelope mode is only reachable for the array form. The per-item
+    // pipeline (plan steps 5/6) consumes this; until then the flag is
+    // parsed and decided here but does not change the response.
+    let _envelope = query.allow_failure && decoded.is_batch;
+    let requests = decoded.items;
 
     if requests.is_empty() {
         return Ok(Json(Vec::<oracle::OracleResponse>::new()));
@@ -902,6 +987,7 @@ async fn build_response_from_quote_pair_bound(
     Ok(response)
 }
 
+#[derive(Debug)]
 pub enum AppError {
     Internal(anyhow::Error),
     BadRequest(String),
@@ -911,48 +997,277 @@ pub enum AppError {
     Unavailable(String),
 }
 
+impl AppError {
+    /// HTTP status this error maps to when it is the outcome of a whole
+    /// request (single-tuple requests, and batches without
+    /// `allowFailure`).
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// The JSON body for this error. Used both as the body of a non-2xx
+    /// response and as the per-item `body` of a batch envelope error, so
+    /// the two paths can never disagree on the `error` code strings.
+    pub fn to_error_response(&self) -> ErrorResponse {
+        match self {
+            AppError::Internal(err) => ErrorResponse {
+                error: "internal_error".to_string(),
+                detail: format!("{}", err),
+            },
+            AppError::BadRequest(detail) => ErrorResponse {
+                error: "bad_request".to_string(),
+                detail: detail.clone(),
+            },
+            AppError::Unavailable(detail) => ErrorResponse {
+                error: "service_unavailable".to_string(),
+                detail: detail.clone(),
+            },
+        }
+    }
+
+    /// Log this error at the severity the whole-request path has always
+    /// used: `error!` for internal failures (with the full anyhow chain),
+    /// `warn!` for client and transient errors.
+    pub fn log(&self) {
+        match self {
+            AppError::Internal(err) => tracing::error!("Internal error: {:?}", err),
+            AppError::BadRequest(detail) => tracing::warn!("Bad request: {}", detail),
+            AppError::Unavailable(detail) => tracing::warn!("Service unavailable: {}", detail),
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        match self {
-            AppError::Internal(err) => {
-                tracing::error!("Internal error: {:?}", err);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "internal_error".to_string(),
-                        detail: format!("{}", err),
-                    }),
-                )
-                    .into_response()
-            }
-            AppError::BadRequest(detail) => {
-                tracing::warn!("Bad request: {}", detail);
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "bad_request".to_string(),
-                        detail,
-                    }),
-                )
-                    .into_response()
-            }
-            AppError::Unavailable(detail) => {
-                tracing::warn!("Service unavailable: {}", detail);
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        error: "service_unavailable".to_string(),
-                        detail,
-                    }),
-                )
-                    .into_response()
-            }
-        }
+        self.log();
+        (self.status_code(), Json(self.to_error_response())).into_response()
     }
 }
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         Self::Internal(err)
+    }
+}
+
+#[cfg(test)]
+mod app_error_tests {
+    use super::*;
+
+    /// Pins the status/code mapping that both the whole-request path and
+    /// the per-item batch envelope depend on. A drift here would change
+    /// what downstream clients key on.
+    #[test]
+    fn app_error_maps_to_stable_status_and_code() {
+        let cases = [
+            (
+                AppError::Internal(anyhow::anyhow!("boom")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "boom",
+            ),
+            (
+                AppError::BadRequest("bad".into()),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "bad",
+            ),
+            (
+                AppError::Unavailable("later".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "later",
+            ),
+        ];
+        for (err, status, code, detail) in cases {
+            assert_eq!(err.status_code(), status);
+            assert_eq!(
+                err.to_error_response(),
+                ErrorResponse {
+                    error: code.to_string(),
+                    detail: detail.to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn error_response_round_trips_through_json() {
+        let original = ErrorResponse {
+            error: "bad_request".into(),
+            detail: "Invalid input IO index".into(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(
+            json,
+            r#"{"error":"bad_request","detail":"Invalid input IO index"}"#
+        );
+        let back: ErrorResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
+    }
+}
+
+#[cfg(test)]
+mod request_shape_tests {
+    use super::*;
+    use alloy::primitives::{FixedBytes, U256};
+
+    fn tuple() -> OracleRequestTuple {
+        let io = |b: u8| IOV2 {
+            token: Address::repeat_byte(b),
+            vaultId: FixedBytes::ZERO,
+        };
+        let order = OrderV4 {
+            owner: Address::ZERO,
+            evaluable: EvaluableV4 {
+                interpreter: Address::ZERO,
+                store: Address::ZERO,
+                bytecode: alloy::primitives::Bytes::new(),
+            },
+            validInputs: vec![io(0x11)],
+            validOutputs: vec![io(0x22)],
+            nonce: FixedBytes::ZERO,
+        };
+        (order, U256::ZERO, U256::ZERO, Address::ZERO)
+    }
+
+    #[test]
+    fn single_tuple_decodes_as_non_batch_with_one_item() {
+        let decoded = decode_request_body(&tuple().abi_encode()).unwrap();
+        assert!(!decoded.is_batch);
+        assert_eq!(decoded.items.len(), 1);
+    }
+
+    #[test]
+    fn array_decodes_as_batch_preserving_order() {
+        let mut second = tuple();
+        second.0.validInputs[0].token = Address::repeat_byte(0x33);
+        let decoded = decode_request_body(&vec![tuple(), second].abi_encode()).unwrap();
+        assert!(decoded.is_batch);
+        assert_eq!(decoded.items.len(), 2);
+        assert_eq!(
+            decoded.items[1].0.validInputs[0].token,
+            Address::repeat_byte(0x33)
+        );
+    }
+
+    /// The two edge sizes the envelope rule depends on: an empty array
+    /// and a one-element array are BATCHES (envelope-eligible), not
+    /// singles.
+    #[test]
+    fn empty_and_one_element_arrays_are_batches() {
+        let empty = decode_request_body(&Vec::<OracleRequestTuple>::new().abi_encode()).unwrap();
+        assert!(empty.is_batch);
+        assert!(empty.items.is_empty());
+
+        let one = decode_request_body(&vec![tuple()].abi_encode()).unwrap();
+        assert!(one.is_batch);
+        assert_eq!(one.items.len(), 1);
+    }
+
+    #[test]
+    fn undecodable_body_is_bad_request() {
+        // `.err()` rather than `.unwrap_err()`: `OrderV4` (from `sol!`)
+        // has no `Debug`, so the `Ok` arm cannot be formatted.
+        let err = decode_request_body(b"not abi")
+            .err()
+            .expect("garbage must not decode");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert!(err
+            .to_error_response()
+            .detail
+            .contains("Invalid ABI-encoded body"));
+    }
+}
+
+#[cfg(test)]
+mod context_query_tests {
+    use super::*;
+
+    fn allow(raw: Option<&str>) -> bool {
+        ContextQuery::parse(raw).allow_failure
+    }
+
+    #[test]
+    fn absent_or_empty_query_is_false() {
+        assert!(!allow(None));
+        assert!(!allow(Some("")));
+    }
+
+    #[test]
+    fn truthy_spellings() {
+        assert!(allow(Some("allowFailure=true")));
+        assert!(allow(Some("allowFailure=TRUE")));
+        assert!(allow(Some("allowFailure=True")));
+        assert!(allow(Some("allowFailure=1")));
+    }
+
+    #[test]
+    fn falsy_and_unknown_values_are_false() {
+        assert!(!allow(Some("allowFailure=false")));
+        assert!(!allow(Some("allowFailure=0")));
+        assert!(!allow(Some("allowFailure=yes")));
+        assert!(!allow(Some("allowFailure=nonsense")));
+        assert!(!allow(Some("allowFailure=")));
+        assert!(!allow(Some("allowFailure")));
+    }
+
+    /// The key is case-sensitive and exact: `allowfailure` or
+    /// `allow_failure` are unknown keys, not aliases, so a client cannot
+    /// half-opt-in by accident.
+    #[test]
+    fn key_must_match_exactly() {
+        assert!(!allow(Some("allowfailure=true")));
+        assert!(!allow(Some("allow_failure=true")));
+        assert!(!allow(Some("AllowFailure=true")));
+        assert!(!allow(Some("xallowFailure=true")));
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_around_the_flag() {
+        assert!(allow(Some("foo=bar&allowFailure=true&baz=1")));
+        assert!(!allow(Some("foo=bar&baz=1")));
+        assert!(!allow(Some("foo=true")));
+    }
+
+    #[test]
+    fn last_occurrence_wins_when_repeated() {
+        assert!(!allow(Some("allowFailure=true&allowFailure=false")));
+        assert!(allow(Some("allowFailure=false&allowFailure=true")));
+    }
+
+    /// The parser does no percent-decoding: values are matched
+    /// literally. `true` and `1` need no encoding, so an encoded spelling
+    /// is treated as "some other value" (false), and the contract is
+    /// simply "send the literal characters".
+    #[test]
+    fn percent_encoded_values_are_not_decoded() {
+        assert!(!allow(Some("allowFailure=%74rue")));
+        assert!(!allow(Some("allowFailure=%31")));
+        assert!(!allow(Some("allow%46ailure=true")));
+    }
+
+    /// Surrounding whitespace is not trimmed either — the client sends
+    /// the bare token or gets the default.
+    #[test]
+    fn whitespace_is_not_trimmed() {
+        assert!(!allow(Some("allowFailure= true")));
+        assert!(!allow(Some("allowFailure=true ")));
+        assert!(!allow(Some(" allowFailure=true")));
+    }
+
+    /// Garbage must parse to the default, never panic or reject — a
+    /// malformed query is not a reason to refuse an oracle request.
+    #[test]
+    fn garbage_never_panics_and_reads_false() {
+        for raw in ["%%%", "&&&", "===", "=&=&", "a=b=c", "&allowFailure=true&"] {
+            let _ = ContextQuery::parse(Some(raw));
+        }
+        assert!(!allow(Some("%%%&==")));
+        assert!(allow(Some("&allowFailure=true&")));
     }
 }
