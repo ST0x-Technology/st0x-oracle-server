@@ -18,6 +18,8 @@ use tower::ServiceExt;
 
 const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+const TEST_CHAIN_ID: u64 = 8453;
+
 // Token addresses for testing
 const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const WCOIN: &str = "0x1111111111111111111111111111111111111111";
@@ -1255,7 +1257,7 @@ async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> axum::
     quote.underlying_rate_quote_to_base = wire_float_of(&under_inv);
     quote.underlying_rate_base_to_quote = wire_float_of(underlying_px);
 
-    let pricing = LiveClient::with_seeded(vec![quote]).await;
+    let pricing = LiveClient::with_seeded(vec![quote], TEST_CHAIN_ID).await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
         signer,
@@ -1337,7 +1339,7 @@ async fn test_v7_fails_closed_on_absent_underlying_rate() {
     let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
     quote.underlying_rate_quote_to_base = WireFloat::from_bytes([0u8; 32]);
     quote.underlying_rate_base_to_quote = WireFloat::from_bytes([0u8; 32]);
-    let pricing = LiveClient::with_seeded(vec![quote]).await;
+    let pricing = LiveClient::with_seeded(vec![quote], TEST_CHAIN_ID).await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
         signer,
@@ -1375,7 +1377,7 @@ async fn test_v7_fails_closed_on_absent_underlying_rate() {
 async fn reuse_test_app(reuse_min_remaining_secs: u64) -> (axum::Router, LiveClient) {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
-    let pricing = LiveClient::with_seeded(vec![]).await;
+    let pricing = LiveClient::with_seeded(vec![], TEST_CHAIN_ID).await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
         signer,

@@ -135,7 +135,10 @@ impl LiveClient {
     /// frame would. Lets integration tests advance the price feed
     /// between requests without a live pricing server.
     pub async fn seed(&self, quote: Quote) {
-        self.cache.write().await.insert(quote.asset.clone(), quote);
+        self.cache
+            .write()
+            .await
+            .insert((quote.chain_id, quote.asset.clone()), quote);
     }
 
     pub async fn latest(&self, symbol: &str) -> Option<Quote> {
