@@ -9,6 +9,14 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
 
+    /// The chain this deployment serves. Every deployment config already
+    /// declares it (`deploy/config/robinhood.toml`); until now the key was
+    /// parsed and dropped. The quote cache keys on it, so a deployment that
+    /// says 4663 stops reading Base's frames for the same symbol. Defaults
+    /// to Base (8453), which is what every existing config means.
+    #[serde(default = "default_chain_id")]
+    pub chain_id: u64,
+
     /// The settlement stable this deployment quotes against: the
     /// implicit quote side of every pair `TokenRegistry::resolve`
     /// accepts. It is a property of the CHAIN, not of the protocol, and
@@ -74,6 +82,10 @@ pub const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 fn default_port() -> u16 {
     3000
+}
+
+fn default_chain_id() -> u64 {
+    8453
 }
 
 fn default_quote_token() -> String {
