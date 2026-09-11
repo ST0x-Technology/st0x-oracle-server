@@ -70,6 +70,12 @@ type OracleRequestTuple = (
 pub struct AppState {
     signer: Signer,
     registry: TokenRegistry,
+    /// The chain this deployment signs for, from config. Scopes the
+    /// pricing quote cache (only this chain's frames are served) and is
+    /// carried at slot 9 of `/context/v7`, inside the signature, so a
+    /// strategy can reject a frame signed for another chain — see
+    /// `oracle::SCHEMA_VERSION_V7`.
+    chain_id: u64,
     /// Live WS subscription to st0x.pricing. Background-tasked, holds
     /// the latest `Quote` per symbol in an RwLock<HashMap>. Replaces
     /// the Alpaca polling cache (pre-RAI-360).
@@ -92,6 +98,7 @@ impl AppState {
     pub fn new(
         signer: Signer,
         registry: TokenRegistry,
+        chain_id: u64,
         pricing: LiveClient,
         configured_symbols: Vec<String>,
         market_hours: Arc<MarketHoursCache>,
@@ -100,6 +107,7 @@ impl AppState {
         Self {
             signer,
             registry,
+            chain_id,
             pricing,
             configured_symbols,
             market_hours,
@@ -336,8 +344,8 @@ async fn post_signed_context_v6(
 
 /// v7 handler — `/context/v7` endpoint. Identical request shape,
 /// resolution and batching to v4/v5/v6; the signed price at slot 1 is the
-/// vault's UNDERLYING asset rate rather than the vault-share rate, and no
-/// NAV ratio is signed (the v5 nine-slot shape, no slot 9).
+/// vault's UNDERLYING asset rate rather than the vault-share rate, no NAV
+/// ratio is signed, and the deployment's chain id is signed at slot 9.
 ///
 /// The property v7 changes: v6 signs the NAV ratio and forces a strategy
 /// to assert exact equality against the vault's live answer at settlement
@@ -348,7 +356,15 @@ async fn post_signed_context_v6(
 /// live `erc4626-convert-to-assets` on-chain and DERIVES the vault price
 /// (`underlying × convertToAssets(1 share)`) atomically — nothing to
 /// straddle. The underlying is the one quantity the chain can re-derive
-/// the vault price from, so it is what must be signed. See
+/// the vault price from, so it is what must be signed.
+///
+/// The property v7 adds (RAI-1991): EIP-191 is chain-agnostic and no
+/// other slot names a chain, while ST0x token addresses are deterministic
+/// clones across chains — so a v6-and-below payload for chain A verifies
+/// unchanged inside an order on chain B. Slot 9 carries this deployment's
+/// `chain_id` inside the signature; a per-deployment
+/// `equal-to(signed-context<0 9>() expected-chain-id)` binding closes the
+/// gap in the strategy rather than in the URL wiring. See
 /// `oracle::SCHEMA_VERSION_V7` for the full layout and the fail-closed
 /// handling of an absent underlying rate.
 async fn post_signed_context_v7(
@@ -364,9 +380,10 @@ async fn post_signed_context_v7(
 /// or `/context/v7` request is being served under. All four share request
 /// decoding, registry resolution, snapshot-once batching and the session
 /// snapshot; they differ in whether the model's expiry is signed into slot
-/// 8 (v5, v6, v7), whether the vault NAV ratio is signed into slot 9 (v6
-/// only), and WHICH price is signed into slot 1 — the vault-share rate for
-/// v4/v5/v6, the vault's UNDERLYING asset rate for v7.
+/// 8 (v5, v6, v7), what slot 9 carries (the vault NAV ratio for v6, the
+/// deployment's chain id for v7, nothing for v4/v5), and WHICH price is
+/// signed into slot 1 — the vault-share rate for v4/v5/v6, the vault's
+/// UNDERLYING asset rate for v7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairSchema {
     V4,
@@ -822,7 +839,10 @@ async fn build_response_from_quote_pair_bound(
         )?,
         // v7 signs the UNDERLYING price at slot 1 (already selected into
         // `price_bytes` above) and NO NAV ratio — the strategy derives the
-        // vault price on-chain from the live ratio (RAI-2198).
+        // vault price on-chain from the live ratio (RAI-2198) — plus this
+        // deployment's chain id at slot 9 (RAI-1991). The chain id is the
+        // same one the quote cache is scoped by, so the slot names the
+        // chain whose frames produced the price.
         (PairSchema::V7, Some(expiry)) => oracle::build_context_v7(
             price_bytes,
             publish_time,
@@ -832,6 +852,7 @@ async fn build_response_from_quote_pair_bound(
             input_token,
             output_token,
             expiry,
+            state.chain_id,
         )?,
         (_, None) => {
             return Err(AppError::Internal(anyhow::anyhow!(

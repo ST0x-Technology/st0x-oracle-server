@@ -9,10 +9,13 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    /// The chain this deployment serves. Every deployment config already
-    /// declares it (`deploy/config/robinhood.toml`); until now the key was
-    /// parsed and dropped. The quote cache keys on it, so a deployment that
-    /// says 4663 stops reading Base's frames for the same symbol. Defaults
+    /// The chain this deployment serves. The quote cache keys on it, so a
+    /// deployment that says 4663 stops reading Base's frames for the same
+    /// symbol, and `/context/v7` signs it at slot 9 so a strategy can
+    /// reject a frame signed for another chain (see
+    /// `oracle::SCHEMA_VERSION_V7`). Getting it wrong is therefore a
+    /// signing fault, not a tuning mistake: a deployment claiming the
+    /// wrong chain signs frames that its own orders will refuse. Defaults
     /// to Base (8453), which is what every existing config means.
     #[serde(default = "default_chain_id")]
     pub chain_id: u64,
