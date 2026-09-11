@@ -15,21 +15,23 @@
 # ("Global Dollar") with 6 decimals (2026-09-11, via
 # rpc.mainnet.chain.robinhood.com).
 #
-# TWO PROPERTIES MUST HOLD BEFORE THIS DEPLOYMENT SIGNS ANYTHING, and
-# neither holds in this binary. Both are correctness, not polish:
+# TWO PROPERTIES MUST HOLD BEFORE THIS DEPLOYMENT SIGNS ANYTHING. Both
+# are correctness, not polish, and both now hold in this binary:
 #
 #   1. The signed context must name its chain. EIP-191 signing is
-#      chain-agnostic and no context slot carries a chain id, so a context
-#      signed for one chain verifies unchanged inside an order on another
-#      wherever the two chains share a token address — which ST0x tokens,
-#      deployed deterministically, may well do. The `chain_id` key below
-#      is what a binary that signs the chain reads; it is inert (unknown
-#      keys are ignored) until then, and is set now so this deployment can
-#      never silently inherit the 8453 default.
+#      chain-agnostic, so up to v6 a context signed for one chain verifies
+#      unchanged inside an order on another wherever the two chains share
+#      a token address — which ST0x tokens, deployed deterministically,
+#      may well do. `/context/v7` signs the `chain_id` below at slot 9
+#      (RAI-1991), and a v7 order asserts it against its own
+#      `expected-chain-id` binding. Orders on this chain MUST be v7 and
+#      MUST carry that assert; a v6 order here is still replayable from
+#      Base.
 #   2. The pricing quote cache must be keyed by (chain id, symbol).
 #      st0x.pricing stamps a chain id on every frame; a symbol-keyed cache
-#      lets a Base frame overwrite the Robinhood frame for the same symbol
-#      and the oracle signs whichever landed last.
+#      would let a Base frame overwrite the Robinhood frame for the same
+#      symbol and the oracle would sign whichever landed last. The cache
+#      keys on the `chain_id` below (RAI-2130).
 #
 # Chain constants, for whoever fills this in. The server reads NONE of
 # them — they are here so the deployment's facts live in one place:
@@ -57,8 +59,10 @@
 
 port = 3000
 
-# The chain this deployment serves. Inert on a binary that does not sign a
-# chain id (unknown keys are ignored) — see property 1 in the header.
+# The chain this deployment serves. Two things read it: the pricing quote
+# cache (only 4663 frames are served) and /context/v7, which signs it at
+# slot 9 — see the two properties in the header. Set explicitly so this
+# deployment can never silently inherit the 8453 default.
 chain_id = 4663
 
 # USDG (Global Dollar) — the settlement stable on Robinhood Chain,

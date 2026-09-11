@@ -105,15 +105,18 @@ pub const SCHEMA_VERSION_V6: u64 = 6;
 const NAV_RATIO_DECIMALS: u8 = 18;
 
 /// Schema version emitted by `/context/v7`. The underlying-price analogue
-/// of v5: the exact v5 nine-slot shape, but slot 1 carries the price of
+/// of v5: the v5 nine-slot shape, but slot 1 carries the price of
 /// the vault's UNDERLYING ERC4626 asset (the offchain stock) rather than
 /// the vault-share rate, and there is NO NAV-ratio slot (RAI-2198,
-/// part of the "derive, don't gate" pivot — RAI-1479).
+/// part of the "derive, don't gate" pivot — RAI-1479); plus one slot v5
+/// has no analogue for, the deployment's chain id (RAI-1991).
 ///
 /// - `context[1]`: underlying price (Rain Float; the directional
 ///   `underlying_rate_*` for the request's swap direction, inverted into
 ///   Raindex ratio units exactly as v1–v6 invert the vault rate — see
 ///   `pick_underlying_rate_bytes`)
+/// - `context[9]`: chain id of the chain this deployment signs for (Rain
+///   Float)
 ///
 /// v6 signs the NAV ratio (as a lossless Float at slot 9) so a strategy
 /// can assert exact equality between the signed ratio and the vault's live
@@ -141,6 +144,33 @@ const NAV_RATIO_DECIMALS: u8 = 18;
 /// legitimate "non-vault base, no assertion" sentinel the strategy may
 /// accept — a zero underlying price is never usable, so the carrier
 /// refuses the request rather than pushing the decision downstream.
+///
+/// # Slot 9 — the chain id (RAI-1991)
+///
+/// The signature over the context is chain-agnostic EIP-191 and no other
+/// slot names a chain, so v1–v6 bind a signed frame only to its
+/// `(input_token, output_token)` pair. ST0x token contracts are
+/// deterministic clones across chains — the SAME addresses can exist on
+/// two chains — so a context produced for chain A verifies byte-for-byte
+/// inside an order on chain B. Today that is mitigated operationally (the
+/// oracle URL is a per-order deploy-time binding and each deployment is
+/// single-chain), not cryptographically, and the mitigation is exactly as
+/// strong as whoever wired the URL.
+///
+/// v7 closes it inside the signed payload: the deployment's chain id
+/// rides slot 9, covered by the existing signature over all slots. A v7
+/// strategy MUST assert
+/// `equal-to(signed-context<0 9>() expected-chain-id)` where
+/// `expected-chain-id` is a per-deployment binding — the same pattern as
+/// the `oracle-signer` binding — so a wrong-chain payload fails the
+/// strategy's own assert regardless of URL wiring.
+///
+/// Slot 9 is where v6 carried the NAV ratio. Nothing reads a v6 slot out
+/// of a v7 frame (slot 0 states the schema and strategies assert on it,
+/// and slot 1 already means something different between the two), so the
+/// reuse of the index costs nothing and keeps the array dense — the
+/// alternative, a dead padding slot, would put a meaningless signed value
+/// on the wire to preserve a number.
 ///
 /// v1–v6 stay unchanged and are still served on their own endpoints.
 pub const SCHEMA_VERSION_V7: u64 = 7;
@@ -469,9 +499,10 @@ pub fn build_context_v6(
     Ok(ctx)
 }
 
-/// Build the v7 signed-context array — the exact v5 nine-slot shape, but
-/// `price_bytes` is the vault's UNDERLYING price rather than the vault
-/// rate, and there is NO NAV-ratio slot (contrast v6, which appends one).
+/// Build the v7 signed-context array — the v5 shape with the vault's
+/// UNDERLYING price at slot 1 rather than the vault rate, NO NAV-ratio
+/// slot (contrast v6, which appends one), and the deployment's chain id
+/// appended at slot 9.
 ///
 /// `price_bytes` is the 32-byte packed Rain Float the caller already
 /// picked for this request's swap direction from the quote's directional
@@ -481,7 +512,13 @@ pub fn build_context_v6(
 /// price is derived on-chain by the consuming strategy from this
 /// underlying price and the vault's LIVE NAV ratio, so no ratio is signed.
 ///
-/// Layout (identical to v5 except slot 0's version and slot 1's meaning):
+/// `chain_id` comes from config: the server is single-chain by design, so
+/// the chain is which config the deployment was started with. Encoded as
+/// a Rain Float like the other numeric slots, so a strategy's `equal-to`
+/// against a rainlang `expected-chain-id` binding literal compares in the
+/// interpreter word's value model rather than against raw bytes.
+///
+/// Layout (v5's, with slot 1 reinterpreted and slot 9 added):
 /// - `context[0]`: schema version (= 7)
 /// - `context[1]`: UNDERLYING price (Rain Float; the underlying rate for
 ///   this request's direction, inverted into ratio units, spread included
@@ -495,9 +532,10 @@ pub fn build_context_v6(
 /// - `context[8]`: quote expiry (Rain Float, Unix seconds; the
 ///   less-than consumer assert makes the expiry second itself
 ///   EXCLUSIVE — already rejected)
+/// - `context[9]`: chain id this deployment signs for (Rain Float)
 ///
-/// There is no `context[9]`: the ratio is never signed. The strategy reads
-/// it live on-chain at settlement (`erc4626-convert-to-assets`).
+/// No slot carries a NAV ratio: it is never signed. The strategy reads it
+/// live on-chain at settlement (`erc4626-convert-to-assets`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_context_v7(
     price_bytes: [u8; 32],
@@ -508,8 +546,9 @@ pub fn build_context_v7(
     input_token: Address,
     output_token: Address,
     quote_expiry: u64,
+    chain_id: u64,
 ) -> Result<Vec<FixedBytes<32>>, anyhow::Error> {
-    build_expiry_bound_context(
+    let mut ctx = build_expiry_bound_context(
         SCHEMA_VERSION_V7,
         price_bytes,
         publish_time,
@@ -519,7 +558,12 @@ pub fn build_context_v7(
         input_token,
         output_token,
         quote_expiry,
-    )
+    )?;
+    let chain_float = Float::parse(chain_id.to_string())
+        .map_err(|e| anyhow::anyhow!("Failed to parse chain_id as Rain float: {:?}", e))?;
+    let chain_b: B256 = chain_float.into();
+    ctx.push(chain_b);
+    Ok(ctx)
 }
 
 #[cfg(test)]
@@ -818,9 +862,10 @@ mod tests {
 
     #[test]
     fn test_build_context_v7_layout() {
-        // v7 is the v5 nine-slot shape: no NAV-ratio slot. Slot 1 carries
-        // whatever price the caller passed — for v7 that is the UNDERLYING
-        // price, but at this layer it is still an opaque 32-byte Float.
+        // v7 is the v5 shape with no NAV-ratio slot and the deployment's
+        // chain id appended. Slot 1 carries whatever price the caller
+        // passed — for v7 that is the UNDERLYING price, but at this layer
+        // it is still an opaque 32-byte Float.
         let ctx = build_context_v7(
             price_bytes_of("184.90"),
             1_700_000_000,
@@ -830,12 +875,13 @@ mod tests {
             IN_TOKEN,
             OUT_TOKEN,
             1_700_000_020,
+            8453,
         )
         .unwrap();
         assert_eq!(
             ctx.len(),
-            9,
-            "schema v7 must emit 9 elements — no NAV-ratio slot"
+            10,
+            "schema v7 must emit 10 elements — v5's nine plus the chain id"
         );
 
         let version = Float::from(alloy::primitives::B256::from(ctx[0]));
@@ -849,20 +895,84 @@ mod tests {
         assert_eq!(&ctx[6].as_slice()[..12], [0u8; 12]);
         assert_eq!(&ctx[7].as_slice()[12..], OUT_TOKEN.as_slice());
 
-        // Slot 8 keeps the v5 expiry, and is the LAST slot.
+        // Slot 8 keeps the v5 expiry.
         let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
         assert_eq!(expiry.format().unwrap(), float_string_of(1_700_000_020));
+
+        // Slot 9 is the chain id as a Rain Float — the value a strategy's
+        // `equal-to` compares against its per-deployment
+        // `expected-chain-id` binding literal.
+        let chain = Float::from(alloy::primitives::B256::from(ctx[9]));
+        let expected = Float::parse("8453".to_string()).unwrap();
+        assert!(
+            chain.eq(expected).unwrap(),
+            "slot 9 must equal 8453, got {}",
+            chain.format().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_build_context_v7_carries_arbitrary_chain_ids() {
+        // The builder must not bake in Base: a Robinhood Chain (4663),
+        // HyperEVM (999) or Ethereum (1) deployment signs its own chain id.
+        for chain_id in [1u64, 999, 4663, 42161] {
+            let ctx = build_context_v7(
+                price_bytes_of("1"),
+                1_700_000_000,
+                v3_session_bytes(),
+                1_700_000_000,
+                1_700_023_400,
+                IN_TOKEN,
+                OUT_TOKEN,
+                1_700_000_020,
+                chain_id,
+            )
+            .unwrap();
+            let slot = Float::from(alloy::primitives::B256::from(ctx[9]));
+            let expected = Float::parse(chain_id.to_string()).unwrap();
+            assert!(
+                slot.eq(expected).unwrap(),
+                "slot 9 must equal {chain_id}, got {}",
+                slot.format().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_context_v7_chain_id_is_the_only_slot_it_moves() {
+        // Strict extension: two v7 contexts differing ONLY in the chain id
+        // must be byte-identical everywhere except slot 9. Nothing else in
+        // the array may pick the chain up.
+        let args = |chain_id: u64| {
+            build_context_v7(
+                price_bytes_of("184.90"),
+                1_700_000_000,
+                v3_session_bytes(),
+                1_700_000_000,
+                1_700_023_400,
+                IN_TOKEN,
+                OUT_TOKEN,
+                1_700_000_020,
+                chain_id,
+            )
+            .unwrap()
+        };
+        let base = args(8453);
+        let robinhood = args(4663);
+        assert_eq!(&base[..9], &robinhood[..9]);
+        assert_ne!(base[9], robinhood[9]);
     }
 
     #[test]
     fn test_build_context_v7_is_v5_shape_bytewise() {
-        // v7 and v5 share the same builder and the same nine slots; for
-        // identical inputs they must be byte-identical except the schema
-        // version at slot 0. (The values DIFFER in production only because
-        // the handler feeds v7 the underlying price and v5 the vault rate;
-        // the context shape itself is the same.) This pins that v7 is v5's
-        // shape with no ratio slot, so a v5-derived consumer parsing v7
-        // sees the layout it expects up to slot 8.
+        // v7 and v5 share the same builder for slots 0–8; for identical
+        // inputs those slots must be byte-identical except the schema
+        // version at slot 0, and v7 then appends the chain id. (The values
+        // DIFFER in production only because the handler feeds v7 the
+        // underlying price and v5 the vault rate; the shared shape itself
+        // is the same.) This pins that v7 is v5's shape with no ratio slot,
+        // so a v5-derived consumer parsing v7 sees the layout it expects up
+        // to slot 8.
         let price = price_bytes_of("184.90");
         let sess = v3_session_bytes();
         let v5 = build_context_v5(
@@ -885,20 +995,35 @@ mod tests {
             IN_TOKEN,
             OUT_TOKEN,
             1_700_000_020,
+            8453,
         )
         .unwrap();
 
-        assert_eq!(v7.len(), v5.len(), "v7 must have the v5 slot count");
-        assert_eq!(v7.len(), 9, "and that count is 9 — no ratio slot");
+        assert_eq!(v5.len(), 9);
+        assert_eq!(v7.len(), v5.len() + 1, "v7 is v5's slots plus the chain id");
         // Slot 0 is the schema version and is expected to differ.
-        assert_eq!(&v7[1..], &v5[1..], "v7 is byte-for-byte v5 past slot 0");
+        assert_eq!(
+            &v7[1..9],
+            &v5[1..],
+            "v7 is byte-for-byte v5 from slot 1 to slot 8"
+        );
     }
 
     #[test]
     fn test_build_context_v7_passes_price_bytes_through_unchanged() {
         let bytes = price_bytes_of("0.005");
-        let ctx =
-            build_context_v7(bytes, 1, v3_session_bytes(), 1, 2, IN_TOKEN, OUT_TOKEN, 3).unwrap();
+        let ctx = build_context_v7(
+            bytes,
+            1,
+            v3_session_bytes(),
+            1,
+            2,
+            IN_TOKEN,
+            OUT_TOKEN,
+            3,
+            8453,
+        )
+        .unwrap();
         assert_eq!(ctx[1].as_slice(), &bytes[..]);
     }
 }

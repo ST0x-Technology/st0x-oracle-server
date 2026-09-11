@@ -18,7 +18,15 @@ use tower::ServiceExt;
 
 const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+/// The chain every test app is configured for and every seeded frame is
+/// stamped with: Base, matching the config default. Also what `/context/v7`
+/// signs at slot 9.
 const TEST_CHAIN_ID: u64 = 8453;
+
+/// A second chain id, for the tests that prove the signed slot follows
+/// config rather than a baked-in Base. Robinhood Chain — the real second
+/// deployment (`deploy/config/robinhood.toml`).
+const OTHER_CHAIN_ID: u64 = 4663;
 
 // Token addresses for testing
 const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
@@ -167,6 +175,7 @@ async fn test_app_full(
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         configured_symbols,
         market_hours,
@@ -191,6 +200,7 @@ async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
         fixed_close_market_hours().await,
@@ -1086,6 +1096,7 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
         fixed_close_market_hours().await,
@@ -1137,6 +1148,7 @@ async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> axum::Router {
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
         fixed_close_market_hours().await,
@@ -1262,6 +1274,7 @@ async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> axum::
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
         fixed_close_market_hours().await,
@@ -1272,16 +1285,17 @@ async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> axum::
 
 #[tokio::test]
 async fn test_v7_endpoint_signs_underlying_price_at_slot_1() {
-    // Route-level pin for /context/v7: the v5 nine-slot shape (no NAV
-    // ratio at slot 9), with slot 1 carrying the UNDERLYING price (90),
-    // NOT the vault-share rate (100). Sell-side request (USDC->WCOIN).
+    // Route-level pin for /context/v7: the v5 slots with no NAV ratio and
+    // the chain id at slot 9, with slot 1 carrying the UNDERLYING price
+    // (90), NOT the vault-share rate (100). Sell-side request
+    // (USDC->WCOIN).
     let app = test_app_with_underlying("100", "90").await;
     let ctx = context_of(app, "/context/v7").await;
 
     assert_eq!(
         ctx.len(),
-        9,
-        "v7 endpoint must emit 9 context elements — no NAV-ratio slot"
+        10,
+        "v7 endpoint must emit 10 context elements — v5's nine, no NAV ratio, plus the chain id"
     );
 
     let version = Float::from(alloy::primitives::B256::from(ctx[0]));
@@ -1301,6 +1315,103 @@ async fn test_v7_endpoint_signs_underlying_price_at_slot_1() {
         .format()
         .unwrap();
     assert_eq!(expiry.format().unwrap(), expected);
+}
+
+/// Build a test app configured for `chain_id`, with its one seeded COIN
+/// frame stamped with that same chain id (the cache is chain-scoped, so a
+/// frame stamped for another chain is never served). Everything else
+/// matches `test_app_with_underlying`'s fixture.
+async fn test_app_on_chain(chain_id: u64) -> axum::Router {
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
+    let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+    quote.chain_id = chain_id;
+    quote.expiry_unix_ms = 1_700_000_020_500;
+    let pricing = LiveClient::with_seeded(vec![quote], chain_id).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        chain_id,
+        pricing,
+        vec!["COIN".to_string()],
+        fixed_close_market_hours().await,
+        metrics,
+    );
+    create_app(state)
+}
+
+#[tokio::test]
+async fn test_v7_endpoint_signs_chain_id_at_slot_9() {
+    // Route-level pin for /context/v7 slot 9: the deployment's configured
+    // chain id as a Rain Float — the value a strategy's `equal-to`
+    // compares against its per-deployment `expected-chain-id` binding.
+    // Without it the EIP-191 signature names no chain, and since ST0x
+    // token addresses are deterministic clones a frame signed here
+    // verifies unchanged inside an order on another chain.
+    let app = test_app_with_underlying("100", "90").await;
+    let ctx = context_of(app, "/context/v7").await;
+
+    let chain = Float::from(alloy::primitives::B256::from(ctx[9]));
+    let expected = Float::parse(TEST_CHAIN_ID.to_string()).unwrap();
+    assert!(
+        chain.eq(expected).unwrap(),
+        "slot 9 must equal the configured chain id, got {}",
+        chain.format().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_v7_signs_the_configured_chain_not_a_baked_in_base() {
+    // The signed chain id follows config. A Robinhood Chain (4663)
+    // deployment must sign 4663 — the whole point of the slot is that two
+    // deployments sharing a token address sign distinguishable frames.
+    let base = context_of(test_app_on_chain(TEST_CHAIN_ID).await, "/context/v7").await;
+    let other = context_of(test_app_on_chain(OTHER_CHAIN_ID).await, "/context/v7").await;
+
+    let signed = |ctx: &Vec<FixedBytes<32>>| {
+        Float::from(alloy::primitives::B256::from(ctx[9]))
+            .format()
+            .unwrap()
+    };
+    assert_eq!(
+        signed(&base),
+        Float::parse(TEST_CHAIN_ID.to_string())
+            .unwrap()
+            .format()
+            .unwrap()
+    );
+    assert_eq!(
+        signed(&other),
+        Float::parse(OTHER_CHAIN_ID.to_string())
+            .unwrap()
+            .format()
+            .unwrap()
+    );
+
+    // ...and slot 9 is the ONLY slot that moved: same tokens, same frame,
+    // same session, so a consumer that ignores the chain sees identical
+    // bytes either way. That is what makes the cross-chain replay possible
+    // in the first place, and what slot 9 is there to stop.
+    assert_eq!(&base[..9], &other[..9]);
+}
+
+#[tokio::test]
+async fn test_v7_is_v5_plus_the_chain_id_from_the_same_quote() {
+    // Strict extension, at the route: for a frame whose underlying rate
+    // equals its vault rate (the default fixture — a base token that is
+    // not a vault share), /context/v7's slots 1..=8 are byte-identical to
+    // /context/v5's from the SAME cached quote, and slot 9 is the only
+    // addition. Adding the chain id must not disturb the price, the
+    // publish time, the session window, the pair binding or the expiry.
+    let app = test_app().await;
+    let v5 = context_of(app.clone(), "/context/v5").await;
+    let v7 = context_of(app, "/context/v7").await;
+
+    assert_eq!(v5.len(), 9);
+    assert_eq!(v7.len(), 10);
+    // Slot 0 is the schema version and is expected to differ.
+    assert_eq!(&v7[1..9], &v5[1..]);
 }
 
 #[tokio::test]
@@ -1344,6 +1455,7 @@ async fn test_v7_fails_closed_on_absent_underlying_rate() {
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
         fixed_close_market_hours().await,
@@ -1382,6 +1494,7 @@ async fn reuse_test_app(reuse_min_remaining_secs: u64) -> (axum::Router, LiveCli
     let state = AppState::new(
         signer,
         registry,
+        TEST_CHAIN_ID,
         pricing.clone(),
         vec!["COIN".to_string()],
         always_in_session_market_hours().await,

@@ -85,9 +85,13 @@ async fn main() -> anyhow::Result<()> {
             .or_else(|| std::env::var("CONFIG_PATH").ok())
             .unwrap_or_else(|| "config.toml".to_string());
         let config = Config::load(std::path::Path::new(&path))?;
+        // The chain id is in the output because /context/v7 signs it: a
+        // config that inherits the 8453 default on a non-Base plane is a
+        // signing fault the reviewer of a config PR can now see.
         println!(
-            "{path}: OK ({} tokens, quote token {})",
+            "{path}: OK ({} tokens, chain {}, quote token {})",
             config.tokens.len(),
+            config.chain_id,
             config.quote_token
         );
         return Ok(());
@@ -110,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         port = config.port,
         pricing_ws_url = %config.pricing.ws_url,
         pricing_consumer = %config.pricing.consumer,
+        chain_id = config.chain_id,
         quote_token = %config.quote_token,
         token_count = config.tokens.len(),
         signature_reuse_min_remaining_secs = config.signing.reuse_min_remaining_secs,
@@ -217,8 +222,16 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(3600),
     );
 
-    let state = AppState::new(signer, registry, pricing, symbols, market_hours, metrics)
-        .with_signature_reuse(config.signing.reuse_min_remaining_secs);
+    let state = AppState::new(
+        signer,
+        registry,
+        config.chain_id,
+        pricing,
+        symbols,
+        market_hours,
+        metrics,
+    )
+    .with_signature_reuse(config.signing.reuse_min_remaining_secs);
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));

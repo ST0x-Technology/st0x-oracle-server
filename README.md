@@ -110,7 +110,24 @@ One deployment serves one chain. The chain rides the oracle URL — a deploy-tim
 
 Robinhood Chain settles in USDG (Global Dollar), not Circle USDC — Circle's USDC is deployed there too and is not what the chain settles in.
 
-Robinhood Chain is staged, not live. Its registry is complete — 48 wt tokens, exactly st0x.pricing's published set, every address read back from the chain — but two properties this binary lacks gate it: the signed context names no chain (so a context signed for one chain verifies inside an order on another wherever a token address is shared), and the pricing quote cache is keyed by symbol alone (so frames for the same symbol on different chains overwrite each other). Both are covered by open work; `deploy/config/robinhood.toml` states them at the file.
+Robinhood Chain is staged, not live. Its registry is complete — 48 wt tokens, exactly st0x.pricing's published set, every address read back from the chain. The two properties that gated it now both hold in this binary: the pricing quote cache is keyed by `(chain id, symbol)`, so frames for one symbol on different chains no longer overwrite each other (RAI-2130), and `/context/v7` signs the deployment's `chain_id`, so a context signed here cannot be replayed into an order on another chain (RAI-1991, below).
+
+#### The chain is in the signature (v7)
+
+EIP-191 signing is chain-agnostic, and every schema up to v6 binds a signed frame only to its `(input_token, output_token)` pair. ST0x token contracts are deterministic clones across chains, so the same pair of addresses can exist on two chains and a frame signed for one verifies byte-for-byte inside an order on the other. Up to v6 the only thing stopping that is which oracle URL an order was deployed against — an operational binding, as strong as whoever wired it.
+
+`/context/v7` signs the deployment's `chain_id` at slot 9, so the strategy can check it itself:
+
+```rainlang
+/* per-deployment binding, alongside oracle-signer */
+expected-chain-id: 8453,
+
+:ensure(equal-to(signed-context<0 9>() expected-chain-id) "wrong chain"),
+```
+
+Set `expected-chain-id` to the chain the order lives on — `8453` on Base, `4663` on Robinhood Chain. A wrong-chain payload then fails the strategy's own assert regardless of URL wiring. A v7 strategy that omits the assert is exactly as exposed as a v6 one.
+
+`chain_id` in the config is what the slot carries. It defaults to Base (8453); `deploy/config/robinhood.toml` sets `4663`. A deployment that claims the wrong chain signs frames its own orders will refuse.
 
 ### Endpoint
 
@@ -140,6 +157,21 @@ Schema v1 context layout (all Rain DecimalFloats):
 - `context[0]`: schema version (= 1)
 - `context[1]`: price (ask for buys, `1/bid` for sells)
 - `context[2]`: publish_time — Alpaca's own quote timestamp as Unix seconds UTC
+
+Schema v7 context layout (`POST /context/v7`):
+
+- `context[0]`: schema version (= 7)
+- `context[1]`: price of the vault's **underlying** asset, for this request's direction
+- `context[2]`: publish_time (Unix seconds; the pricing frame's own `source_ts`)
+- `context[3]`: session tag
+- `context[4]`: session start (Unix seconds)
+- `context[5]`: session end (Unix seconds)
+- `context[6]`: input token address
+- `context[7]`: output token address
+- `context[8]`: quote expiry (Unix seconds)
+- `context[9]`: chain id this deployment signs for
+
+No slot carries a NAV ratio: v7 signs the underlying price and the strategy derives the vault price on-chain from the live `erc4626-convert-to-assets` answer. v6 is unchanged and still served, NAV ratio at slot 9 and all.
 
 The old `/context` endpoint has been removed; it now returns `404`.
 
