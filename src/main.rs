@@ -152,9 +152,9 @@ async fn main() -> anyhow::Result<()> {
     let alpaca = AlpacaClient::new(&cli.alpaca_api_key_id, &cli.alpaca_api_secret_key);
 
     // The quote token comes from the config, not the binary: it is the
-    // one address in the registry that changes per chain (Base USDC vs
-    // Robinhood Chain USDC), and it is keyed with the token list it has
-    // to agree with.
+    // one address in the registry that changes per chain — Base settles
+    // in USDC, Robinhood Chain in USDG — and it is keyed with the token
+    // list it has to agree with.
     let registry = TokenRegistry::from_config(&config.tokens, &config.quote_token)?;
 
     tracing::info!("Signer address: {}", signer.address());

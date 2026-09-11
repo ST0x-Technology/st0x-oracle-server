@@ -11,8 +11,9 @@
 #
 # The registry below is the live 4663 deployment. Every address was read
 # back from the chain before it was committed: `symbol()` matches its row
-# and `decimals()` is 18 for all 39, and the quote token answers "USDC"
-# with 6 decimals (2026-09-10, via rpc.mainnet.chain.robinhood.com).
+# and `decimals()` is 18 for all 39, and the quote token answers "USDG"
+# ("Global Dollar") with 6 decimals (2026-09-11, via
+# rpc.mainnet.chain.robinhood.com).
 #
 # TWO PROPERTIES MUST HOLD BEFORE THIS DEPLOYMENT SIGNS ANYTHING, and
 # neither holds in this binary. Both are correctness, not polish:
@@ -37,8 +38,12 @@
 #   RPC (public)  https://rpc.mainnet.chain.robinhood.com
 #   IRaindexV6    0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20
 #   RaindexInvent 0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30
-#   USDC (native, Circle, 6 dec)
-#                 0x3884564BA51B349e7661c7e28Ad947DEE327FeDF
+#   USDG (Global Dollar, 6 dec) — THE SETTLEMENT STABLE
+#                 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168
+#   Circle's native USDC is also deployed on 4663
+#                 (0x3884564BA51B349e7661c7e28Ad947DEE327FeDF), and is
+#                 NOT what this chain settles in. Do not "correct" the
+#                 quote token to it.
 #   Token-owner Safe
 #                 0x3840aeDaEc8e82f79d8F6a8F6ADCa271E13E0329
 #   Subgraph      TODO — the Ormi subgraph for 4663 is being set up
@@ -56,10 +61,12 @@ port = 3000
 # chain id (unknown keys are ignored) — see property 1 in the header.
 chain_id = 4663
 
-# USDC on Robinhood Chain — native Circle issuance, 6 decimals. The quote
-# side of every pair; it is NOT Base's USDC, which is the whole reason
-# this key exists rather than a constant in main.rs.
-quote_token = "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF"
+# USDG (Global Dollar) — the settlement stable on Robinhood Chain,
+# 6 decimals, confirmed by Robinhood 2026-09-11. The quote side of every
+# pair. Not a USDC at all, which is the whole reason this key exists
+# rather than a constant in main.rs; the resolver matches it by address
+# and never reads its symbol.
+quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 
 # Live pricing source. ws_url is a placeholder here: the stack's
 # PRICING_WS_URL env var overrides it with this env's Cloud Run pricing

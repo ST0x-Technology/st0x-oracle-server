@@ -97,7 +97,7 @@ address = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"
 symbol  = "COIN"
 ```
 
-USDC is the implicit quote token of every pair, and it's a property of the chain rather than of the protocol, so it lives in the config as `quote_token` (defaulting to Base's `0x8335…2913`). Token addresses in the bottom 2^16 of the address space are rejected as placeholders: a config for a chain whose tokens are still deploying fails to load rather than booting a registry that resolves nothing.
+The chain's settlement stable is the implicit quote token of every pair, and it's a property of the chain rather than of the protocol — it isn't even always a USDC — so it lives in the config as `quote_token` (defaulting to Base's USDC, `0x8335…2913`). It's matched by address; nothing reads its symbol. Token addresses in the bottom 2^16 of the address space are rejected as placeholders: a config for a chain whose tokens are still deploying fails to load rather than booting a registry that resolves nothing.
 
 ### Chains
 
@@ -105,8 +105,10 @@ One deployment serves one chain. The chain rides the oracle URL — a deploy-tim
 
 | Chain | Config | Quote token |
 |-------|--------|-------------|
-| Base (8453) | `deploy/config/production.toml`, `deploy/config/staging.toml` | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
-| Robinhood Chain (4663) | `deploy/config/robinhood.toml` (not yet wired to a service) | `0x3884564BA51B349e7661c7e28Ad947DEE327FeDF` |
+| Base (8453) | `deploy/config/production.toml`, `deploy/config/staging.toml` | USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
+| Robinhood Chain (4663) | `deploy/config/robinhood.toml` (not yet wired to a service) | USDG `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
+
+Robinhood Chain settles in USDG (Global Dollar), not Circle USDC — Circle's USDC is deployed there too and is not what the chain settles in.
 
 Robinhood Chain is staged, not live. Its registry is complete — 39 wt tokens, every address read back from the chain — but two properties this binary lacks gate it: the signed context names no chain (so a context signed for one chain verifies inside an order on another wherever a token address is shared), and the pricing quote cache is keyed by symbol alone (so frames for the same symbol on different chains overwrite each other). Both are covered by open work; `deploy/config/robinhood.toml` states them at the file.
 
@@ -145,8 +147,8 @@ The old `/context` endpoint has been removed; it now returns `404`.
 
 The server automatically determines price direction from the order's IO tokens:
 
-- **Buy tStock** (input=USDC, output=tStock): returns **ask price** (cost to buy)
-- **Sell tStock** (input=tStock, output=USDC): returns **1/bid price** (inverted in Rain Float precision)
+- **Buy tStock** (input=quote token, output=tStock): returns **ask price** (cost to buy)
+- **Sell tStock** (input=tStock, output=quote token): returns **1/bid price** (inverted in Rain Float precision)
 
 This ensures the on-chain price matches what can be immediately hedged on Alpaca.
 

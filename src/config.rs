@@ -9,13 +9,15 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    /// The USDC address this deployment quotes against: the implicit
-    /// quote side of every pair `TokenRegistry::resolve` accepts. It is
-    /// a property of the CHAIN, not of the protocol — Base's native USDC
-    /// is `0x8335…2913`, Robinhood Chain's (4663) is `0x3884…FeDF` — so
-    /// it belongs next to the token registry it is keyed with rather
-    /// than in the binary. Defaults to Base, which is what every config
-    /// that predates multichain means.
+    /// The settlement stable this deployment quotes against: the
+    /// implicit quote side of every pair `TokenRegistry::resolve`
+    /// accepts. It is a property of the CHAIN, not of the protocol, and
+    /// not even always a USDC — Base settles in Circle's USDC
+    /// (`0x8335…2913`), Robinhood Chain (4663) in USDG, Global Dollar
+    /// (`0x5fc5…d168`) — so it belongs next to the token registry it is
+    /// keyed with rather than in the binary. Nothing reads its symbol;
+    /// it is matched by address. Defaults to Base, which is what every
+    /// config that predates multichain means.
     #[serde(default = "default_quote_token")]
     pub quote_token: String,
 
@@ -107,7 +109,7 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("Invalid quote_token {:?}: {}", self.quote_token, e))?;
         if is_placeholder_address(&quote) {
             anyhow::bail!(
-                "Placeholder quote_token {} — fill in the chain's USDC address before releasing this config",
+                "Placeholder quote_token {} — fill in the chain's settlement stable before releasing this config",
                 self.quote_token
             );
         }
@@ -129,9 +131,9 @@ impl Config {
                     t.symbol
                 );
             }
-            // USDC is the quote side of every pair, so an entry that
-            // repeats it would claim the quote token is also a tStock and
-            // make `resolve` answer for a USDC/USDC order.
+            // The quote token is the quote side of every pair, so an
+            // entry repeating it would claim it is also a tStock and make
+            // `resolve` answer for a quote/quote order.
             if addr == quote {
                 anyhow::bail!(
                     "Token {} ({}) is the quote token — the quote side is implicit and must not be listed as a tStock",
@@ -303,7 +305,7 @@ mod tests {
         );
     }
 
-    /// Robinhood Chain's USDC is a different contract from Base's, so a
+    /// Robinhood Chain settles in USDG, not a USDC at all, so a
     /// deployment there sets `quote_token` and everything else — the
     /// registry, the direction logic — is unchanged.
     #[test]
@@ -322,7 +324,7 @@ mod tests {
 
         let robinhood = format!(
             r#"
-            quote_token = "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF"
+            quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
             [[tokens]]
             address = "0x1111111111111111111111111111111111111111"
             symbol = "wtCOIN"
@@ -333,7 +335,7 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(
             cfg.quote_token,
-            "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF"
+            "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
         );
     }
 
@@ -400,10 +402,10 @@ mod tests {
     fn rejects_quote_token_listed_as_tstock() {
         let text = format!(
             r#"
-            quote_token = "0x3884564BA51B349e7661c7e28Ad947DEE327FeDF"
+            quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
             [[tokens]]
-            address = "0x3884564bA51b349E7661C7E28aD947dEe327fEdf"
-            symbol = "wtUSDC"
+            address = "0x5FC5360d0400A0fD4F2Af552add042d716F1D168"
+            symbol = "wtUSDG"
             {MIN_PRICING}
         "#
         );
