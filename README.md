@@ -110,7 +110,7 @@ One deployment serves one chain. The chain rides the oracle URL — a deploy-tim
 
 Robinhood Chain settles in USDG (Global Dollar), not Circle USDC — Circle's USDC is deployed there too and is not what the chain settles in.
 
-Robinhood Chain is staged, not live. Its registry is complete — 39 wt tokens, every address read back from the chain — but two properties this binary lacks gate it: the signed context names no chain (so a context signed for one chain verifies inside an order on another wherever a token address is shared), and the pricing quote cache is keyed by symbol alone (so frames for the same symbol on different chains overwrite each other). Both are covered by open work; `deploy/config/robinhood.toml` states them at the file.
+Robinhood Chain is staged, not live. Its registry is complete — 48 wt tokens, exactly st0x.pricing's published set, every address read back from the chain — but two properties this binary lacks gate it: the signed context names no chain (so a context signed for one chain verifies inside an order on another wherever a token address is shared), and the pricing quote cache is keyed by symbol alone (so frames for the same symbol on different chains overwrite each other). Both are covered by open work; `deploy/config/robinhood.toml` states them at the file.
 
 ### Endpoint
 

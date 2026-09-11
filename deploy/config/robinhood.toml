@@ -11,7 +11,7 @@
 #
 # The registry below is the live 4663 deployment. Every address was read
 # back from the chain before it was committed: `symbol()` matches its row
-# and `decimals()` is 18 for all 39, and the quote token answers "USDG"
+# and `decimals()` is 18 for all 48, and the quote token answers "USDG"
 # ("Global Dollar") with 6 decimals (2026-09-11, via
 # rpc.mainnet.chain.robinhood.com).
 #
@@ -82,15 +82,22 @@ consumer = "oracle"
 # are st0x.pricing asset names and are chain-independent; only the
 # addresses change.
 #
-# 39 rows, in the Base registry's order so the two read side by side. The
-# chain has 41 wt tokens; the two this file leaves out are wtFTF and
-# wtIBHG, which st0x.pricing does not publish, so they could never be
-# quoted — an entry for either would only sit permanently in the
-# missing-symbols count on /status and blunt the alert that catches a
-# wedged feed. Add them here when pricing publishes them.
+# 48 rows: all 47 of Base's, in Base's order so the two files read side by
+# side, then wtFTF, which 4663 has and Base does not.
 #
-# Absent the other way round: wtMCD, wtNKE, wtGRND, wtDNUT, wtFGI, wtPLBY,
-# wtTR and wtWEN are in the Base registry but are not deployed on 4663.
+# That is exactly st0x.pricing's published asset set — every asset pricing
+# publishes is deployed here, and every row here is published. The chain
+# carries 56 wt tokens; the eight left out are the ones pricing publishes
+# no mark for, so an order on them could never be quoted and a row would
+# only sit permanently in the missing-symbols count on /status, blunting
+# the alert that catches a wedged feed:
+#
+#   wtCBRS, wtIBHG
+#   wtAIR.PA, wtBMW.DE, wtMC.PA, wtSIE.DE, wtMBG.DE, wtRHM.DE  (EU listings)
+#
+# Add each here when pricing starts publishing it — that is what happened
+# to wtFTF, which this file excluded on those grounds until pricing picked
+# it up.
 # ----------------------------------------------------------------------------
 
 [[tokens]]
@@ -248,3 +255,39 @@ symbol = "wtSMCI"
 [[tokens]]
 address = "0xc80730995D2C53114BAaFd2736E02f4E274D5B83"
 symbol = "wtTQQQ"
+
+[[tokens]]
+address = "0xe26b53fb8B0819682432d27C88D6505883cabafF"
+symbol = "wtMCD"
+
+[[tokens]]
+address = "0x8fe134109A9Eb38D3f071a9Df4911081B4aa0814"
+symbol = "wtNKE"
+
+[[tokens]]
+address = "0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"
+symbol = "wtGRND"
+
+[[tokens]]
+address = "0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826"
+symbol = "wtDNUT"
+
+[[tokens]]
+address = "0x685DFd386968B58D895F934485820C479C79a8bB"
+symbol = "wtFGI"
+
+[[tokens]]
+address = "0xBe127eeD812DC1F622227FAdc8639d4138B47b2e"
+symbol = "wtPLBY"
+
+[[tokens]]
+address = "0x1abADE2601DA2617f441e2c2B3Fff870445FEfd1"
+symbol = "wtTR"
+
+[[tokens]]
+address = "0x441Eaae749B7BA0C4462F2b19a47fBe8De0DFac2"
+symbol = "wtWEN"
+
+[[tokens]]
+address = "0x710A14a41a8Ea2e25376124C48bf9cAdc1E69be5"
+symbol = "wtFTF"
