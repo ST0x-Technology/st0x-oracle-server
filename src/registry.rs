@@ -5,13 +5,16 @@ use std::str::FromStr;
 
 /// Maps on-chain token addresses to st0x.pricing asset symbols.
 ///
-/// The "base" token is always the tStock (e.g. wtCOIN), and the
-/// "quote" token is always USDC.
+/// The "base" token is always the tStock (e.g. wtCOIN); the "quote"
+/// token is whichever settlement stable the deployment's chain uses —
+/// USDC on Base, USDG on Robinhood Chain — supplied as `quote_token`.
 #[derive(Debug, Clone)]
 pub struct TokenRegistry {
     /// token address → pricing symbol
     tokens: HashMap<Address, String>,
-    /// USDC address on Base
+    /// This chain's settlement stable, from `quote_token` in the config:
+    /// USDC on Base, USDG (Global Dollar) on Robinhood Chain (4663).
+    /// Compared by address only — nothing here reads its symbol.
     pub quote_token: Address,
 }
 
@@ -22,7 +25,7 @@ pub struct TokenRegistry {
 /// the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceDirection {
-    /// Order input is USDC (quote), output is tStock (base) — the order
+    /// Order input is the quote token, output is tStock (base) — the order
     /// is the venue where takers swap quote→base. Priced by the
     /// DIRECTIONAL rate `rate_quote_to_base`, inverted into Raindex
     /// `ratio = input/output = quote per base` units by
@@ -30,7 +33,7 @@ pub enum PriceDirection {
     /// carries the OTHER direction's spread — picking it was the
     /// 2026-08-07 crossed-orders bug.)
     QuoteToBase,
-    /// Order input is tStock (base), output is USDC (quote) — the
+    /// Order input is tStock (base), output is the quote token — the
     /// base→quote venue. Priced by `rate_base_to_quote`, inverted into
     /// `base per quote` ratio units by `pick_rate_bytes`.
     BaseToQuote,
@@ -51,7 +54,7 @@ pub struct ResolvedPair {
     /// Pricing-service asset symbol (e.g. "COIN").
     pub symbol: String,
     /// Which of the two rates in the live `Quote` to sign for this
-    /// request. Determined by which side of the swap is USDC.
+    /// request. Determined by which side of the swap is the quote token.
     pub direction: PriceDirection,
 }
 
@@ -59,7 +62,7 @@ impl TokenRegistry {
     /// Build a registry from env-style config.
     ///
     /// `entries` is a list of (token_address, pricing_symbol) pairs.
-    /// `quote_token` is the USDC address.
+    /// `quote_token` is this chain's settlement stable.
     pub fn new(entries: Vec<(String, String)>, quote_token: &str) -> anyhow::Result<Self> {
         let quote = Address::from_str(quote_token)
             .map_err(|e| anyhow::anyhow!("Invalid quote token address: {}", e))?;
@@ -92,7 +95,7 @@ impl TokenRegistry {
         input_token: Address,
         output_token: Address,
     ) -> anyhow::Result<ResolvedPair> {
-        // Case 1: order input=USDC, output=tStock — the ORDER (maker) receives
+        // Case 1: order input=quote, output=tStock — the ORDER (maker) receives
         // quote and pays out base: it is the venue where takers swap
         // quote→base. Priced by pricing's `rate_quote_to_base`, inverted
         // into ratio units (see `pick_rate_bytes`).
@@ -106,7 +109,7 @@ impl TokenRegistry {
             });
         }
 
-        // Case 2: order input=tStock, output=USDC — the maker receives base
+        // Case 2: order input=tStock, output=quote — the maker receives base
         // and pays out quote: the base→quote venue. Priced by
         // `rate_base_to_quote`, inverted into ratio units.
         if output_token == self.quote_token {
@@ -120,7 +123,7 @@ impl TokenRegistry {
         }
 
         anyhow::bail!(
-            "Neither token is USDC ({}). Got input={}, output={}",
+            "Neither token is the quote token ({}). Got input={}, output={}",
             self.quote_token,
             input_token,
             output_token
@@ -167,6 +170,40 @@ mod tests {
         let pair = reg.resolve(rklb, usdc).unwrap();
         assert_eq!(pair.symbol, "RKLB");
         assert_eq!(pair.direction, PriceDirection::BaseToQuote);
+    }
+
+    /// Nothing in the resolver is Base-specific, and nothing in it reads
+    /// the quote token's symbol: point it at another chain's settlement
+    /// stable — USDG on Robinhood Chain (4663), which is not a USDC at
+    /// all — with that chain's token addresses and both directions
+    /// resolve the same way. A Base USDC order against a Robinhood
+    /// registry resolves to nothing, the fail-closed half of the same
+    /// property.
+    #[test]
+    fn test_resolve_on_a_non_base_chain() {
+        const USDG_ROBINHOOD: &str = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+        let reg = TokenRegistry::new(
+            vec![(
+                "0x4444444444444444444444444444444444444444".into(),
+                "RKLB".into(),
+            )],
+            USDG_ROBINHOOD,
+        )
+        .unwrap();
+        let usdg = Address::from_str(USDG_ROBINHOOD).unwrap();
+        let rklb = Address::from_str("0x4444444444444444444444444444444444444444").unwrap();
+
+        assert_eq!(
+            reg.resolve(usdg, rklb).unwrap().direction,
+            PriceDirection::QuoteToBase
+        );
+        assert_eq!(
+            reg.resolve(rklb, usdg).unwrap().direction,
+            PriceDirection::BaseToQuote
+        );
+
+        let usdc_base = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        assert!(reg.resolve(usdc_base, rklb).is_err());
     }
 
     #[test]

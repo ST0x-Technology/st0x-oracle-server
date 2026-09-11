@@ -14,8 +14,8 @@ consumer = "oracle"
 
 # Token registry: maps on-chain Base token addresses (st0x wrapped
 # equities) to pricing-service asset symbols. USDC is the implicit
-# quote token and is hardcoded in main.rs because it's a chain
-# invariant. Synced with ST0x Base Token List v1.2.0 (2026-05-26).
+# quote token; it defaults to Base's, and a deployment on another chain
+# sets `quote_token` (see deploy/config/robinhood.toml). Synced with ST0x Base Token List v1.2.0 (2026-05-26).
 
 [[tokens]]
 address = "0xFb5B41acdbA20a3230F84BE995173CFb98b8D6E7"

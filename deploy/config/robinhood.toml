@@ -1,0 +1,293 @@
+# st0x-oracle-server runtime config for ROBINHOOD CHAIN (chain id 4663).
+#
+# NOT YET DEPLOYED. This file is the Robinhood
+# deployment's config in the same sense deploy/config/production.toml is
+# Base's, but no Cloud Run service reads it yet and no workflow validates
+# or publishes it: .github/workflows/{config-check,deploy,production-
+# release}.yml still name production.toml and staging.toml only. Wire it
+# up in the same commit that creates the service, and split it into
+# robinhood-staging.toml / robinhood-production.toml at that point if the
+# two environments diverge.
+#
+# The registry below is the live 4663 deployment. Every address was read
+# back from the chain before it was committed: `symbol()` matches its row
+# and `decimals()` is 18 for all 48, and the quote token answers "USDG"
+# ("Global Dollar") with 6 decimals (2026-09-11, via
+# rpc.mainnet.chain.robinhood.com).
+#
+# TWO PROPERTIES MUST HOLD BEFORE THIS DEPLOYMENT SIGNS ANYTHING, and
+# neither holds in this binary. Both are correctness, not polish:
+#
+#   1. The signed context must name its chain. EIP-191 signing is
+#      chain-agnostic and no context slot carries a chain id, so a context
+#      signed for one chain verifies unchanged inside an order on another
+#      wherever the two chains share a token address — which ST0x tokens,
+#      deployed deterministically, may well do. The `chain_id` key below
+#      is what a binary that signs the chain reads; it is inert (unknown
+#      keys are ignored) until then, and is set now so this deployment can
+#      never silently inherit the 8453 default.
+#   2. The pricing quote cache must be keyed by (chain id, symbol).
+#      st0x.pricing stamps a chain id on every frame; a symbol-keyed cache
+#      lets a Base frame overwrite the Robinhood frame for the same symbol
+#      and the oracle signs whichever landed last.
+#
+# Chain constants, for whoever fills this in. The server reads NONE of
+# them — they are here so the deployment's facts live in one place:
+#
+#   RPC (archive) https://robinhood-chain.gateway.tenderly.co
+#   RPC (public)  https://rpc.mainnet.chain.robinhood.com
+#   IRaindexV6    0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20
+#   RaindexInvent 0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30
+#   USDG (Global Dollar, 6 dec) — THE SETTLEMENT STABLE
+#                 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168
+#   Circle's native USDC is also deployed on 4663
+#                 (0x3884564BA51B349e7661c7e28Ad947DEE327FeDF), and is
+#                 NOT what this chain settles in. Do not "correct" the
+#                 quote token to it.
+#   Token-owner Safe
+#                 0x3840aeDaEc8e82f79d8F6a8F6ADCa271E13E0329
+#   Subgraph      TODO — the Ormi subgraph for 4663 is being set up
+#                 separately. strategy/settings.yaml gets its `robinhood`
+#                 network (and the Zoltu interpreter suite, identical to
+#                 the other chains) once that URL exists; adding a
+#                 subgraph-less network before then would only break the
+#                 Raindex UI for Base.
+#
+# Non-secret settings only; secrets come from Secret Manager env injection.
+
+port = 3000
+
+# The chain this deployment serves. Inert on a binary that does not sign a
+# chain id (unknown keys are ignored) — see property 1 in the header.
+chain_id = 4663
+
+# USDG (Global Dollar) — the settlement stable on Robinhood Chain,
+# 6 decimals, confirmed by Robinhood 2026-09-11. The quote side of every
+# pair. Not a USDC at all, which is the whole reason this key exists
+# rather than a constant in main.rs; the resolver matches it by address
+# and never reads its symbol.
+quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+
+# Live pricing source. ws_url is a placeholder here: the stack's
+# PRICING_WS_URL env var overrides it with this env's Cloud Run pricing
+# URL. The consumer name must match the `pricing_<consumer>_<32-hex>` API
+# key format.
+[pricing]
+ws_url = "ws://st0x-pricing:8080/ws"
+consumer = "oracle"
+
+# --- Robinhood Chain token registry -----------------------------------------
+# The wrapped tokens (wt*, 18 decimals) deployed on 4663, which is what the
+# Base registry lists too — not the tNNN receipt vaults those wrap. Symbols
+# are st0x.pricing asset names and are chain-independent; only the
+# addresses change.
+#
+# 48 rows: all 47 of Base's, in Base's order so the two files read side by
+# side, then wtFTF, which 4663 has and Base does not.
+#
+# That is exactly st0x.pricing's published asset set — every asset pricing
+# publishes is deployed here, and every row here is published. The chain
+# carries 56 wt tokens; the eight left out are the ones pricing publishes
+# no mark for, so an order on them could never be quoted and a row would
+# only sit permanently in the missing-symbols count on /status, blunting
+# the alert that catches a wedged feed:
+#
+#   wtCBRS, wtIBHG
+#   wtAIR.PA, wtBMW.DE, wtMC.PA, wtSIE.DE, wtMBG.DE, wtRHM.DE  (EU listings)
+#
+# Add each here when pricing starts publishing it — that is what happened
+# to wtFTF, which this file excluded on those grounds until pricing picked
+# it up.
+# ----------------------------------------------------------------------------
+
+[[tokens]]
+address = "0xa3947d2A74F5a3A7135A9d0c66B28fC7315f30Da"
+symbol = "wtNVDA"
+
+[[tokens]]
+address = "0x4404E24629a33b85FC1E2D7beA673Cd283054594"
+symbol = "wtAMZN"
+
+[[tokens]]
+address = "0x550499e28A3CE8cb1dB3e3Db23fDD0357eD3ff48"
+symbol = "wtTSLA"
+
+[[tokens]]
+address = "0xd9fE7488B86D3aEaf457b181C744BD1A5a120833"
+symbol = "wtMSTR"
+
+[[tokens]]
+address = "0x33f3a6401ce08f705eE4B8a03fc37F298395b720"
+symbol = "wtIAU"
+
+[[tokens]]
+address = "0xa3d1be1Ab9F4E72309Cb9Bfeaa14aFe46D012e36"
+symbol = "wtCOIN"
+
+[[tokens]]
+address = "0x7dF3ad1ECC10DBF0296D05F91a697e4A059771c2"
+symbol = "wtSPYM"
+
+[[tokens]]
+address = "0x2B310218001C38cf82816c2098AedDCE22D3Df27"
+symbol = "wtSIVR"
+
+[[tokens]]
+address = "0x25Ab6926BA171e1618b214cda774104B2f6ec884"
+symbol = "wtCRCL"
+
+[[tokens]]
+address = "0x35e1D3d3Fa6D43438641d2b8f63cBf84C84435c0"
+symbol = "wtBMNR"
+
+[[tokens]]
+address = "0xCbD06C802BFe993de94d0d635AB5B1fa764519D8"
+symbol = "wtPPLT"
+
+[[tokens]]
+address = "0x63fDfe9cf53cB1FD5d98fE7537B881B86aE04A31"
+symbol = "wtQQQM"
+
+[[tokens]]
+address = "0x01EE8b582147D1Aa8A8f2Adc2EBB91fA60082AB0"
+symbol = "wtVWO"
+
+[[tokens]]
+address = "0x5D80cAcaABCe0ab4C1541493ceB25D97970D250a"
+symbol = "wtARKK"
+
+[[tokens]]
+address = "0x06b17E431a957Dd8522Bf106653BAc6B39F437E6"
+symbol = "wtSGOV"
+
+[[tokens]]
+address = "0xC32C8166164E2cA18BB5fbf3E82CB776943d97FB"
+symbol = "wtSPCX"
+
+[[tokens]]
+address = "0xc842fC56Dd39B62357d027a0F3B3266353cac991"
+symbol = "wtCEG"
+
+[[tokens]]
+address = "0x7e1263f1e1EeF7eCe7fA7e568842f213a6CEa956"
+symbol = "wtDRAM"
+
+[[tokens]]
+address = "0x050dB961D36DC2047c779798694AeE455CD40BE6"
+symbol = "wtTSM"
+
+[[tokens]]
+address = "0x8FC87Be766C0cB6f254F1FDc9351D4B85B560FB3"
+symbol = "wtRKLB"
+
+[[tokens]]
+address = "0xb8605a64B57E7A8631c87F3187c783493231bdD9"
+symbol = "wtASML"
+
+[[tokens]]
+address = "0xD13bBc46C4582246656868d32227A99A538D97E1"
+symbol = "wtSKHY"
+
+[[tokens]]
+address = "0xF01523C4ca52dF88f07938D4Fb32FCBb6b159867"
+symbol = "wtMU"
+
+[[tokens]]
+address = "0xb904955bC71FE6c8e6aBE676ACca640Abc771622"
+symbol = "wtAMD"
+
+[[tokens]]
+address = "0xCee4981Fc273C105e2b9eA1fD19031Aa9a6cf113"
+symbol = "wtAVGO"
+
+[[tokens]]
+address = "0x44DE27A07B33CD708A49fa79629fAC1df03C56d3"
+symbol = "wtAMAT"
+
+[[tokens]]
+address = "0xD1c1D974837d3f79A92E14048993AD28a6228831"
+symbol = "wtLRCX"
+
+[[tokens]]
+address = "0x1D6F0763e58FA6d472d470Eaaef0a4C08080d208"
+symbol = "wtTTWO"
+
+[[tokens]]
+address = "0x1B2A2C8c3621642c64cf1245016488fA0f76da78"
+symbol = "wtAAPL"
+
+[[tokens]]
+address = "0xAbb2641950C7dE9D3ec9AA05668e112E1DB701F6"
+symbol = "wtBABA"
+
+[[tokens]]
+address = "0x3209384FB852E7D0510aFa896236f3f866c3876f"
+symbol = "wtGOOGL"
+
+[[tokens]]
+address = "0xca678d0d69F9E815d1A4f4dF05C904b2DDE017f8"
+symbol = "wtHOOD"
+
+[[tokens]]
+address = "0x4E3600f48C61eF4513c72923ab50851bD546FFA9"
+symbol = "wtINTC"
+
+[[tokens]]
+address = "0x908266E3C3bFBb603d2EdF295deBE37C88985239"
+symbol = "wtLLY"
+
+[[tokens]]
+address = "0x8DdAEC53399E5324BbC60a368eA853c713629B1d"
+symbol = "wtMSFT"
+
+[[tokens]]
+address = "0xd702276d50fdCf58b0E41b3f1f9651faBC1141f4"
+symbol = "wtORCL"
+
+[[tokens]]
+address = "0x04eE4ED5FF6643eA955503f966012b684f479966"
+symbol = "wtPTY"
+
+[[tokens]]
+address = "0xa6890e89D99Fd4F275c016d89A28ec24A428846D"
+symbol = "wtSMCI"
+
+[[tokens]]
+address = "0xc80730995D2C53114BAaFd2736E02f4E274D5B83"
+symbol = "wtTQQQ"
+
+[[tokens]]
+address = "0xe26b53fb8B0819682432d27C88D6505883cabafF"
+symbol = "wtMCD"
+
+[[tokens]]
+address = "0x8fe134109A9Eb38D3f071a9Df4911081B4aa0814"
+symbol = "wtNKE"
+
+[[tokens]]
+address = "0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"
+symbol = "wtGRND"
+
+[[tokens]]
+address = "0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826"
+symbol = "wtDNUT"
+
+[[tokens]]
+address = "0x685DFd386968B58D895F934485820C479C79a8bB"
+symbol = "wtFGI"
+
+[[tokens]]
+address = "0xBe127eeD812DC1F622227FAdc8639d4138B47b2e"
+symbol = "wtPLBY"
+
+[[tokens]]
+address = "0x1abADE2601DA2617f441e2c2B3Fff870445FEfd1"
+symbol = "wtTR"
+
+[[tokens]]
+address = "0x441Eaae749B7BA0C4462F2b19a47fBe8De0DFac2"
+symbol = "wtWEN"
+
+[[tokens]]
+address = "0x710A14a41a8Ea2e25376124C48bf9cAdc1E69be5"
+symbol = "wtFTF"
