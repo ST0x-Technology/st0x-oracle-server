@@ -1,13 +1,19 @@
 # st0x-oracle-server runtime config for ROBINHOOD CHAIN (chain id 4663).
 #
-# NOT YET DEPLOYED. This file is the Robinhood
-# deployment's config in the same sense deploy/config/production.toml is
-# Base's, but no Cloud Run service reads it yet and no workflow validates
-# or publishes it: .github/workflows/{config-check,deploy,production-
-# release}.yml still name production.toml and staging.toml only. Wire it
-# up in the same commit that creates the service, and split it into
-# robinhood-staging.toml / robinhood-production.toml at that point if the
-# two environments diverge.
+# This file is the Robinhood deployment's config in the same sense
+# deploy/config/production.toml is Base's, and the repo side of that
+# deployment now exists: config-check.yml validates it on every PR against
+# the newest released image, and .github/workflows/robinhood-release.yml
+# publishes it as a version of the oracle-runtime-config-robinhood secret
+# and rolls the t0-oracle-robinhood Cloud Run service behind the same
+# app-deploy PAM grant production uses. One manual dispatch, no trigger.
+#
+# THE GCP SIDE DOES NOT EXIST YET: the service, the secret, the DNS name
+# and the pricing subscription for chain 4663 are listed as prerequisites
+# in the README ("Chains" -> "GCP prerequisites"), and until they are created
+# a dispatch of robinhood-release.yml fails on the first gcloud call.
+# There is no staging twin; split this into robinhood-staging.toml /
+# robinhood-production.toml if one is ever added and the two diverge.
 #
 # The registry below is the live 4663 deployment. Every address was read
 # back from the chain before it was committed: `symbol()` matches its row

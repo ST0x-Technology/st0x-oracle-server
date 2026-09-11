@@ -1,7 +1,11 @@
 name: production-release
 
-# THE production release for this repo, and the only way to roll it. One
-# manual action plus the app-deploy PAM approval in t0-oracle:
+# THE production release for the BASE (8453) plane, and the only way to
+# roll it. Robinhood Chain (4663) is a separate service with a separate
+# config and is rolled by robinhood-release.yml; the two share the
+# `production-release` concurrency group because they share the
+# `app-deploy` entitlement in t0-oracle. One manual action plus the
+# app-deploy PAM approval in t0-oracle:
 #   Actions -> production-release -> Run workflow
 #     version = vX.Y.Z  : image AND deploy/config/production.toml from that tag
 #                         (new version, re-deploy or rollback);
