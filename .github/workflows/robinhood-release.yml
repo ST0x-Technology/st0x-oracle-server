@@ -1,0 +1,74 @@
+name: robinhood-release
+
+# THE release for the ROBINHOOD CHAIN (4663) deployment, and the only way
+# to roll it. One deployment serves one chain (README "Chains"), so
+# Robinhood is a second Cloud Run service reading a second config from a
+# second runtime-config secret — the same image, the same attestor, the
+# same PAM gate as Base:
+#
+#   Actions -> robinhood-release -> Run workflow
+#     version = vX.Y.Z  : image AND deploy/config/robinhood.toml from that
+#                         tag (new version, re-deploy or rollback);
+#     version empty     : CONFIG-ONLY release, deploy/config/robinhood.toml
+#                         from the default branch on the digest LIVE in
+#                         t0-oracle-robinhood.
+#
+# This mirrors production-release.yml exactly except for the service, the
+# config file and the secret. Nothing fires on its own: no push trigger, no
+# tag trigger. A tag that rolls Base does NOT roll Robinhood, which is the
+# point — the two planes are released independently.
+#
+# There is no staging twin. Staging (deploy.yml) rolls Base's staging
+# service on every main merge; a Robinhood staging service would need its
+# own project-side service, secret and pricing subscription for a chain
+# that is not live yet. Add one by copying this file if that changes.
+#
+# The image is NOT built here. It is the same t0-oracle-server image the
+# default-branch build pushed and release-label.yml labeled: one binary,
+# one attestation, two configs. The first release of this plane must
+# therefore name a `version` — a config-only release needs a digest
+# already live on the service.
+#
+# CONCURRENCY, deliberately shared with production-release/release-tag:
+# both services live in project t0-oracle and both gate on the SAME
+# `app-deploy` PAM entitlement there. The shared workflow refuses to ride
+# an open grant whose justification is not its own, so two releases in
+# flight at once would make one of them fail on the other's grant. One
+# release at a time in t0-oracle, whichever chain it targets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "vX.Y.Z to deploy image and config from that tag; leave empty for a config-only release of deploy/config/robinhood.toml from the default branch onto the live image"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@986523b8a550aefc41e34ba35320da74d2e5d784 # app-release @ .github main
+    with:
+      environment: production
+      runtime: cloud-run
+      project: t0-oracle
+      region: europe-west3
+      service: t0-oracle-robinhood
+      ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-oracle
+      images: t0-oracle-server
+      attestor: projects/t0-artifacts/attestors/oracle-image
+      service_account: oracle-releaser@t0-artifacts.iam.gserviceaccount.com
+      pam_entitlement: app-deploy
+      image_tag: ${{ inputs.version || '' }}
+      ref: ${{ inputs.version || '' }}
+      config_file: deploy/config/robinhood.toml
+      config_secret: oracle-runtime-config-robinhood
+      config_mount: /config/st0x-oracle-server.toml
+      validate_command: /bin/st0x-oracle-server validate /candidate.toml

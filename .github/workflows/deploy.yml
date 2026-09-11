@@ -17,6 +17,11 @@ name: deploy
 # service. Since 2026-09-07 (t0.devops#465); before that production rolled
 # only from a t0.devops manifest merge.
 #
+# All of that is the BASE (8453) plane. Robinhood Chain (4663) is a second
+# deployment of this same image — its own service, its own config, its own
+# runtime-config secret — rolled only by robinhood-release.yml. Neither
+# this workflow nor a version tag touches it.
+#
 # The image is built BY THE FLAKE (dockerTools) — no Dockerfile, no base
 # image: the exact nix store closure `nix build .#st0x-oracle-server`
 # produces, plus CA certs and the non-secret config. `created` is pinned in
