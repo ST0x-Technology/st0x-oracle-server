@@ -108,6 +108,24 @@ consumer = "oracle"
 # A row here for a symbol pricing does not publish on 4663 sits
 # permanently in the missing-symbols count on /status and blunts the alert
 # that catches a wedged feed, so add rows only as pricing adds them.
+#
+# PROVENANCE, independently auditable:
+#   Source of both addresses: st0x.deploy `src/lib/LibTokenInvariants.sol`
+#   at commit f2dfe564cfb4b0b50408db7746de35eb1ccd2bb1 (main, 2026-09-12),
+#   `productionTokensRobinhood()` (L1402), `wrappedTokenVault` leg of the
+#   "DNUT" row (L983-986) and the "FGI" row (L1007-1010).
+#   On-chain at 4663 block 62027864 (rpc.mainnet.chain.robinhood.com):
+#     0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826 symbol() "wtDNUT"
+#       decimals() 18, asset() 0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9,
+#       convertToAssets(1e18) 1e18
+#     0x685DFd386968B58D895F934485820C479C79a8bB symbol() "wtFGI"
+#       decimals() 18, asset() 0xfEa217600e2b00bBB2172a99345016a0cEb7d29f,
+#       convertToAssets(1e18) 1e18
+#
+# RELEASE. The first Robinhood rollout must be a NEW tag cut after this
+# merges (v1.3.0), dispatched as `robinhood-release` version=v1.3.0.
+# NEVER dispatch v1.2.0: the workflow checks out BOTH image and this file
+# from the tag, and v1.2.0's copy is the 48-token registry.
 # ----------------------------------------------------------------------------
 
 [[tokens]]

@@ -203,6 +203,14 @@ mod tests {
         // leaves a launch order unquotable. Both directions are caught here,
         // and the addresses are pinned so a drift against pricing / bebop /
         // raindex-deploy (all of which carry the same two) fails loudly.
+        //
+        // The two literals are NOT self-referential: they are the
+        // `wrappedTokenVault` leg of `productionTokensRobinhood()` in
+        // st0x.deploy src/lib/LibTokenInvariants.sol at
+        // f2dfe564cfb4b0b50408db7746de35eb1ccd2bb1 ("DNUT" row L983-986,
+        // "FGI" row L1007-1010), and both answered symbol() "wtDNUT" /
+        // "wtFGI", decimals() 18 at 4663 block 62027864. The same citation
+        // sits next to the rows in deploy/config/robinhood.toml.
         let text = include_str!("../deploy/config/robinhood.toml");
         let cfg: Config = toml::from_str(text).expect("robinhood config must parse");
         cfg.validate().expect("robinhood config must validate");

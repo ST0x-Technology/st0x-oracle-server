@@ -141,13 +141,13 @@ is deployed there too and is not what the chain settles in.
 
 Robinhood Chain is staged, not live. Its registry is deliberately two wt tokens,
 wtDNUT and wtFGI: exactly the set st0x.pricing publishes on 4663 in production
-after the 2026-09-11 incident, every address read back from the chain. The other
-deployed tokens return one pair at a time. The two properties that gated it now
-both hold in this binary: the pricing quote cache is keyed by
-`(chain id, symbol)`, so frames for one symbol on different chains no longer
-overwrite each other (RAI-2130), and `/context/v7` signs the deployment's
-`chain_id`, so a context signed here cannot be replayed into an order on another
-chain (RAI-1991, below).
+after the 2026-09-11 incident, every address read back from the chain
+(provenance and a fixed-block observation are recorded next to the rows in
+`deploy/config/robinhood.toml`). The other deployed tokens return one pair at a
+time. The first Robinhood rollout must be dispatched from a NEW tag cut after
+the two-token config merged (v1.3.0); `robinhood-release` reads both the image
+and the config from the tag, so dispatching v1.2.0 would deploy the old 48-token
+file.
 
 #### The chain is in the signature (v7)
 
