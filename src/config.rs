@@ -195,6 +195,39 @@ mod tests {
         "#;
 
     #[test]
+    fn committed_robinhood_config_serves_exactly_the_launch_pair() {
+        // The Robinhood (4663) deployment serves wtDNUT and wtFGI and nothing
+        // else: the two symbols st0x.pricing publishes on 4663 in production
+        // after the 2026-09-11 incident. A row for a symbol pricing does not
+        // publish sits in the missing-symbols count forever; a missing row
+        // leaves a launch order unquotable. Both directions are caught here,
+        // and the addresses are pinned so a drift against pricing / bebop /
+        // raindex-deploy (all of which carry the same two) fails loudly.
+        let text = include_str!("../deploy/config/robinhood.toml");
+        let cfg: Config = toml::from_str(text).expect("robinhood config must parse");
+        cfg.validate().expect("robinhood config must validate");
+        let mut rows: Vec<(String, String)> = cfg
+            .tokens
+            .iter()
+            .map(|t| (t.symbol.clone(), t.address.to_lowercase()))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "wtDNUT".to_string(),
+                    "0xb7fc2b7881cceeb73d8deccf69b6acb8ac2e0826".to_string()
+                ),
+                (
+                    "wtFGI".to_string(),
+                    "0x685dfd386968b58d895f934485820c479c79a8bb".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn parses_minimal_config() {
         let text = format!(
             r#"

@@ -15,9 +15,10 @@
 # There is no staging twin; split this into robinhood-staging.toml /
 # robinhood-production.toml if one is ever added and the two diverge.
 #
-# The registry below is the live 4663 deployment. Every address was read
-# back from the chain before it was committed: `symbol()` matches its row
-# and `decimals()` is 18 for all 48, and the quote token answers "USDG"
+# The registry below is the live 4663 deployment, cut to the two launch
+# tokens (see the token registry comment). Every address was read back
+# from the chain before it was committed: `symbol()` matches its row and
+# `decimals()` is 18 for both, and the quote token answers "USDG"
 # ("Global Dollar") with 6 decimals (2026-09-11, via
 # rpc.mainnet.chain.robinhood.com).
 #
