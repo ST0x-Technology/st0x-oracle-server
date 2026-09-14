@@ -288,6 +288,17 @@ the request:
 ]
 ```
 
+If the requested symbol has no usable pricing quote, every context schema
+returns HTTP 503 with one of two stable machine-readable `error` values:
+`no_live_quote` when the cache has no live entry, or `expired_quote` when the
+cached quote has reached its exclusive expiry deadline. `detail` is for humans;
+clients must match `error` exactly. A batch fails as one request and never
+returns a partial response array. Schemas v1 and v4 enforce the pricing frame's
+raw millisecond deadline. Schemas v5, v6, and v7 encode slot 8 in whole Unix
+seconds and the on-chain check is exclusive, so they floor the deadline and
+refuse the final partial second once the current time reaches that encoded
+second.
+
 Schema v1 context layout (all Rain DecimalFloats):
 
 - `context[0]`: schema version (= 1)

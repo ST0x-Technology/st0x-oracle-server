@@ -32,6 +32,7 @@
 //! still gets a fresh one each frame.
 
 use crate::oracle::OracleResponse;
+use crate::pricing_client::QuoteGeneration;
 use alloy::primitives::{Address, FixedBytes};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -69,9 +70,20 @@ pub struct ReuseKey {
     pub output_token: Address,
 }
 
+#[derive(Clone)]
 struct Stored {
     expiry_unix_secs: u64,
     response: OracleResponse,
+    generation: QuoteGeneration,
+}
+
+/// A prior signed response together with the deadline that is actually
+/// encoded in it. Callers must validate this stored deadline immediately
+/// before returning the response; the current candidate frame can have a
+/// later expiry and is not evidence that the older signature is still live.
+pub struct ReusedResponse {
+    pub expiry_unix_secs: u64,
+    pub response: OracleResponse,
 }
 
 pub struct ReuseCache {
@@ -97,18 +109,26 @@ impl ReuseCache {
     /// `context` (up to timestamps), does not outlive the current frame's
     /// `expiry_unix_secs`, and is good for at least `min_remaining_secs`
     /// more.
-    pub fn lookup(
+    pub(crate) fn lookup(
         &self,
         key: &ReuseKey,
         context: &[FixedBytes<32>],
         expiry_unix_secs: u64,
         now_secs: u64,
-    ) -> Option<OracleResponse> {
+        generation: &QuoteGeneration,
+    ) -> Option<ReusedResponse> {
         if !self.enabled() {
             return None;
         }
-        let guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let stored = guard.get(key)?;
+        let stored = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)?
+            .clone();
+        if !stored.generation.is_same(generation) || !stored.generation.is_live() {
+            return None;
+        }
         if !same_statement(&stored.response.context, context) {
             return None;
         }
@@ -118,32 +138,73 @@ impl ReuseCache {
         if stored.expiry_unix_secs < now_secs.saturating_add(self.min_remaining_secs) {
             return None;
         }
-        Some(stored.response.clone())
+        Some(ReusedResponse {
+            expiry_unix_secs: stored.expiry_unix_secs,
+            response: stored.response.clone(),
+        })
     }
 
     /// Remember a freshly signed response so later frames stating the
-    /// same thing can reuse it until `expiry_unix_secs` (minus margin).
-    pub fn store(&self, key: ReuseKey, expiry_unix_secs: u64, response: OracleResponse) {
+    /// same thing in the same live generation can reuse it until
+    /// `expiry_unix_secs` (minus margin). Returns false when reuse is disabled
+    /// or the producing generation was revoked before the store could begin.
+    pub(crate) fn store(
+        &self,
+        key: ReuseKey,
+        expiry_unix_secs: u64,
+        response: OracleResponse,
+        generation: &QuoteGeneration,
+    ) -> bool {
         if !self.enabled() {
-            return;
+            return false;
         }
-        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(
-            key,
-            Stored {
-                expiry_unix_secs,
-                response,
-            },
-        );
+        generation
+            .while_live(|| {
+                let mut guard = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                guard.insert(
+                    key,
+                    Stored {
+                        expiry_unix_secs,
+                        response,
+                        generation: generation.clone(),
+                    },
+                );
+            })
+            .is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::Bytes;
 
     fn slot(n: u8) -> FixedBytes<32> {
         FixedBytes::from([n; 32])
+    }
+
+    fn key() -> ReuseKey {
+        ReuseKey {
+            schema: "v5",
+            symbol: "COIN".into(),
+            direction: "base_to_quote",
+            input_token: Address::from([0x11; 20]),
+            output_token: Address::from([0x22; 20]),
+        }
+    }
+
+    fn response(publish_time: u8, expiry: u8, signature: u8) -> OracleResponse {
+        let mut context: Vec<FixedBytes<32>> = (0..9).map(slot).collect();
+        context[PUBLISH_TIME_SLOT] = slot(publish_time);
+        context[EXPIRY_SLOT] = slot(expiry);
+        OracleResponse {
+            signer: Address::ZERO,
+            context,
+            signature: Bytes::from(vec![signature]),
+        }
     }
 
     #[test]
@@ -163,5 +224,50 @@ mod tests {
         let mut longer = base.clone();
         longer.push(slot(9));
         assert!(!same_statement(&base, &longer), "a v6 slot 9 is not a v5");
+    }
+
+    #[test]
+    fn revoked_store_cannot_overwrite_repopulated_generation() {
+        let cache = ReuseCache::new(1);
+        let old_generation = QuoteGeneration::new_for_test();
+        let new_generation = QuoteGeneration::new_for_test();
+        let old_response = response(10, 100, 0xa1);
+        let new_response = response(20, 100, 0xb2);
+
+        old_generation.revoke_for_test();
+        assert!(cache.store(key(), 100, new_response.clone(), &new_generation));
+        assert!(
+            !cache.store(key(), 100, old_response, &old_generation),
+            "a response finishing after revocation must not enter the cache"
+        );
+
+        let reused = cache
+            .lookup(&key(), &new_response.context, 100, 0, &new_generation)
+            .expect("the replacement generation must retain its own entry");
+        assert_eq!(reused.response.signature, new_response.signature);
+    }
+
+    #[test]
+    fn pre_invalidation_entry_does_not_match_repopulated_generation() {
+        let cache = ReuseCache::new(1);
+        let old_generation = QuoteGeneration::new_for_test();
+        let new_generation = QuoteGeneration::new_for_test();
+        let old_response = response(10, 100, 0xa1);
+        let new_response = response(20, 100, 0xb2);
+
+        assert!(cache.store(key(), 100, old_response, &old_generation));
+        old_generation.revoke_for_test();
+        assert!(
+            cache
+                .lookup(&key(), &new_response.context, 100, 0, &new_generation,)
+                .is_none(),
+            "an entry from before invalidation must not cross generations"
+        );
+
+        assert!(cache.store(key(), 100, new_response.clone(), &new_generation));
+        let reused = cache
+            .lookup(&key(), &new_response.context, 100, 0, &new_generation)
+            .expect("the replacement generation may reuse its own entry");
+        assert_eq!(reused.response.signature, new_response.signature);
     }
 }

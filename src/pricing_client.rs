@@ -13,9 +13,13 @@
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::HeaderValue;
-use st0x_pricing_types::{ClientFrame, PongFrame, Quote, ServerFrame, SubscribeFrame, Symbol};
+use st0x_pricing_types::{
+    ClientFrame, ErrorCode, PongFrame, Quote, ServerFrame, SubscribeFrame, Symbol,
+};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -94,7 +98,142 @@ impl LiveClientConfig {
 /// against another chain's rate. Nothing else catches that: both frames are
 /// individually fresh, in-expiry and correctly signed, so the difference is
 /// invisible to every staleness and expiry check downstream.
-type QuoteCache = Arc<RwLock<HashMap<(u64, Symbol), Quote>>>;
+struct CachedQuote {
+    quote: Quote,
+    generation: QuoteGeneration,
+}
+
+impl CachedQuote {
+    fn snapshot(&self) -> QuoteSnapshot {
+        QuoteSnapshot {
+            quote: self.quote.clone(),
+            generation: self.generation.clone(),
+        }
+    }
+
+    fn revoke(&self) {
+        self.generation.revoke();
+    }
+}
+
+struct GenerationState {
+    live: AtomicBool,
+    store_gate: Mutex<()>,
+}
+
+/// Identity and liveness for one uninterrupted run of price frames. Reuse
+/// entries retain this token so an invalidated generation cannot cross into a
+/// replacement generation even when both frames state the same price.
+#[derive(Clone)]
+pub(crate) struct QuoteGeneration {
+    state: Arc<GenerationState>,
+}
+
+impl QuoteGeneration {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(GenerationState {
+                live: AtomicBool::new(true),
+                store_gate: Mutex::new(()),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.state.live.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Run `operation` only while this generation is live. The gate makes the
+    /// operation linearizable with revocation: an operation that starts after
+    /// revocation is refused, while revocation waits for an already-started
+    /// operation and makes its result immediately unusable.
+    pub(crate) fn while_live<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let _guard = self
+            .state
+            .store_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.is_live().then(operation)
+    }
+
+    fn revoke(&self) {
+        let _guard = self
+            .state
+            .store_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.state.live.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_for_test(&self) {
+        self.revoke();
+    }
+}
+
+/// One immutable quote version captured from the live cache. All ordinary
+/// price updates in one uninterrupted live generation share the token;
+/// `stale_source` or halt permanently revokes it. A later price starts a new
+/// generation, so it cannot accidentally resurrect an in-flight old snapshot.
+#[derive(Clone)]
+pub struct QuoteSnapshot {
+    quote: Quote,
+    generation: QuoteGeneration,
+}
+
+impl QuoteSnapshot {
+    pub fn is_live(&self) -> bool {
+        self.generation.is_live()
+    }
+
+    pub(crate) fn generation(&self) -> &QuoteGeneration {
+        &self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn always_live(quote: Quote) -> Self {
+        Self {
+            quote,
+            generation: QuoteGeneration::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_same_generation(&self, quote: Quote) -> Self {
+        Self {
+            quote,
+            generation: self.generation.clone(),
+        }
+    }
+}
+
+impl Deref for QuoteSnapshot {
+    type Target = Quote;
+
+    fn deref(&self) -> &Self::Target {
+        &self.quote
+    }
+}
+
+type QuoteCache = Arc<RwLock<HashMap<(u64, Symbol), CachedQuote>>>;
+
+fn insert_quote(cache: &mut HashMap<(u64, Symbol), CachedQuote>, quote: Quote) {
+    let key = (quote.chain_id, quote.asset.clone());
+    let generation = cache
+        .get(&key)
+        .map(|previous| previous.generation.clone())
+        .unwrap_or_else(QuoteGeneration::new);
+    cache.insert(key, CachedQuote { quote, generation });
+}
 
 /// Background subscriber. Spawns one task that connects, subscribes,
 /// reads price frames, and stashes the latest per-chain-and-asset `Quote`
@@ -123,7 +262,7 @@ impl LiveClient {
     pub async fn with_seeded(quotes: Vec<Quote>, chain_id: u64) -> Self {
         let mut map = HashMap::with_capacity(quotes.len());
         for q in quotes {
-            map.insert((q.chain_id, q.asset.clone()), q);
+            insert_quote(&mut map, q);
         }
         Self {
             cache: Arc::new(RwLock::new(map)),
@@ -135,10 +274,8 @@ impl LiveClient {
     /// frame would. Lets integration tests advance the price feed
     /// between requests without a live pricing server.
     pub async fn seed(&self, quote: Quote) {
-        self.cache
-            .write()
-            .await
-            .insert((quote.chain_id, quote.asset.clone()), quote);
+        let mut guard = self.cache.write().await;
+        insert_quote(&mut guard, quote);
     }
 
     pub async fn latest(&self, symbol: &str) -> Option<Quote> {
@@ -146,7 +283,7 @@ impl LiveClient {
             .read()
             .await
             .get(&(self.chain_id, symbol.to_string()))
-            .cloned()
+            .map(|entry| entry.quote.clone())
     }
 
     /// Snapshot multiple symbols under a single read lock so every
@@ -154,12 +291,12 @@ impl LiveClient {
     /// of the WS cache. Mirrors `cache::QuoteCache::snapshot_many` from
     /// the pre-pricing-client world. Symbols missing from the cache — or
     /// cached only for another chain — are simply absent in the returned map.
-    pub async fn snapshot_many(&self, symbols: &[&str]) -> HashMap<String, Quote> {
+    pub async fn snapshot_many(&self, symbols: &[&str]) -> HashMap<String, QuoteSnapshot> {
         let guard = self.cache.read().await;
         let mut out = HashMap::with_capacity(symbols.len());
         for sym in symbols {
-            if let Some(q) = guard.get(&(self.chain_id, (*sym).to_string())) {
-                out.insert((*sym).to_string(), q.clone());
+            if let Some(entry) = guard.get(&(self.chain_id, (*sym).to_string())) {
+                out.insert((*sym).to_string(), entry.snapshot());
             }
         }
         out
@@ -178,7 +315,7 @@ impl LiveClient {
             .await
             .iter()
             .filter(|((chain, _), _)| *chain == self.chain_id)
-            .map(|(_, q)| q.source_ts_unix_ms)
+            .map(|(_, entry)| entry.quote.source_ts_unix_ms)
             .max()
     }
 
@@ -193,6 +330,11 @@ impl LiveClient {
             .filter(|s| !guard.contains_key(&(self.chain_id, (*s).clone())))
             .cloned()
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn apply_test_frame(&self, frame: ServerFrame) {
+        apply_server_frame(&self.cache, frame).await;
     }
 }
 
@@ -308,7 +450,8 @@ async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<Cl
                 underlying_rate_base_to_quote: p.underlying_rate_base_to_quote,
                 underlying_rate_quote_to_base: p.underlying_rate_quote_to_base,
             };
-            cache.write().await.insert((p.chain_id, p.asset), q);
+            let mut guard = cache.write().await;
+            insert_quote(&mut guard, q);
             None
         }
         ServerFrame::Error(e) => {
@@ -318,11 +461,32 @@ async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<Cl
                 "kind" => "pricing_error_frame",
             )
             .increment(1);
+            if e.code == ErrorCode::StaleSource {
+                if let Some(asset) = e.asset {
+                    // ErrorFrame v0.7 has no chain_id, so retaining any chain's
+                    // quote could keep serving the observation pricing just
+                    // disowned. Fail closed across chains for now. Once the wire
+                    // and producer carry chain_id, narrow this to one cache key.
+                    let mut guard = cache.write().await;
+                    guard.retain(|(_, symbol), entry| {
+                        let keep = symbol != &asset;
+                        if !keep {
+                            entry.revoke();
+                        }
+                        keep
+                    });
+                    tracing::warn!(%asset, "Stale pricing source; quote evicted on every chain");
+                } else {
+                    tracing::warn!("Stale-source frame omitted asset; no quotes evicted");
+                }
+            }
             None
         }
         ServerFrame::Halt(h) => {
             if h.halted {
-                cache.write().await.remove(&(h.chain_id, h.asset.clone()));
+                if let Some(entry) = cache.write().await.remove(&(h.chain_id, h.asset.clone())) {
+                    entry.revoke();
+                }
                 tracing::warn!(asset = %h.asset, reason = ?h.reason, "Asset halted by pricing server; quote evicted");
             } else {
                 tracing::info!(asset = %h.asset, "Asset halt lifted; awaiting next price frame");
@@ -420,7 +584,9 @@ async fn connect_and_run(cfg: &LiveClientConfig, cache: &QuoteCache) -> Result<(
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use st0x_pricing_types::{HaltFrame, PriceFrame, Venue, WireAddress, WireFloat, WireU256};
+    use st0x_pricing_types::{
+        ErrorFrame, HaltFrame, PriceFrame, Venue, WireAddress, WireFloat, WireU256,
+    };
 
     /// Base (8453) is what these tests treat as the configured chain.
     const CONFIGURED: u64 = 8453;
@@ -459,6 +625,15 @@ mod tests {
             quote: WireAddress::from_bytes([0x22; 20]),
             halted,
             reason: None,
+        })
+    }
+
+    fn error_frame(code: ErrorCode, asset: Option<&str>) -> ServerFrame {
+        ServerFrame::Error(ErrorFrame {
+            code,
+            asset: asset.map(str::to_string),
+            last_ok_unix_ms: None,
+            detail: None,
         })
     }
 
@@ -534,7 +709,7 @@ mod tests {
             .read()
             .await
             .get(&(chain_id, asset.to_string()))
-            .cloned()
+            .map(|entry| entry.quote.clone())
     }
 
     /// st0x.pricing publishes one frame per (chain, symbol). Two frames for
@@ -636,6 +811,63 @@ mod tests {
             cached(&cache, CONFIGURED, "COIN").await.is_some(),
             "halt must not reach across chains"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_source_evicts_named_symbol_on_every_chain_and_price_repopulates() {
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        apply_server_frame(&cache, price_frame_on("COIN", CONFIGURED, WireU256::ZERO)).await;
+        apply_server_frame(&cache, price_frame_on("COIN", 1, WireU256::ZERO)).await;
+        apply_server_frame(&cache, price_frame_on("TSLA", CONFIGURED, WireU256::ZERO)).await;
+        let client = LiveClient {
+            cache: Arc::clone(&cache),
+            chain_id: CONFIGURED,
+        };
+        let in_flight = client
+            .snapshot_many(&["COIN"])
+            .await
+            .remove("COIN")
+            .unwrap();
+
+        apply_server_frame(&cache, error_frame(ErrorCode::StaleSource, Some("COIN"))).await;
+
+        assert!(cached(&cache, CONFIGURED, "COIN").await.is_none());
+        assert!(
+            cached(&cache, 1, "COIN").await.is_none(),
+            "fail-closed eviction includes a valid other-chain quote until ErrorFrame carries chain_id"
+        );
+        assert!(cached(&cache, CONFIGURED, "TSLA").await.is_some());
+        assert!(!in_flight.is_live(), "eviction revokes owned snapshots");
+
+        apply_server_frame(&cache, price_frame_on("COIN", CONFIGURED, WireU256::ZERO)).await;
+        assert!(cached(&cache, CONFIGURED, "COIN").await.is_some());
+        assert!(
+            !in_flight.is_live(),
+            "a new live generation must not resurrect an older snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_source_without_asset_and_other_errors_do_not_evict() {
+        for code in [
+            ErrorCode::StaleSource,
+            ErrorCode::UnknownAsset,
+            ErrorCode::ModelError,
+            ErrorCode::Internal,
+        ] {
+            let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+            apply_server_frame(&cache, price_frame("COIN", WireU256::ZERO)).await;
+            let asset = if code == ErrorCode::StaleSource {
+                None
+            } else {
+                Some("COIN")
+            };
+            apply_server_frame(&cache, error_frame(code, asset)).await;
+            assert!(
+                cached(&cache, CONFIGURED, "COIN").await.is_some(),
+                "{code:?} must not evict this quote"
+            );
+        }
     }
 
     proptest! {
