@@ -139,15 +139,15 @@ can't be re-pointed without rewriting the strategy.
 Robinhood Chain settles in USDG (Global Dollar), not Circle USDC — Circle's USDC
 is deployed there too and is not what the chain settles in.
 
-Robinhood Chain is staged, not live. Its registry is deliberately two wt tokens,
-wtDNUT and wtFGI: exactly the set st0x.pricing publishes on 4663 in production
-after the 2026-09-11 incident, every address read back from the chain
-(provenance and a fixed-block observation are recorded next to the rows in
-`deploy/config/robinhood.toml`). The other deployed tokens return one pair at a
-time. The first Robinhood rollout must be dispatched from a NEW tag cut after
-the two-token config merged (v1.3.0); `robinhood-release` reads both the image
-and the config from the tag, so dispatching v1.2.0 would deploy the old 48-token
-file.
+Robinhood Chain is staged, not live. Its registry is deliberately three wt
+tokens, wtDNUT and wtFGI plus the wtSGOV probe: exactly the set st0x.pricing
+publishes on 4663 in production after the 2026-09-11 incident, every address
+read back from the chain (provenance and a fixed-block observation are recorded
+next to the rows in `deploy/config/robinhood.toml`). The other deployed tokens
+return one pair at a time. The first Robinhood rollout must be dispatched from a
+NEW tag cut after the two-token config merged (v1.3.0); `robinhood-release`
+reads both the image and the config from the tag, so dispatching v1.2.0 would
+deploy the old 48-token file.
 
 #### The chain is in the signature (v7)
 
