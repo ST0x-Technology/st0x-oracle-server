@@ -367,6 +367,17 @@ impl Signer {
         self
     }
 
+    /// Delay the detached signing task so higher-level request tests can
+    /// deterministically interleave a cache invalidation after signing starts.
+    #[cfg(test)]
+    pub(crate) fn with_test_delay(mut self, delay: Duration) -> Self {
+        self.test_hook = Some(TestHook {
+            delay,
+            ..TestHook::default()
+        });
+        self
+    }
+
     /// Signature cache hit/miss counters since startup.
     #[cfg(test)]
     pub fn cache_stats(&self) -> SignatureCacheStats {

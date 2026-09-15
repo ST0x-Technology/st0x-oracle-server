@@ -88,6 +88,10 @@ impl MetricsHandle {
             "oracle_signature_reuse_total",
             "v5/v6/v7 responses answered with the previous frame's signature because the price was unchanged and that quote's expiry was still ahead by the configured margin; each one is a KMS call not made"
         );
+        metrics::describe_counter!(
+            "oracle_quote_refusals_total",
+            "Quote requests refused because no live quote exists or the snapshotted quote expired"
+        );
         metrics::describe_gauge!(
             "oracle_signature_cache_entries",
             "Signatures currently held in the content-addressed cache (idle TTL 120s, swept every 256 inserts)"

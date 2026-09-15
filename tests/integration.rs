@@ -184,6 +184,166 @@ async fn test_app_full(
     create_app(state)
 }
 
+async fn test_app_with_quotes(entries: &[(&str, &str)], quotes: Vec<Quote>) -> axum::Router {
+    let signer = Signer::new(TEST_KEY).unwrap();
+    let registry = TokenRegistry::new(
+        entries
+            .iter()
+            .map(|(address, symbol)| ((*address).to_string(), (*symbol).to_string()))
+            .collect(),
+        USDC,
+    )
+    .unwrap();
+    let pricing = LiveClient::with_seeded(quotes, TEST_CHAIN_ID).await;
+    let metrics = MetricsHandle::install().expect("metrics install");
+    let state = AppState::new(
+        signer,
+        registry,
+        TEST_CHAIN_ID,
+        pricing,
+        entries
+            .iter()
+            .map(|(_, symbol)| (*symbol).to_string())
+            .collect(),
+        fixed_close_market_hours().await,
+        metrics,
+    );
+    create_app(state)
+}
+
+async fn post_status_and_json(
+    app: axum::Router,
+    endpoint: &str,
+    body: Bytes,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn expired_quotes_are_refused_by_every_context_schema() {
+    for endpoint in [
+        "/context/v1",
+        "/context/v4",
+        "/context/v5",
+        "/context/v6",
+        "/context/v7",
+    ] {
+        let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+        quote.expiry_unix_ms = Utc::now().timestamp_millis() - 1;
+        let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![quote]).await;
+        let (status, json) = post_status_and_json(app, endpoint, encode_single(USDC, WCOIN)).await;
+        assert_eq!(status, 503, "{endpoint}");
+        assert_eq!(json["error"], "expired_quote", "{endpoint}");
+        assert!(json["detail"].as_str().unwrap().contains("COIN"));
+    }
+}
+
+#[tokio::test]
+async fn quote_expiring_at_current_millisecond_is_refused() {
+    let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+    quote.expiry_unix_ms = Utc::now().timestamp_millis();
+    let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![quote]).await;
+    let (status, json) = post_status_and_json(app, "/context/v1", encode_single(USDC, WCOIN)).await;
+    assert_eq!(status, 503);
+    assert_eq!(json["error"], "expired_quote");
+}
+
+#[tokio::test]
+async fn expired_refusal_is_exposed_with_stable_metric_labels() {
+    let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+    quote.expiry_unix_ms = Utc::now().timestamp_millis() - 1;
+    let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![quote]).await;
+    let (status, _) =
+        post_status_and_json(app.clone(), "/context/v5", encode_single(USDC, WCOIN)).await;
+    assert_eq!(status, 503);
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.lines().any(|line| {
+        line.starts_with("oracle_quote_refusals_total{")
+            && line.contains("endpoint=\"v5\"")
+            && line.contains("phase=\"admission\"")
+            && line.contains("reason=\"expired_quote\"")
+            && line.contains("symbol=\"COIN\"")
+    }));
+}
+
+#[tokio::test]
+async fn missing_quotes_return_stable_no_live_quote_reason() {
+    for endpoint in ["/context/v1", "/context/v5"] {
+        let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![]).await;
+        let (status, json) =
+            post_status_and_json(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
+        assert_eq!(status, 503, "{endpoint}");
+        assert_eq!(json["error"], "no_live_quote", "{endpoint}");
+        assert!(json["detail"].as_str().unwrap().contains("COIN"));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        let endpoint_label = endpoint.trim_start_matches("/context/");
+        let refusal = body
+            .lines()
+            .find(|line| {
+                line.starts_with("oracle_quote_refusals_total{")
+                    && line.contains(&format!("endpoint=\"{endpoint_label}\""))
+                    && line.contains("phase=\"admission\"")
+                    && line.contains("reason=\"no_live_quote\"")
+                    && line.contains("symbol=\"COIN\"")
+            })
+            .expect("no-live-quote refusal metric");
+        assert_eq!(refusal.split_whitespace().last(), Some("1"));
+    }
+}
+
+#[tokio::test]
+async fn mixed_batch_fails_whole_request_when_second_quote_is_expired() {
+    let live = fake_quote("COIN", WCOIN, "0.01", "100");
+    let mut expired = fake_quote("DRAM", WDRAM, "0.02", "50");
+    expired.expiry_unix_ms = Utc::now().timestamp_millis() - 1;
+    let app = test_app_with_quotes(&[(WCOIN, "COIN"), (WDRAM, "DRAM")], vec![live, expired]).await;
+    let (status, json) = post_status_and_json(
+        app,
+        "/context/v5",
+        encode_batch(&[(USDC, WCOIN), (USDC, WDRAM)]),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(json["error"], "expired_quote");
+    assert!(json["detail"].as_str().unwrap().contains("DRAM"));
+    assert!(json.as_array().is_none(), "no partial response array");
+}
+
 /// Build a test app whose pricing cache holds asymmetric per-direction
 /// rates for one symbol. Used by the maker-orientation test proving the
 /// oracle serves each order shape the inverse of its DIRECTIONAL rate
@@ -1088,9 +1248,8 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
     let mut quote = fake_quote("COIN", WCOIN, "100", "100");
-    // 1_700_000_020_500 ms floors to 1_700_000_020 s — the trailing
-    // 500ms must be dropped, never rounded up past the model's horizon.
-    quote.expiry_unix_ms = 1_700_000_020_500;
+    let now_secs = Utc::now().timestamp();
+    quote.expiry_unix_ms = (now_secs + 3600) * 1000 + 500;
     let pricing = LiveClient::with_seeded(vec![quote], TEST_CHAIN_ID).await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
@@ -1128,7 +1287,7 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
     // Slot 8: the seeded expiry, ms floored to whole seconds. Compare
     // Float-canonical forms (large ints format in scientific notation).
     let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
-    let expected = Float::parse("1700000020".to_string())
+    let expected = Float::parse((now_secs + 3600).to_string())
         .unwrap()
         .format()
         .unwrap();
@@ -1137,11 +1296,12 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
 
 /// Build a test app whose single COIN quote carries the given NAV
 /// ratio and a realistic expiry. Used by the /context/v6 route tests.
-async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> axum::Router {
+async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> (axum::Router, i64) {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
     let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
-    quote.expiry_unix_ms = 1_700_000_020_500;
+    let expected_expiry_secs = Utc::now().timestamp() + 3600;
+    quote.expiry_unix_ms = expected_expiry_secs * 1000 + 500;
     quote.nav_ratio = nav_ratio;
     let pricing = LiveClient::with_seeded(vec![quote], TEST_CHAIN_ID).await;
     let metrics = MetricsHandle::install().expect("metrics install");
@@ -1154,7 +1314,7 @@ async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> axum::Router {
         fixed_close_market_hours().await,
         metrics,
     );
-    create_app(state)
+    (create_app(state), expected_expiry_secs)
 }
 
 /// POST a single (USDC -> WCOIN) request to `endpoint` and return the
@@ -1170,7 +1330,7 @@ async fn test_v6_endpoint_signs_nav_ratio_at_slot_9() {
     // packing of the raw 18-decimal fixed-point uint256 off the pricing
     // wire, never through an f64 or a decimal string.
     let nav = nav_ratio_pattern();
-    let app = test_app_with_nav_ratio(nav).await;
+    let (app, expected_expiry_secs) = test_app_with_nav_ratio(nav).await;
     let ctx = context_of(app, "/context/v6").await;
 
     assert_eq!(ctx.len(), 10, "v6 endpoint must emit 10 context elements");
@@ -1180,7 +1340,7 @@ async fn test_v6_endpoint_signs_nav_ratio_at_slot_9() {
 
     // Slot 8 keeps the v5 expiry semantics: ms floored to whole seconds.
     let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
-    let expected = Float::parse("1700000020".to_string())
+    let expected = Float::parse(expected_expiry_secs.to_string())
         .unwrap()
         .format()
         .unwrap();
@@ -1211,7 +1371,7 @@ async fn test_v6_zero_nav_ratio_signs_float_zero() {
     // Zero is the "no ratio" sentinel (non-vault base token / producer
     // predates nav_ratio): the carrier packs it as Float zero instead
     // of erroring, and no downstream settlement assertion applies.
-    let app = test_app_with_nav_ratio(WireU256::ZERO).await;
+    let (app, _) = test_app_with_nav_ratio(WireU256::ZERO).await;
     let ctx = context_of(app, "/context/v6").await;
     assert_eq!(ctx.len(), 10);
     let nav_float = Float::from(alloy::primitives::B256::from(ctx[9]));
@@ -1229,7 +1389,7 @@ async fn test_v5_response_is_v6_minus_nav_ratio() {
     // slot except the schema version identical to the v6 response built
     // from the same cached quote. Anyone diffing the two endpoints sees
     // one appended slot and nothing else.
-    let app = test_app_with_nav_ratio(nav_ratio_pattern()).await;
+    let (app, _) = test_app_with_nav_ratio(nav_ratio_pattern()).await;
     let v5 = context_of(app.clone(), "/context/v5").await;
     let v6 = context_of(app, "/context/v6").await;
 
@@ -1247,7 +1407,7 @@ async fn test_v5_response_is_v6_minus_nav_ratio() {
 /// seeded so a QuoteToBase (sell-side, USDC->WCOIN) request serves the
 /// price back after the oracle's `inv`: `quote_to_base = 1/px`,
 /// `base_to_quote = px`.
-async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> axum::Router {
+async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> (axum::Router, i64) {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
 
@@ -1258,7 +1418,8 @@ async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> axum::
         .format()
         .unwrap();
     let mut quote = fake_quote("COIN", WCOIN, &vault_inv, vault_px);
-    quote.expiry_unix_ms = 1_700_000_020_500;
+    let expected_expiry_secs = Utc::now().timestamp() + 3600;
+    quote.expiry_unix_ms = expected_expiry_secs * 1000 + 500;
 
     let under_inv = Float::parse(underlying_px.to_string())
         .unwrap()
@@ -1280,7 +1441,7 @@ async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> axum::
         fixed_close_market_hours().await,
         metrics,
     );
-    create_app(state)
+    (create_app(state), expected_expiry_secs)
 }
 
 #[tokio::test]
@@ -1289,7 +1450,7 @@ async fn test_v7_endpoint_signs_underlying_price_at_slot_1() {
     // the chain id at slot 9, with slot 1 carrying the UNDERLYING price
     // (90), NOT the vault-share rate (100). Sell-side request
     // (USDC->WCOIN).
-    let app = test_app_with_underlying("100", "90").await;
+    let (app, expected_expiry_secs) = test_app_with_underlying("100", "90").await;
     let ctx = context_of(app, "/context/v7").await;
 
     assert_eq!(
@@ -1310,7 +1471,7 @@ async fn test_v7_endpoint_signs_underlying_price_at_slot_1() {
 
     // Slot 8 keeps the v5 expiry semantics: ms floored to whole seconds.
     let expiry = Float::from(alloy::primitives::B256::from(ctx[8]));
-    let expected = Float::parse("1700000020".to_string())
+    let expected = Float::parse(expected_expiry_secs.to_string())
         .unwrap()
         .format()
         .unwrap();
@@ -1321,12 +1482,16 @@ async fn test_v7_endpoint_signs_underlying_price_at_slot_1() {
 /// frame stamped with that same chain id (the cache is chain-scoped, so a
 /// frame stamped for another chain is never served). Everything else
 /// matches `test_app_with_underlying`'s fixture.
-async fn test_app_on_chain(chain_id: u64) -> axum::Router {
+async fn test_app_on_chain(
+    chain_id: u64,
+    expiry_unix_secs: i64,
+    market_hours: Arc<MarketHoursCache>,
+) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
     let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
     quote.chain_id = chain_id;
-    quote.expiry_unix_ms = 1_700_000_020_500;
+    quote.expiry_unix_ms = expiry_unix_secs * 1000 + 500;
     let pricing = LiveClient::with_seeded(vec![quote], chain_id).await;
     let metrics = MetricsHandle::install().expect("metrics install");
     let state = AppState::new(
@@ -1335,7 +1500,7 @@ async fn test_app_on_chain(chain_id: u64) -> axum::Router {
         chain_id,
         pricing,
         vec!["COIN".to_string()],
-        fixed_close_market_hours().await,
+        market_hours,
         metrics,
     );
     create_app(state)
@@ -1349,7 +1514,7 @@ async fn test_v7_endpoint_signs_chain_id_at_slot_9() {
     // Without it the EIP-191 signature names no chain, and since ST0x
     // token addresses are deterministic clones a frame signed here
     // verifies unchanged inside an order on another chain.
-    let app = test_app_with_underlying("100", "90").await;
+    let (app, _) = test_app_with_underlying("100", "90").await;
     let ctx = context_of(app, "/context/v7").await;
 
     let chain = Float::from(alloy::primitives::B256::from(ctx[9]));
@@ -1366,8 +1531,18 @@ async fn test_v7_signs_the_configured_chain_not_a_baked_in_base() {
     // The signed chain id follows config. A Robinhood Chain (4663)
     // deployment must sign 4663 — the whole point of the slot is that two
     // deployments sharing a token address sign distinguishable frames.
-    let base = context_of(test_app_on_chain(TEST_CHAIN_ID).await, "/context/v7").await;
-    let other = context_of(test_app_on_chain(OTHER_CHAIN_ID).await, "/context/v7").await;
+    let expiry_unix_secs = Utc::now().timestamp() + 3600;
+    let market_hours = always_in_session_market_hours().await;
+    let base = context_of(
+        test_app_on_chain(TEST_CHAIN_ID, expiry_unix_secs, Arc::clone(&market_hours)).await,
+        "/context/v7",
+    )
+    .await;
+    let other = context_of(
+        test_app_on_chain(OTHER_CHAIN_ID, expiry_unix_secs, market_hours).await,
+        "/context/v7",
+    )
+    .await;
 
     let signed = |ctx: &Vec<FixedBytes<32>>| {
         Float::from(alloy::primitives::B256::from(ctx[9]))
@@ -1420,7 +1595,7 @@ async fn test_v5_v6_still_sign_vault_rate_when_underlying_differs() {
     // underlying (90) distinct from the vault rate (100), the vault-rate
     // endpoints must still serve 100 at slot 1. Regression pin proving
     // slot 1's meaning is per-schema.
-    let app = test_app_with_underlying("100", "90").await;
+    let (app, _) = test_app_with_underlying("100", "90").await;
     let v5 = context_of(app.clone(), "/context/v5").await;
     let v6 = context_of(app, "/context/v6").await;
 
@@ -1574,6 +1749,30 @@ async fn test_v5_unchanged_price_reuses_previous_signature() {
     assert_eq!(publish_time_of(&third), secs(FIXED_PUBLISH_TIME + 10));
     assert_ne!(third.context[1], first.context[1], "price slot moved");
     assert_ne!(third.signature, first.signature);
+}
+
+#[tokio::test]
+async fn expired_same_price_frame_is_not_served_from_reuse_and_fresh_frame_recovers() {
+    let (app, pricing) = reuse_test_app(10).await;
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME, 60)).await;
+    let first = response_of(app.clone(), "/context/v5").await;
+
+    let mut expired = frame("100", FIXED_PUBLISH_TIME + 5, 60);
+    expired.expiry_unix_ms = Utc::now().timestamp_millis() - 1;
+    pricing.seed(expired).await;
+    let (status, json) =
+        post_status_and_json(app.clone(), "/context/v5", encode_single(USDC, WCOIN)).await;
+    assert_eq!(status, 503);
+    assert_eq!(json["error"], "expired_quote");
+
+    pricing
+        .seed(frame("100", FIXED_PUBLISH_TIME + 10, 60))
+        .await;
+    let recovered = response_of(app, "/context/v5").await;
+    assert_eq!(
+        recovered.context, first.context,
+        "a fresh replacement may safely reuse the pre-expiry signature"
+    );
 }
 
 #[tokio::test]
