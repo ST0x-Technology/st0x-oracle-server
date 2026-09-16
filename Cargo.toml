@@ -69,6 +69,12 @@ wasm-bindgen = "=0.2.100"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Thread-local DebuggingRecorder for exact metric assertions. The
+# Prometheus recorder is process-global and tests run in parallel, so
+# absolute/delta assertions against it are racy; unit tests swap in a
+# local recorder via `metrics::with_local_recorder` instead. Same 0.17
+# metrics-exporter-prometheus already pulls in.
+metrics-util = { version = "0.17", default-features = false, features = ["debugging"] }
 # Property-based tests. Same version as st0x.pricing / st0x.bebop.
 # Used for the signing fuzz target + the pricing-client wire-decode
 # fuzz target (RAI-363 quality-bar sweep).
