@@ -172,7 +172,8 @@ const NAV_RATIO_DECIMALS: u8 = 18;
 /// alternative, a dead padding slot, would put a meaningless signed value
 /// on the wire to preserve a number.
 ///
-/// v1–v6 stay unchanged and are still served on their own endpoints.
+/// v5 and v6 remain supported. v1 and v4 refuse new signatures because
+/// they cannot carry an execution deadline; v2 and v3 are retired.
 pub const SCHEMA_VERSION_V7: u64 = 7;
 
 /// Oracle response matching Rain's SignedContextV1 format.

@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use rain_math_float::Float;
 use st0x_oracle_server::market_hours::{MarketHoursCache, SessionWindow};
 use st0x_oracle_server::metrics::MetricsHandle;
-use st0x_oracle_server::oracle::{BatchItemResponse, OracleResponse, SCHEMA_VERSION};
+use st0x_oracle_server::oracle::{BatchItemResponse, OracleResponse};
 use st0x_oracle_server::pricing_client::LiveClient;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
@@ -97,6 +97,7 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
         rate_base_to_quote: wire_float_of(base_to_quote),
         rate_quote_to_base: wire_float_of(quote_to_base),
         expiry_unix_ms: i64::MAX,
+        execution_deadline_unix_ms: Some(i64::MAX),
         source_ts_unix_ms: FIXED_PUBLISH_TIME * 1000,
         // Zero = the "no ratio" sentinel. Tests that exercise the v6
         // NAV-ratio slot overwrite this with a full-entropy pattern.
@@ -244,13 +245,7 @@ async fn post_status_and_json(
 
 #[tokio::test]
 async fn expired_quotes_are_refused_by_every_context_schema() {
-    for endpoint in [
-        "/context/v1",
-        "/context/v4",
-        "/context/v5",
-        "/context/v6",
-        "/context/v7",
-    ] {
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
         let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
         quote.expiry_unix_ms = Utc::now().timestamp_millis() - 1;
         let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![quote]).await;
@@ -262,11 +257,56 @@ async fn expired_quotes_are_refused_by_every_context_schema() {
 }
 
 #[tokio::test]
+async fn executable_schemas_bind_and_enforce_the_execution_deadline() {
+    let now_ms = Utc::now().timestamp_millis();
+    let future_deadline = now_ms + 60_999;
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
+        for deadline in [
+            None,
+            Some(0),
+            Some(-1),
+            Some(now_ms - 1),
+            Some(future_deadline),
+        ] {
+            let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+            quote.expiry_unix_ms = future_deadline + 60_000;
+            quote.execution_deadline_unix_ms = deadline;
+            let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![quote]).await;
+            let (status, json) =
+                post_status_and_json(app, endpoint, encode_single(USDC, WCOIN)).await;
+            if deadline == Some(future_deadline) {
+                assert_eq!(status, 200, "{endpoint}");
+                let responses: Vec<OracleResponse> = serde_json::from_value(json).unwrap();
+                assert_eq!(responses.len(), 1);
+                assert_eq!(
+                    Float::from(responses[0].context[8])
+                        .to_fixed_decimal(0)
+                        .unwrap(),
+                    U256::from(u64::try_from(future_deadline / 1000).unwrap()),
+                    "{endpoint} must sign the earlier, floored execution deadline"
+                );
+            } else {
+                assert_eq!(status, 503, "{endpoint}: {deadline:?}");
+                assert_eq!(json["error"], "expired_quote", "{endpoint}");
+                assert!(
+                    json["detail"]
+                        .as_str()
+                        .unwrap()
+                        .to_ascii_lowercase()
+                        .contains("deadline"),
+                    "{endpoint}: {json}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn quote_expiring_at_current_millisecond_is_refused() {
     let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
     quote.expiry_unix_ms = Utc::now().timestamp_millis();
     let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![quote]).await;
-    let (status, json) = post_status_and_json(app, "/context/v1", encode_single(USDC, WCOIN)).await;
+    let (status, json) = post_status_and_json(app, "/context/v5", encode_single(USDC, WCOIN)).await;
     assert_eq!(status, 503);
     assert_eq!(json["error"], "expired_quote");
 }
@@ -302,7 +342,7 @@ async fn expired_refusal_is_exposed_with_stable_metric_labels() {
 
 #[tokio::test]
 async fn missing_quotes_return_stable_no_live_quote_reason() {
-    for endpoint in ["/context/v1", "/context/v5"] {
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
         let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![]).await;
         let (status, json) =
             post_status_and_json(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
@@ -580,7 +620,7 @@ async fn test_v1_invalid_body_returns_400() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00]))
                 .unwrap(),
@@ -606,7 +646,7 @@ async fn test_v1_empty_batch_returns_empty_array() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(body))
                 .unwrap(),
@@ -633,7 +673,7 @@ async fn test_v1_unknown_token_returns_400() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(body))
                 .unwrap(),
@@ -645,57 +685,25 @@ async fn test_v1_unknown_token_returns_400() {
 }
 
 #[tokio::test]
-async fn test_v1_single_returns_v1_schema_from_cache() {
-    let app = test_app().await;
-    let body = encode_single(USDC, WCOIN);
-
-    let response = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/context/v1")
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
-
-    assert_eq!(
-        responses.len(),
-        1,
-        "single-request must return length-1 array"
-    );
-    let resp = &responses[0];
-    assert_eq!(
-        resp.context.len(),
-        3,
-        "schema v1 must have 3 context elements"
-    );
-
-    // version
-    let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
-    assert_eq!(version.format().unwrap(), SCHEMA_VERSION.to_string());
-
-    // price (broker mark = 100.0 — same number for both directions,
-    // build_context inverts via Float when needed)
-    let price = Float::from(alloy::primitives::B256::from(resp.context[1]));
-    assert_eq!(price.format().unwrap(), "100");
-
-    // publish_time = the mark's fetch time (QuoteData.t), seeded to
-    // FIXED_PUBLISH_TIME, so we expect that exact value here. Compare
-    // against a Float-round-tripped canonical form since Rain Float
-    // formats large integers in scientific notation.
-    let publish = Float::from(alloy::primitives::B256::from(resp.context[2]));
-    let expected = Float::parse(FIXED_PUBLISH_TIME.to_string())
-        .unwrap()
-        .format()
-        .unwrap();
-    assert_eq!(publish.format().unwrap(), expected);
+async fn legacy_schemas_refuse_new_signatures() {
+    for endpoint in ["/context/v1", "/context/v4"] {
+        let response = test_app()
+            .await
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503, "{endpoint}");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"], "legacy_schema", "{endpoint}");
+    }
 }
 
 #[tokio::test]
@@ -713,7 +721,7 @@ async fn test_v1_publish_time_is_quote_source_ts_even_when_in_session() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -750,7 +758,7 @@ async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v4")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -763,11 +771,11 @@ async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
     let responses: Vec<OracleResponse> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(responses.len(), 1);
     let resp = &responses[0];
-    assert_eq!(resp.context.len(), 8, "v4 must emit 8 context elements");
+    assert_eq!(resp.context.len(), 9, "v5 must emit 9 context elements");
 
-    // schema_version = 4
+    // schema_version = 5
     let version = Float::from(alloy::primitives::B256::from(resp.context[0]));
-    assert_eq!(version.format().unwrap(), "4");
+    assert_eq!(version.format().unwrap(), "5");
 
     // session tag still uses V3 IntOrAString (same shape as v3's slot 3)
     // — v4 only adds tokens, it doesn't renegotiate session encoding.
@@ -834,7 +842,7 @@ async fn test_v4_rejects_the_swapped_token_attack() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v4")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(WCOIN, USDC)))
                 .unwrap(),
@@ -1064,7 +1072,7 @@ async fn test_v1_returns_503_for_uncached_symbol() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -1078,7 +1086,7 @@ async fn test_v1_returns_503_for_uncached_symbol() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WDRAM)))
                 .unwrap(),
@@ -1113,7 +1121,7 @@ async fn test_v1_batch_returns_length_matching_array() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(body))
                 .unwrap(),
@@ -1161,19 +1169,10 @@ async fn test_maker_orientation_ask_above_bid_per_direction() {
     //                         maker ask = inv(0.01) = 100)
     let app = test_app_asymmetric("0.01", "99").await;
 
-    // v5 is what production signs; v1, v4 and v6 share pick_rate_bytes
-    // but each handler carries its own code path and its own comments —
-    // the exact divergence surface that produced this bug — so pin all
-    // remaining endpoints. v7 uses `pick_underlying_rate_bytes` (a distinct
-    // picker), and since this app's underlying rates mirror the vault rates
-    // it must pick the SAME direction and orient identically.
-    for endpoint in [
-        "/context/v1",
-        "/context/v4",
-        "/context/v5",
-        "/context/v6",
-        "/context/v7",
-    ] {
+    // v5 and v6 share `pick_rate_bytes`. v7 uses
+    // `pick_underlying_rate_bytes`, and this app's underlying rates mirror
+    // the vault rates, so all executable schemas must orient identically.
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
         // Sell-side order (input=USDC, output=tStock): must serve the ASK
         // in quote-per-base units = inv(quote_to_base) = 100.
         let sell_resp = app
@@ -1240,7 +1239,7 @@ async fn test_zero_rate_fails_closed_with_500() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/context/v1")
+                .uri("/context/v5")
                 .header("content-type", "application/octet-stream")
                 .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
                 .unwrap(),
@@ -1707,6 +1706,7 @@ fn frame(price: &str, source_ts_secs: i64, expires_in_secs: i64) -> Quote {
     let mut q = fake_quote("COIN", WCOIN, &inv, price);
     q.source_ts_unix_ms = source_ts_secs * 1000;
     q.expiry_unix_ms = (Utc::now().timestamp() + expires_in_secs) * 1000;
+    q.execution_deadline_unix_ms = Some(q.expiry_unix_ms);
     q
 }
 
@@ -1831,16 +1831,50 @@ async fn test_v5_shorter_expiry_on_new_frame_is_not_reused() {
 }
 
 #[tokio::test]
+async fn signature_reuse_respects_shortened_and_revoked_execution_deadlines() {
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
+        let (app, pricing) = reuse_test_app(10).await;
+        pricing.seed(frame("100", FIXED_PUBLISH_TIME, 120)).await;
+        let first = response_of(app.clone(), endpoint).await;
+
+        let deadline_seconds = Utc::now().timestamp() + 60;
+        let mut shortened = frame("100", FIXED_PUBLISH_TIME + 5, 120);
+        shortened.execution_deadline_unix_ms = Some(deadline_seconds * 1000);
+        pricing.seed(shortened.clone()).await;
+        let second = response_of(app.clone(), endpoint).await;
+        assert_eq!(
+            Float::from(second.context[8]).to_fixed_decimal(0).unwrap(),
+            U256::from(u64::try_from(deadline_seconds).unwrap())
+        );
+        assert_ne!(second.context[8], first.context[8]);
+
+        for deadline in [None, Some(Utc::now().timestamp_millis() - 1)] {
+            shortened.execution_deadline_unix_ms = deadline;
+            pricing.seed(shortened.clone()).await;
+            let (status, json) =
+                post_status_and_json(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
+            assert_eq!(status, 503, "{endpoint}: {deadline:?}");
+            assert_eq!(json["error"], "expired_quote");
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_v4_never_reuses_across_frames() {
-    // v4 signs no expiry, so the taker cannot see how old a reused quote
-    // would be; it always gets the newest frame.
     let (app, pricing) = reuse_test_app(10).await;
     pricing.seed(frame("100", FIXED_PUBLISH_TIME, 60)).await;
-    let first = response_of(app.clone(), "/context/v4").await;
-    pricing.seed(frame("100", FIXED_PUBLISH_TIME + 5, 60)).await;
-    let second = response_of(app, "/context/v4").await;
-    assert_eq!(publish_time_of(&second), secs(FIXED_PUBLISH_TIME + 5));
-    assert_ne!(second.context, first.context);
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/context/v4")
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(encode_single(USDC, WCOIN)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
 }
 
 #[tokio::test]
@@ -1891,7 +1925,7 @@ async fn test_error_body_shape_is_stable_across_status_codes() {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/context/v1")
+                    .uri("/context/v5")
                     .header("content-type", "application/octet-stream")
                     .body(axum::body::Body::from(body))
                     .unwrap(),
@@ -1975,13 +2009,7 @@ async fn test_query_string_never_changes_single_tuple_responses() {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    for endpoint in [
-        "/context/v1",
-        "/context/v4",
-        "/context/v5",
-        "/context/v6",
-        "/context/v7",
-    ] {
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
         // Happy path: the flag must NOT envelope a single tuple. In-session
         // app: the bodies of separate requests are compared below.
         let app = in_session_app_with(&[(WCOIN, "COIN", Some(100.0))]).await;
@@ -2060,7 +2088,7 @@ async fn test_batch_without_flag_keeps_all_or_nothing_behaviour() {
         "?%%%&==",
     ];
 
-    for endpoint in ["/context/v1", "/context/v7"] {
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
         // Healthy batch: bare array, identical across non-flag queries.
         // In-session app: the bodies of separate requests are compared.
         let app = in_session_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
@@ -2120,11 +2148,11 @@ async fn test_v1_batch_with_flag_returns_per_item_envelope() {
     let unknown = "0x9999999999999999999999999999999999999999";
 
     // Reference: strict single responses for the two healthy pairs.
-    let (_, buy_ref) = post_json(app.clone(), "/context/v1", encode_single(USDC, WCOIN)).await;
-    let (_, sell_ref) = post_json(app.clone(), "/context/v1", encode_single(WCOIN, USDC)).await;
+    let (_, buy_ref) = post_json(app.clone(), "/context/v5", encode_single(USDC, WCOIN)).await;
+    let (_, sell_ref) = post_json(app.clone(), "/context/v5", encode_single(WCOIN, USDC)).await;
 
     let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM), (USDC, unknown), (WCOIN, USDC)]);
-    let (status, body) = post_json(app.clone(), "/context/v1?allowFailure=true", mixed).await;
+    let (status, body) = post_json(app.clone(), "/context/v5?allowFailure=true", mixed).await;
     assert_eq!(
         status, 200,
         "envelope mode must be 200 even with failures: {body}"
@@ -2185,7 +2213,7 @@ async fn test_v1_batch_with_flag_all_failed_is_200_with_error_slots() {
     let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
     let unknown = "0x9999999999999999999999999999999999999999";
     let body = encode_batch(&[(USDC, WDRAM), (USDC, unknown)]);
-    let (status, json) = post_json(app, "/context/v1?allowFailure=true", body).await;
+    let (status, json) = post_json(app, "/context/v5?allowFailure=true", body).await;
     assert_eq!(status, 200);
     let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
     assert_eq!(items.len(), 2);
@@ -2204,7 +2232,7 @@ async fn test_v1_batch_with_flag_all_failed_is_200_with_error_slots() {
 async fn test_v1_empty_batch_with_flag_returns_empty_array() {
     let (status, json) = post_json(
         test_app().await,
-        "/context/v1?allowFailure=true",
+        "/context/v5?allowFailure=true",
         encode_batch(&[]),
     )
     .await;
@@ -2222,7 +2250,7 @@ async fn test_v1_zero_rate_item_is_internal_error_slot_with_flag() {
     let body = encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)]);
 
     let (status, json) =
-        post_json(app.clone(), "/context/v1?allowFailure=true", body.clone()).await;
+        post_json(app.clone(), "/context/v5?allowFailure=true", body.clone()).await;
     assert_eq!(status, 200, "{json}");
     let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
     assert!(
@@ -2236,7 +2264,7 @@ async fn test_v1_zero_rate_item_is_internal_error_slot_with_flag() {
         items[1]
     );
 
-    let (status, json) = post_json(app, "/context/v1", body).await;
+    let (status, json) = post_json(app, "/context/v5", body).await;
     assert_eq!(
         status, 500,
         "strict mode keeps the whole-request 500: {json}"
@@ -2250,7 +2278,7 @@ async fn test_v1_one_element_array_with_flag_is_enveloped_but_single_tuple_is_no
     let app = test_app().await;
     let (status, json) = post_json(
         app.clone(),
-        "/context/v1?allowFailure=true",
+        "/context/v5?allowFailure=true",
         encode_batch(&[(USDC, WCOIN)]),
     )
     .await;
@@ -2261,7 +2289,7 @@ async fn test_v1_one_element_array_with_flag_is_enveloped_but_single_tuple_is_no
 
     let (status, json) = post_json(
         app,
-        "/context/v1?allowFailure=true",
+        "/context/v5?allowFailure=true",
         encode_single(USDC, WCOIN),
     )
     .await;
@@ -2275,7 +2303,7 @@ async fn test_v1_one_element_array_with_flag_is_enveloped_but_single_tuple_is_no
 async fn test_v1_partial_envelope_is_counted_as_partial_outcome() {
     let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
     let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM)]);
-    let (status, _) = post_json(app.clone(), "/context/v1?allowFailure=true", mixed).await;
+    let (status, _) = post_json(app.clone(), "/context/v5?allowFailure=true", mixed).await;
     assert_eq!(status, 200);
 
     let resp = app
@@ -2301,10 +2329,10 @@ async fn test_v1_partial_envelope_is_counted_as_partial_outcome() {
         .lines()
         .find(|l| {
             l.starts_with("oracle_context_request_total{")
-                && l.contains(r#"endpoint="v1""#)
+                && l.contains(r#"endpoint="v5""#)
                 && l.contains(r#"outcome="partial""#)
         })
-        .unwrap_or_else(|| panic!("no partial outcome sample for v1 in:\n{text}"));
+        .unwrap_or_else(|| panic!("no partial outcome sample for v5 in:\n{text}"));
     let count: f64 = line.rsplit(' ').next().unwrap().parse().unwrap();
     assert!(count >= 1.0, "{line}");
 }
@@ -2323,23 +2351,22 @@ async fn test_v1_strict_batch_resolve_error_wins_over_earlier_build_error() {
     // slot 1: unknown token (resolve-phase 400)
     let body = encode_batch(&[(USDC, WDRAM), (USDC, unknown)]);
 
-    let (status, json) = post_json(app.clone(), "/context/v1", body.clone()).await;
+    let (status, json) = post_json(app.clone(), "/context/v5", body.clone()).await;
     assert_eq!(status, 400, "resolve error must win in strict mode: {json}");
     let err: ErrorResponse = serde_json::from_value(json).unwrap();
     assert_eq!(err.error, "bad_request");
 
-    let (status, json) = post_json(app, "/context/v1?allowFailure=true", body).await;
+    let (status, json) = post_json(app, "/context/v5?allowFailure=true", body).await;
     assert_eq!(status, 200);
     let items: Vec<BatchItemResponse> = serde_json::from_value(json).unwrap();
     assert!(matches!(&items[0], BatchItemResponse::Error(e) if e.error == "no_live_quote"));
     assert!(matches!(&items[1], BatchItemResponse::Error(e) if e.error == "bad_request"));
 }
 
-const PAIR_BOUND_ENDPOINTS: [&str; 4] =
-    ["/context/v4", "/context/v5", "/context/v6", "/context/v7"];
+const PAIR_BOUND_ENDPOINTS: [&str; 3] = ["/context/v5", "/context/v6", "/context/v7"];
 
 /// Pair-bound schemas share one pipeline, so one route-level sweep pins
-/// all four: a batch with `allowFailure=true` is `200`, one slot per
+/// all three: a batch with `allowFailure=true` is `200`, one slot per
 /// item in request order, ok slots byte-identical to the strict single
 /// response for the same pair (so the schema-specific slots 6/7/8/9 are
 /// intact), failed slots carrying the per-item error code.
@@ -2525,13 +2552,7 @@ async fn test_v7_partial_envelope_is_counted_as_partial_outcome() {
     );
 }
 
-const ALL_ENDPOINTS: [&str; 5] = [
-    "/context/v1",
-    "/context/v4",
-    "/context/v5",
-    "/context/v6",
-    "/context/v7",
-];
+const ALL_ENDPOINTS: [&str; 3] = ["/context/v5", "/context/v6", "/context/v7"];
 
 /// The other resolve-phase failure: an IO index outside the order's
 /// `validInputs` / `validOutputs`. Per-item in envelope mode (with the
@@ -2693,7 +2714,7 @@ async fn test_item_counter_reaches_metrics_for_every_path() {
         counter_value(
             text,
             "oracle_context_item_total",
-            &[("endpoint", "v1"), ("outcome", outcome)],
+            &[("endpoint", "v5"), ("outcome", outcome)],
         )
     };
     let grew_by_at_least = |before: &str, after: &str, outcome: &str, n: f64| {
@@ -2704,7 +2725,7 @@ async fn test_item_counter_reaches_metrics_for_every_path() {
     // Envelope, mixed: every slot counted under its own code.
     let before = scrape_metrics(app.clone()).await;
     let mixed = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM), (USDC, unknown), (WCOIN, USDC)]);
-    let (status, _) = post_json(app.clone(), "/context/v1?allowFailure=true", mixed.clone()).await;
+    let (status, _) = post_json(app.clone(), "/context/v5?allowFailure=true", mixed.clone()).await;
     assert_eq!(status, 200);
     let after = scrape_metrics(app.clone()).await;
     grew_by_at_least(&before, &after, "ok", 2.0);
@@ -2713,7 +2734,7 @@ async fn test_item_counter_reaches_metrics_for_every_path() {
 
     // Strict, mixed: the aborting error (resolve wins → bad_request).
     let before = after;
-    let (status, _) = post_json(app.clone(), "/context/v1", mixed).await;
+    let (status, _) = post_json(app.clone(), "/context/v5", mixed).await;
     assert_eq!(status, 400);
     let after = scrape_metrics(app.clone()).await;
     grew_by_at_least(&before, &after, "bad_request", 1.0);
@@ -2722,7 +2743,7 @@ async fn test_item_counter_reaches_metrics_for_every_path() {
     let before = after;
     let (status, _) = post_json(
         app.clone(),
-        "/context/v1",
+        "/context/v5",
         encode_batch(&[(USDC, WCOIN), (WCOIN, USDC), (USDC, WCOIN)]),
     )
     .await;
@@ -2732,7 +2753,7 @@ async fn test_item_counter_reaches_metrics_for_every_path() {
 
     // Strict, single tuple failing in the build phase: one error.
     let before = after;
-    let (status, _) = post_json(app.clone(), "/context/v1", encode_single(USDC, WDRAM)).await;
+    let (status, _) = post_json(app.clone(), "/context/v5", encode_single(USDC, WDRAM)).await;
     assert_eq!(status, 503);
     let after = scrape_metrics(app.clone()).await;
     grew_by_at_least(&before, &after, "no_live_quote", 1.0);
@@ -2741,7 +2762,7 @@ async fn test_item_counter_reaches_metrics_for_every_path() {
     let before = after;
     let (status, _) = post_json(
         app.clone(),
-        "/context/v1?allowFailure=true",
+        "/context/v5?allowFailure=true",
         encode_batch(&[(USDC, WDRAM), (USDC, unknown)]),
     )
     .await;
@@ -2751,7 +2772,7 @@ async fn test_item_counter_reaches_metrics_for_every_path() {
         counter_value(
             t,
             "oracle_context_request_total",
-            &[("endpoint", "v1"), ("outcome", "failed")],
+            &[("endpoint", "v5"), ("outcome", "failed")],
         )
     };
     assert!(failed(&after) - failed(&before) >= 1.0);
@@ -2764,7 +2785,7 @@ async fn test_item_counter_reaches_metrics_for_every_path() {
 #[tokio::test]
 async fn test_metrics_help_text_describes_both_context_counters() {
     let app = test_app().await;
-    let (status, _) = post_json(app.clone(), "/context/v1", encode_single(USDC, WCOIN)).await;
+    let (status, _) = post_json(app.clone(), "/context/v5", encode_single(USDC, WCOIN)).await;
     assert_eq!(status, 200);
     let text = scrape_metrics(app).await;
 
