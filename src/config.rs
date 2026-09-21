@@ -195,25 +195,10 @@ mod tests {
         "#;
 
     #[test]
-    fn committed_robinhood_config_serves_the_launch_pair_and_the_sgov_probe() {
-        // The Robinhood (4663) deployment serves wtDNUT, wtFGI and the wtSGOV
-        // probe and nothing else: the three symbols st0x.pricing publishes on
-        // 4663 in production after the 2026-09-11 incident. wtSGOV is there
-        // because its NAV differs between chains, which the parity board
-        // needs to see; it has no Robinhood orders. A row for a symbol pricing does not
-        // publish sits in the missing-symbols count forever; a missing row
-        // leaves a launch order unquotable. Both directions are caught here,
-        // and the addresses are pinned so a drift against pricing / bebop /
-        // raindex-deploy (all of which carry the same two) fails loudly.
-        //
-        // The two literals are NOT self-referential: they are the
-        // `wrappedTokenVault` leg of `productionTokensRobinhood()` in
-        // st0x.deploy src/lib/LibTokenInvariants.sol at
-        // f2dfe564cfb4b0b50408db7746de35eb1ccd2bb1 ("SGOV" row L719-722,
-        // "DNUT" row L983-986, "FGI" row L1007-1010), and each answered its
-        // symbol() and decimals() 18 on 4663 (DNUT/FGI at block 62027864,
-        // SGOV at 62700704). The same citation sits next to the rows in
-        // deploy/config/robinhood.toml.
+    fn committed_robinhood_config_serves_exactly_its_five_pinned_rows() {
+        // Exact membership catches both unpriced registry rows and orders whose
+        // token is missing here. Independent address literals also catch an
+        // accidental substitution in the committed config.
         let text = include_str!("../deploy/config/robinhood.toml");
         let cfg: Config = toml::from_str(text).expect("robinhood config must parse");
         cfg.validate().expect("robinhood config must validate");
@@ -233,6 +218,14 @@ mod tests {
                 (
                     "wtFGI".to_string(),
                     "0x685dfd386968b58d895f934485820c479c79a8bb".to_string()
+                ),
+                (
+                    "wtGRND".to_string(),
+                    "0xb80bd4d599eebbf2851d4e7f5594918b82ff1823".to_string()
+                ),
+                (
+                    "wtPLBY".to_string(),
+                    "0xbe127eed812dc1f622227fadc8639d4138b47b2e".to_string()
                 ),
                 (
                     "wtSGOV".to_string(),

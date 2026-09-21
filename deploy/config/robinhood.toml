@@ -15,14 +15,6 @@
 # There is no staging twin; split this into robinhood-staging.toml /
 # robinhood-production.toml if one is ever added and the two diverge.
 #
-# The registry below is the live 4663 deployment, cut to the two launch
-# tokens plus the wtSGOV probe (see the token registry comment). Every
-# address was read back from the chain before it was committed: `symbol()`
-# matches its row and `decimals()` is 18 for all three, and the quote
-# token answers "USDG"
-# ("Global Dollar") with 6 decimals (2026-09-11, via
-# rpc.mainnet.chain.robinhood.com).
-#
 # TWO PROPERTIES MUST HOLD BEFORE THIS DEPLOYMENT SIGNS ANYTHING. Both
 # are correctness, not polish, and both now hold in this binary:
 #
@@ -94,48 +86,11 @@ consumer = "oracle"
 # are st0x.pricing asset names and are chain-independent; only the
 # addresses change.
 #
-# Three rows: wtDNUT and wtFGI, the Robinhood launch pair, plus wtSGOV as
-# a PROBE, exactly the three symbols st0x.pricing publishes on 4663 in
-# production. wtSGOV's Base vault has accrued NAV and its 4663 vault has
-# not, so it is the one symbol whose signed price must differ between the
-# Base oracle and this one; that difference is what proves the pricing
-# fan-out fix (#105) live. No Robinhood orders or funding exist for SGOV.
-#
-# HISTORY. This file carried all 48 of pricing's symbols when it was
-# merged (#82). On 2026-09-11 pricing published those 48 on 4663 alongside
-# Base and a WebSocket fan-out bug had the Base oracle sign Robinhood's
-# NAV for Base orders (ST0x-Technology/incident-11-09-26, ~$178k). The
-# service was never released with the 48, and the rollout is now one
-# symbol pair at a time behind a strategy-level volume cap and an
-# external watchdog. The other 46 addresses are in git history.
-#
-# A row here for a symbol pricing does not publish on 4663 sits
-# permanently in the missing-symbols count on /status and blunts the alert
-# that catches a wedged feed, so add rows only as pricing adds them.
-#
-# PROVENANCE, independently auditable:
-#   Source of all three addresses: st0x.deploy `src/lib/LibTokenInvariants.sol`
-#   at commit f2dfe564cfb4b0b50408db7746de35eb1ccd2bb1 (main, 2026-09-12),
-#   `productionTokensRobinhood()` (L1402), `wrappedTokenVault` leg of the
-#   "SGOV" row (L719-722), the "DNUT" row (L983-986) and the "FGI" row
-#   (L1007-1010).
-#   On-chain at 4663 block 62027864 (rpc.mainnet.chain.robinhood.com):
-#     0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826 symbol() "wtDNUT"
-#       decimals() 18, asset() 0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9,
-#       convertToAssets(1e18) 1e18
-#     0x685DFd386968B58D895F934485820C479C79a8bB symbol() "wtFGI"
-#       decimals() 18, asset() 0xfEa217600e2b00bBB2172a99345016a0cEb7d29f,
-#       convertToAssets(1e18) 1e18
-#   On-chain at 4663 block 62700704 (2026-09-14):
-#     0x06b17E431a957Dd8522Bf106653BAc6B39F437E6 symbol() "wtSGOV"
-#       decimals() 18, asset() 0x344147366F648640076d363FAF659c214788E99d,
-#       convertToAssets(1e18) 1e18 (Base's wtSGOV read 1.010890749 the
-#       same day: that gap is the probe)
-#
-# RELEASE. The first Robinhood rollout must be a NEW tag cut after this
-# merges (v1.3.0), dispatched as `robinhood-release` version=v1.3.0.
-# NEVER dispatch v1.2.0: the workflow checks out BOTH image and this file
-# from the tag, and v1.2.0's copy is the 48-token registry.
+# wtSGOV exercises differing cross-chain NAVs. Deploy pricing before this
+# config or /status will report missing symbols. For a config-only rollout,
+# dispatch `robinhood-release` from the default branch with an empty version;
+# tagged rollouts pin both image and config. Verify all five symbols with none
+# missing before applying orders.
 # ----------------------------------------------------------------------------
 
 [[tokens]]
@@ -150,3 +105,11 @@ symbol = "wtFGI"
 [[tokens]]
 address = "0x06b17E431a957Dd8522Bf106653BAc6B39F437E6"
 symbol = "wtSGOV"
+
+[[tokens]]
+address = "0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"
+symbol = "wtGRND"
+
+[[tokens]]
+address = "0xBe127eeD812DC1F622227FAdc8639d4138B47b2e"
+symbol = "wtPLBY"
