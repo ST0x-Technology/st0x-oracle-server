@@ -1,0 +1,19 @@
+name: Externally merged label
+
+# The Graphite merge queue closes PRs instead of merging them, so Linear never
+# sees a merge. The shared workflow labels those PRs `externally-merged`.
+# Logic lives in ST0x-Technology/.github; bump the pinned SHA via PR.
+
+on:
+  pull_request:
+    types: [closed]
+  push:
+    branches: [main]
+
+jobs:
+  externally-merged:
+    uses: ST0x-Technology/.github/.github/workflows/externally-merged.yml@3f1d909536c90ac6ea14cab4a2d9932f2282069b
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
