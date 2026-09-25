@@ -346,6 +346,13 @@ Rules:
 The flag applies to all `/context/v*` endpoints. The key is case-sensitive.
 Unknown query keys are ignored.
 
+A batch with the flag builds its items concurrently, up to 10 at a time
+(hardcoded). Signing is the slow step, so a slow or unavailable signer costs one
+wait per group of 10 items rather than one wait per item: a batch of 10 or fewer
+pays one wait, a batch of 11 pays two. A batch without the flag stops at the
+first failure, so it stays sequential. This applies to v5, v6 and v7 only,
+because v1 and v4 refuse new signatures and never sign.
+
 Do not put the flag in the on-chain oracle meta URL of an order. A client that
 does not understand the item format cannot parse the response. The client adds
 the flag itself when it supports the format.

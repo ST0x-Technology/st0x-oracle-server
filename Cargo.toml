@@ -65,6 +65,11 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 wasm-bindgen = "=0.2.100"
 
 [dev-dependencies]
+# `test-util` for `#[tokio::test(start_paused = true)]`: the concurrency
+# test for envelope batches asserts on elapsed time, and a paused clock
+# makes that exact instead of a race against CI load. `full` above does
+# NOT include it, and dev-dependencies never reach a release build.
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Thread-local DebuggingRecorder for exact metric assertions. The
