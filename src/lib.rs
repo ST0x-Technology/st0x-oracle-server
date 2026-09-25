@@ -7,6 +7,7 @@ pub mod pricing_client;
 pub mod registry;
 pub mod reuse;
 pub mod sign;
+pub mod token_file;
 
 use alloy::primitives::{Address, B256};
 use alloy::sol;

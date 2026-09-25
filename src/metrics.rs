@@ -57,6 +57,23 @@ impl MetricsHandle {
     }
 
     fn declare() {
+        metrics::describe_gauge!(
+            "oracle_registry_tokens",
+            "Token rows this instance loaded from the token file at boot."
+        );
+        metrics::describe_gauge!(
+            "oracle_registry_pending_restart",
+            "1 when the latest token file in the bucket differs from what this instance runs. \
+             It is not applied live; a release picks it up."
+        );
+        metrics::describe_gauge!(
+            "oracle_registry_invalid",
+            "1 when the latest token file in the bucket would be REFUSED at boot."
+        );
+        metrics::describe_counter!(
+            "oracle_registry_fetch_errors_total",
+            "Failed reads of the token file from the bucket."
+        );
         metrics::describe_counter!(
             "oracle_context_request_total",
             "Signed-context requests received, labelled by endpoint (v1 / v4 / v5 / v6 / v7) and outcome: \
