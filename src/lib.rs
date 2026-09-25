@@ -779,7 +779,7 @@ async fn post_signed_context_pair_bound(
                 .registry
                 .resolve(input_token, output_token)
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
-            tracing::info!(
+            tracing::trace!(
                 symbol = %pair.symbol,
                 direction = pair.direction.as_str(),
                 input = %input_token,
@@ -955,7 +955,7 @@ fn resolve_pair_for_order(
         .resolve(input_token, output_token)
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
-    tracing::info!(
+    tracing::trace!(
         symbol = %pair.symbol,
         direction = pair.direction.as_str(),
         input = %input_token,
@@ -1146,6 +1146,19 @@ impl RefusalPhase {
     }
 }
 
+/// Log a refusal. At admission it is the normal answer while a market is
+/// closed and repeats on every poll, so it goes to TRACE; a quote that dies
+/// later in the request is a race worth seeing, so it stays at WARN.
+macro_rules! log_refusal {
+    ($phase:expr, $($event:tt)+) => {
+        if $phase == RefusalPhase::Admission {
+            tracing::trace!($($event)+)
+        } else {
+            tracing::warn!($($event)+)
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnavailableReason {
     NoLiveQuote,
@@ -1184,7 +1197,8 @@ fn unavailable(
 fn no_live_quote_at(endpoint: &'static str, symbol: &str, phase: RefusalPhase) -> AppError {
     let reason = UnavailableReason::NoLiveQuote;
     let detail = format!("No live quote for {symbol}.");
-    tracing::warn!(
+    log_refusal!(
+        phase,
         reason = reason.code(),
         endpoint,
         symbol,
@@ -1206,7 +1220,8 @@ fn expired_quote_at(
     detail: String,
 ) -> AppError {
     let reason = UnavailableReason::ExpiredQuote;
-    tracing::warn!(
+    log_refusal!(
+        phase,
         reason = reason.code(),
         endpoint,
         symbol,
@@ -1249,7 +1264,8 @@ fn validate_expiry_deadline(
         return Ok(());
     }
 
-    tracing::warn!(
+    log_refusal!(
+        phase,
         reason = UnavailableReason::ExpiredQuote.code(),
         phase = phase.label(),
         endpoint,
@@ -1363,7 +1379,7 @@ async fn build_response_from_quote(
         RefusalPhase::PostSign,
     )?;
 
-    tracing::info!(
+    tracing::trace!(
         symbol = %pair.symbol,
         direction = pair.direction.as_str(),
         schema = "v1",
@@ -1555,7 +1571,7 @@ async fn build_response_from_quote_pair_bound(
                 RefusalPhase::PreReuseReturn,
             )?;
             ::metrics::counter!("oracle_signature_reuse_total").increment(1);
-            tracing::info!(
+            tracing::trace!(
                 symbol = %pair.symbol,
                 direction = pair.direction.as_str(),
                 schema = schema.tag(),
@@ -1610,7 +1626,7 @@ async fn build_response_from_quote_pair_bound(
             .reuse
             .store(key, expiry, response.clone(), quote.generation());
     }
-    tracing::info!(
+    tracing::trace!(
         symbol = %pair.symbol,
         direction = pair.direction.as_str(),
         schema = schema.tag(),
@@ -1681,15 +1697,17 @@ impl AppError {
         }
     }
 
-    /// Log this error at the severity the whole-request path has always
-    /// used: `error!` for internal failures (with the full anyhow chain),
-    /// `warn!` for client errors. `Unavailable` is already logged with
-    /// structured fields where the refusal is decided, so it is not
-    /// logged again here.
+    /// Log this error: `error!` for internal failures (with the full anyhow
+    /// chain), `trace!` for client errors, since one broken caller repeats
+    /// the same bad body several times a second and
+    /// `oracle_context_request_total` already counts them. `Unavailable` is
+    /// not logged here: refusals decided on a live quote log where they are
+    /// decided, and legacy-schema refusals are counted by
+    /// `oracle_quote_refusals_total` only.
     pub fn log(&self) {
         match self {
             AppError::Internal(err) => tracing::error!("Internal error: {:?}", err),
-            AppError::BadRequest(detail) => tracing::warn!("Bad request: {}", detail),
+            AppError::BadRequest(detail) => tracing::trace!("Bad request: {}", detail),
             AppError::Unavailable { .. } => {}
         }
     }
@@ -1697,7 +1715,8 @@ impl AppError {
     /// Same severities as `log`, for a failed slot inside a `200`
     /// envelope. Carries the endpoint and the item's position so an
     /// operator can tie the line to one request in a batch that
-    /// otherwise left no non-2xx trace.
+    /// otherwise left no non-2xx trace. `Unavailable` lines are TRACE for
+    /// the reasons given on `log`.
     pub fn log_batch_item(&self, endpoint: &'static str, index: usize) {
         match self {
             AppError::Internal(err) => tracing::error!(
@@ -1707,14 +1726,14 @@ impl AppError {
                 err
             ),
             AppError::BadRequest(detail) => {
-                tracing::warn!(
+                tracing::trace!(
                     endpoint,
                     index,
                     "Batch item failed (bad request): {}",
                     detail
                 )
             }
-            AppError::Unavailable { reason, detail } => tracing::warn!(
+            AppError::Unavailable { reason, detail } => tracing::trace!(
                 endpoint,
                 index,
                 reason = reason.code(),
