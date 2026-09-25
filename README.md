@@ -116,6 +116,12 @@ addresses in the bottom 2^16 of the address space are rejected as placeholders:
 a config for a chain whose tokens are still deploying fails to load rather than
 booting a registry that resolves nothing.
 
+The deployed configs carry no `[[tokens]]`. A `[registry]` section names T0's
+token file in the bucket (`st0x.registry` `t0/<env>.toml`), and boot takes every
+slot on the config's chain with `pricing = "enabled"`. Production pins the
+object `generation`, so a token change ships with a gated release. Check a config
+in full with `st0x-oracle-server validate <config> --registry-file <tokens.toml>`.
+
 ### Chains
 
 One deployment serves one chain. The chain rides the oracle URL — a deploy-time

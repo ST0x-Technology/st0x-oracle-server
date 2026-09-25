@@ -32,7 +32,12 @@ pub struct Config {
     #[serde(default = "default_quote_token")]
     pub quote_token: String,
 
+    #[serde(default)]
     pub tokens: Vec<TokenEntry>,
+    /// Where `[[tokens]]` comes from when it is NOT in this file: T0's
+    /// token file in the bucket. See `token_file.rs`.
+    #[serde(default)]
+    pub registry: Option<crate::token_file::RegistrySource>,
     pub pricing: PricingConfig,
     #[serde(default)]
     pub signing: SigningConfig,
@@ -107,17 +112,50 @@ fn is_placeholder_address(addr: &Address) -> bool {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
+    /// Read and parse the file, no validation yet.
+    pub fn parse_table(path: &Path) -> anyhow::Result<toml::Table> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read config at {}: {}", path.display(), e))?;
-        let cfg: Config = toml::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {}", path.display(), e))?;
+        toml::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {}", path.display(), e))
+    }
+
+    /// Deserialize and validate a parsed table.
+    pub fn from_table(table: toml::Table) -> anyhow::Result<Self> {
+        if table.contains_key("registry") && !table.contains_key("tokens") {
+            anyhow::bail!(
+                "config reads its tokens from [registry], which have not been merged in; \
+                 load it through token_file::load_into (or pass --registry-file to validate)"
+            );
+        }
+        let cfg: Config = table
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to parse config: {e}"))?;
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Validate everything but the token rows, for a `[registry]` config
+    /// checked without its token file.
+    pub fn from_table_static(table: toml::Table) -> anyhow::Result<Self> {
+        let cfg: Config = table
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to parse config: {e}"))?;
+        cfg.validate_inner(false)?;
+        Ok(cfg)
+    }
+
+    /// Parse and validate a config whose tokens are inline.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        Self::from_table(Self::parse_table(path)?)
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
-        if self.tokens.is_empty() {
+        self.validate_inner(true)
+    }
+
+    fn validate_inner(&self, require_tokens: bool) -> anyhow::Result<()> {
+        if require_tokens && self.tokens.is_empty() {
             anyhow::bail!("config.toml has no [[tokens]] entries");
         }
         let quote = Address::from_str(&self.quote_token)
@@ -198,10 +236,12 @@ mod tests {
     fn committed_robinhood_config_serves_exactly_its_five_pinned_rows() {
         // Exact membership catches both unpriced registry rows and orders whose
         // token is missing here. Independent address literals also catch an
-        // accidental substitution in the committed config.
-        let text = include_str!("../deploy/config/robinhood.toml");
-        let cfg: Config = toml::from_str(text).expect("robinhood config must parse");
-        cfg.validate().expect("robinhood config must validate");
+        // accidental substitution in the token file.
+        let cfg = crate::token_file::load_deployed(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/deploy/config/robinhood.toml"
+        )))
+        .expect("robinhood config must load");
         let mut rows: Vec<(String, String)> = cfg
             .tokens
             .iter()

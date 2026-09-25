@@ -80,13 +80,36 @@ quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 ws_url = "ws://st0x-pricing:8080/ws"
 consumer = "oracle"
 
-# Tokens come from T0's token file in the bucket (st0x.registry
-# t0/production.toml): every slot on this chain with pricing = "enabled", as
-# `wt<SYM>` at its tokenized_equity_derivative (src/token_file.rs).
-# Boot reads the pinned `generation`, so every instance signs for the same
-# tokens and a change ships only with a gated release that bumps it.
-# Running instances report a newer copy on oracle_registry_pending_restart.
-[registry]
-url = "gs://t0-artifacts-tokens/production/tokens.toml"
-generation = 1790341753647581
-refresh_secs = 60
+# --- Robinhood Chain token registry -----------------------------------------
+# The wrapped tokens (wt*, 18 decimals) deployed on 4663, which is what the
+# Base registry lists too — not the tNNN receipt vaults those wrap. Symbols
+# are st0x.pricing asset names and are chain-independent; only the
+# addresses change.
+#
+# wtSGOV exercises differing cross-chain NAVs. Deploy pricing before this
+# config or /status will report missing symbols. For a config-only rollout,
+# dispatch `robinhood-release` from the default branch with an empty version;
+# tagged rollouts pin both image and config. Verify all five symbols with none
+# missing before applying orders.
+# ----------------------------------------------------------------------------
+
+[[tokens]]
+address = "0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826"
+symbol = "wtDNUT"
+
+[[tokens]]
+address = "0x685DFd386968B58D895F934485820C479C79a8bB"
+symbol = "wtFGI"
+
+# Probe row, see the registry comment: same symbol as Base, different NAV.
+[[tokens]]
+address = "0x06b17E431a957Dd8522Bf106653BAc6B39F437E6"
+symbol = "wtSGOV"
+
+[[tokens]]
+address = "0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"
+symbol = "wtGRND"
+
+[[tokens]]
+address = "0xBe127eeD812DC1F622227FAdc8639d4138B47b2e"
+symbol = "wtPLBY"
