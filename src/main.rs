@@ -13,6 +13,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -97,8 +99,15 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+    // Per-request lines are TRACE, so the default keeps this crate's DEBUG
+    // lines and drops TRACE before it leaves the process. Dependencies log
+    // at WARN and above only.
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,st0x_oracle_server=debug".into()),
+        )
+        .with(tracing_stackdriver::layer().with_source_location(false))
         .init();
 
     let cli = Cli::parse();
