@@ -456,9 +456,14 @@ async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<Cl
             None
         }
         ServerFrame::Error(e) => {
-            // Mostly expected refusals while a session is closed; pricing logs its
-            // own failures, and a stale-source eviction logs at WARN below.
-            tracing::trace!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
+            // `ModelError` is mostly the expected refusal while a session is
+            // closed, and a stale source logs at WARN below. Any other code is a
+            // real fault, such as an asset pricing does not know.
+            if matches!(e.code, ErrorCode::ModelError | ErrorCode::StaleSource) {
+                tracing::trace!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
+            } else {
+                tracing::warn!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
+            }
             ::metrics::counter!(
                 "oracle_upstream_failure_total",
                 "kind" => "pricing_error_frame",

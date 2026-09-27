@@ -1700,7 +1700,9 @@ impl AppError {
     /// Log this error: `error!` for internal failures (with the full anyhow
     /// chain), `trace!` for client errors, since one broken caller repeats
     /// the same bad body several times a second and
-    /// `oracle_context_request_total` already counts them. `Unavailable` is
+    /// `oracle_context_item_total{outcome="bad_request"}` counts batch
+    /// items (a whole failed request counts as `error` on
+    /// `oracle_context_request_total`). `Unavailable` is
     /// not logged here: refusals decided on a live quote log where they are
     /// decided, and legacy-schema refusals are counted by
     /// `oracle_quote_refusals_total` only.
