@@ -437,9 +437,8 @@ async fn fetch_id_token(audience: &str) -> Result<String, ClientError> {
 async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<ClientFrame> {
     match frame {
         ServerFrame::Price(p) => {
-            if !p
-                .execution_deadline_unix_ms
-                .is_some_and(|deadline| deadline > 0)
+            if p.execution_deadline_unix_ms
+                .is_none_or(|deadline| deadline <= 0)
             {
                 // A producer fault, not a closed market: every request for
                 // this quote is refused, at TRACE on admission, so warn once a frame.
