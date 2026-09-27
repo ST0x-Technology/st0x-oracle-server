@@ -417,6 +417,42 @@ async fn fetch_id_token(audience: &str) -> Result<String, ClientError> {
     Ok(token.trim().to_string())
 }
 
+/// A price frame without a valid execution deadline is a producer fault, not
+/// a closed market, and every request for that quote is then refused at TRACE
+/// on admission. Count every such frame, and WARN only when a (chain, asset)
+/// goes bad or recovers, so a feed-wide regression cannot flood the log.
+fn note_deadline_validity(chain_id: u64, asset: &str, valid: bool) {
+    static INVALID: std::sync::OnceLock<Mutex<std::collections::HashSet<(u64, String)>>> =
+        std::sync::OnceLock::new();
+    if !valid {
+        ::metrics::counter!(
+            "oracle_upstream_failure_total",
+            "kind" => "missing_execution_deadline",
+        )
+        .increment(1);
+    }
+    let mut invalid = INVALID
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (chain_id, asset.to_string());
+    if valid {
+        if invalid.remove(&key) {
+            tracing::warn!(
+                asset,
+                chain_id,
+                "Price frames carry a valid execution deadline again"
+            );
+        }
+    } else if invalid.insert(key) {
+        tracing::warn!(
+            asset,
+            chain_id,
+            "Price frame has no valid execution deadline"
+        );
+    }
+}
+
 /// Apply one decoded inbound `ServerFrame` to the quote cache and
 /// return the reply frame to send, if the frame demands one (Ping →
 /// Pong). Split out of the socket loop so the cache semantics are unit
@@ -437,6 +473,12 @@ async fn fetch_id_token(audience: &str) -> Result<String, ClientError> {
 async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<ClientFrame> {
     match frame {
         ServerFrame::Price(p) => {
+            note_deadline_validity(
+                p.chain_id,
+                &p.asset,
+                p.execution_deadline_unix_ms
+                    .is_some_and(|deadline| deadline > 0),
+            );
             let q = Quote {
                 asset: p.asset.clone(),
                 chain_id: p.chain_id,
