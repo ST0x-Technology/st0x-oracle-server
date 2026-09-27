@@ -5457,7 +5457,7 @@ dependencies = [
 [[package]]
 name = "st0x-pricing-types"
 version = "0.8.0"
-source = "git+https://github.com/ST0x-Technology/st0x.pricing-types?rev=095334008a46ea44ad54eb1a38e019bfe70bf129#095334008a46ea44ad54eb1a38e019bfe70bf129"
+source = "git+https://github.com/ST0x-Technology/st0x.pricing-types?rev=b8dba737974a4aba449b3d8bbb4765b533df05cf#b8dba737974a4aba449b3d8bbb4765b533df05cf"
 dependencies = [
  "chrono",
  "serde",
