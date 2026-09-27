@@ -1294,8 +1294,6 @@ fn validate_quote_expiry(
     phase: RefusalPhase,
 ) -> Result<(), AppError> {
     let effective_expiry = effective_expiry_unix_ms(quote).map_err(|_| {
-        // A producer fault, not a closed market, so WARN at every phase.
-        tracing::warn!(endpoint, symbol, "Quote has no valid execution deadline");
         expired_quote_at(
             endpoint,
             symbol,

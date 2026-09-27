@@ -14,7 +14,7 @@
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::HeaderValue;
 use st0x_pricing_types::{
-    ClientFrame, ErrorCode, ErrorFrame, PongFrame, Quote, ServerFrame, SubscribeFrame, Symbol,
+    ClientFrame, ErrorCode, PongFrame, Quote, ServerFrame, SubscribeFrame, Symbol,
 };
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -417,19 +417,6 @@ async fn fetch_id_token(audience: &str) -> Result<String, ClientError> {
     Ok(token.trim().to_string())
 }
 
-/// Pricing answers with `ModelError` on every poll while an asset's session
-/// is closed, so those frames go to TRACE. Pricing has no distinct code for
-/// this, so it is told apart by its detail text ("broker trading session is
-/// closed", "no spread config … in Closed session"). A detail that stops
-/// matching falls back to WARN, which is loud rather than silent.
-fn is_closed_session_refusal(frame: &ErrorFrame) -> bool {
-    frame.code == ErrorCode::ModelError
-        && frame
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.to_ascii_lowercase().contains("closed"))
-}
-
 /// Apply one decoded inbound `ServerFrame` to the quote cache and
 /// return the reply frame to send, if the frame demands one (Ping →
 /// Pong). Split out of the socket loop so the cache semantics are unit
@@ -450,6 +437,14 @@ fn is_closed_session_refusal(frame: &ErrorFrame) -> bool {
 async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<ClientFrame> {
     match frame {
         ServerFrame::Price(p) => {
+            if !p
+                .execution_deadline_unix_ms
+                .is_some_and(|deadline| deadline > 0)
+            {
+                // A producer fault, not a closed market: every request for
+                // this quote is refused, at TRACE on admission, so warn once a frame.
+                tracing::warn!(asset = %p.asset, chain_id = p.chain_id, "Price frame has no valid execution deadline");
+            }
             let q = Quote {
                 asset: p.asset.clone(),
                 chain_id: p.chain_id,
@@ -469,11 +464,7 @@ async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<Cl
             None
         }
         ServerFrame::Error(e) => {
-            if is_closed_session_refusal(&e) {
-                tracing::trace!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
-            } else {
-                tracing::warn!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
-            }
+            tracing::warn!(?e.code, asset = ?e.asset, detail = ?e.detail, "Pricing server error frame");
             ::metrics::counter!(
                 "oracle_upstream_failure_total",
                 "kind" => "pricing_error_frame",
@@ -887,42 +878,6 @@ mod tests {
                 cached(&cache, CONFIGURED, "COIN").await.is_some(),
                 "{code:?} must not evict this quote"
             );
-        }
-    }
-
-    #[test]
-    fn only_closed_session_model_errors_are_routine() {
-        let frame = |code, detail: Option<&str>| ErrorFrame {
-            code,
-            asset: Some("COIN".to_string()),
-            last_ok_unix_ms: None,
-            detail: detail.map(str::to_string),
-        };
-        assert!(is_closed_session_refusal(&frame(
-            ErrorCode::ModelError,
-            Some("broker trading session is closed"),
-        )));
-        assert!(is_closed_session_refusal(&frame(
-            ErrorCode::ModelError,
-            Some("no spread config for COIN in Closed session"),
-        )));
-        assert!(!is_closed_session_refusal(&frame(
-            ErrorCode::ModelError,
-            Some("invalid quote"),
-        )));
-        assert!(!is_closed_session_refusal(&frame(
-            ErrorCode::ModelError,
-            None
-        )));
-        for code in [
-            ErrorCode::StaleSource,
-            ErrorCode::UnknownAsset,
-            ErrorCode::Internal,
-        ] {
-            assert!(!is_closed_session_refusal(&frame(
-                code,
-                Some("broker trading session is closed"),
-            )));
         }
     }
 
