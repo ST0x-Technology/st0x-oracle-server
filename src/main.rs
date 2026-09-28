@@ -8,6 +8,7 @@ use st0x_oracle_server::metrics::MetricsHandle;
 use st0x_oracle_server::pricing_client::{LiveClient, LiveClientConfig};
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
+use st0x_oracle_server::token_file;
 use st0x_oracle_server::{create_app, AppState};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,12 +21,18 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "st0x-oracle-server")]
 #[command(about = "Signed context oracle server for st0x tokenized equities.\n\
-    Run `st0x-oracle-server validate [path]` to check a config file and exit.")]
+    Run `st0x-oracle-server validate [path] [--registry-file PATH]` to check a config file and exit.")]
 struct Cli {
     /// Path to config.toml. Contains port, pricing connection, and the
     /// token registry — everything except secrets.
     #[arg(long, default_value = "config.toml", env = "CONFIG_PATH")]
     config: PathBuf,
+
+    /// Read T0's token file from PATH instead of the bucket named in the
+    /// config's [registry]. For running locally; the deployed service
+    /// always reads the bucket.
+    #[arg(long, value_name = "PATH")]
+    registry_file: Option<PathBuf>,
 
     /// Private key for EIP-191 signing (hex, with or without 0x prefix).
     /// Local dev / tests only — production uses --signer-kms-key. Exactly
@@ -75,28 +82,18 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // `st0x-oracle-server validate [path]` — parse + validate a config file
-    // with the real Config::load rules and exit. Dispatched before clap so
+    // with the rules boot uses and exit. Dispatched before clap so
     // the serve-only required flags (pricing/Alpaca creds) are not needed:
     // CI validates candidate configs by running the shipped image with no
     // env at all. Path resolution mirrors --config: positional arg, then
     // CONFIG_PATH, then ./config.toml.
     let mut argv = std::env::args();
     if argv.nth(1).as_deref() == Some("validate") {
-        let path = argv
-            .next()
+        let (path, registry_file) = validate_args(argv)?;
+        let path = path
             .or_else(|| std::env::var("CONFIG_PATH").ok())
             .unwrap_or_else(|| "config.toml".to_string());
-        let config = Config::load(std::path::Path::new(&path))?;
-        // The chain id is in the output because /context/v7 signs it: a
-        // config that inherits the 8453 default on a non-Base plane is a
-        // signing fault the reviewer of a config PR can now see.
-        println!(
-            "{path}: OK ({} tokens, chain {}, quote token {})",
-            config.tokens.len(),
-            config.chain_id,
-            config.quote_token
-        );
-        return Ok(());
+        return validate(&path, registry_file.as_deref());
     }
 
     // Per-request lines are TRACE, so the default keeps this crate's DEBUG
@@ -117,7 +114,33 @@ async fn main() -> anyhow::Result<()> {
     // would otherwise no-op. Matches the bebop / pricing pattern.
     let metrics = MetricsHandle::install()?;
 
-    let config = Config::load(&cli.config)?;
+    // The token rows may live in the bucket rather than in the file. Merge
+    // them in before validation so the config is checked whole.
+    let mut table = Config::parse_table(&cli.config)?;
+    let static_table = table.clone();
+    let registry = token_file::source_of(&table)?;
+    let registry_live = match &registry {
+        Some(source) => {
+            let projection =
+                token_file::load_into(&mut table, source, cli.registry_file.as_deref()).await?;
+            tracing::info!(
+                url = %source.url,
+                generation = ?source.generation,
+                from_file = cli.registry_file.is_some(),
+                tokens = projection.tokens.len(),
+                "tokens loaded from the token file"
+            );
+            metrics::gauge!("oracle_registry_tokens").set(projection.tokens.len() as f64);
+            Some(projection)
+        }
+        None => None,
+    };
+    let config = Config::from_table(table)?;
+    if let (Some(source), Some(live)) = (registry, registry_live) {
+        if cli.registry_file.is_none() {
+            token_file::spawn_refresh(static_table, live, source);
+        }
+    }
     tracing::info!(
         config = %cli.config.display(),
         port = config.port,
@@ -250,4 +273,102 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// The arguments after `validate`: one optional config path and an
+/// optional `--registry-file PATH`. An unknown flag or a second path is
+/// refused, so a misspelled flag cannot pass as a static-only check.
+fn validate_args(
+    mut args: impl Iterator<Item = String>,
+) -> anyhow::Result<(Option<String>, Option<PathBuf>)> {
+    let mut path = None;
+    let mut registry_file = None;
+    while let Some(arg) = args.next() {
+        if arg == "--registry-file" {
+            let file = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--registry-file needs a path"))?;
+            if registry_file.replace(PathBuf::from(file)).is_some() {
+                anyhow::bail!("validate takes one --registry-file");
+            }
+        } else if arg.starts_with("--") {
+            anyhow::bail!("validate: unknown flag {arg}");
+        } else if path.replace(arg).is_some() {
+            anyhow::bail!("validate takes one config path");
+        }
+    }
+    Ok((path, registry_file))
+}
+
+/// `validate [path] [--registry-file PATH]`. A config that reads its tokens
+/// from the bucket is checked in full only with a copy of the token file;
+/// without one, everything else is checked and the output says so.
+fn validate(path: &str, registry_file: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let mut table = Config::parse_table(std::path::Path::new(path))?;
+    let config = match (token_file::source_of(&table)?, registry_file) {
+        (None, _) => Config::from_table(table)?,
+        (Some(_), Some(file)) => {
+            let bytes = std::fs::read(file).map_err(|e| {
+                anyhow::anyhow!("reading the token file at {}: {e}", file.display())
+            })?;
+            token_file::merge_bytes(&mut table, &bytes)?;
+            println!("registry: tokens taken from {}", file.display());
+            Config::from_table(table)?
+        }
+        (Some(source), None) => {
+            let config = Config::from_table_static(table)?;
+            println!(
+                "registry: tokens NOT validated here. They come from {} at boot; \
+                 pass --registry-file to check them.",
+                source.url
+            );
+            config
+        }
+    };
+    // The chain id is in the output because /context/v7 signs it: a config
+    // that inherits the 8453 default on a non-Base plane is a signing fault
+    // the reviewer of a config PR can now see.
+    let tokens = if config.tokens.is_empty() {
+        "static part".to_string()
+    } else {
+        format!("{} tokens", config.tokens.len())
+    };
+    println!(
+        "{path}: OK ({tokens}, chain {}, quote token {})",
+        config.chain_id, config.quote_token
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> anyhow::Result<(Option<String>, Option<PathBuf>)> {
+        validate_args(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn validate_args_take_one_path_and_one_registry_file() {
+        assert_eq!(args(&[]).unwrap(), (None, None));
+        assert_eq!(
+            args(&["cfg.toml", "--registry-file", "t.toml"]).unwrap(),
+            (Some("cfg.toml".into()), Some(PathBuf::from("t.toml")))
+        );
+        for (bad, want) in [
+            (
+                &["--registry-fil", "t.toml", "cfg.toml"][..],
+                "unknown flag",
+            ),
+            (&["a.toml", "b.toml"][..], "one config path"),
+            (&["--registry-file"][..], "needs a path"),
+            (
+                &["--registry-file", "a", "--registry-file", "b"][..],
+                "one --registry-file",
+            ),
+        ] {
+            let err = args(bad).unwrap_err().to_string();
+            assert!(err.contains(want), "{bad:?}: {err}");
+        }
+    }
 }

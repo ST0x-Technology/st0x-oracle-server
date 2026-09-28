@@ -116,6 +116,13 @@ addresses in the bottom 2^16 of the address space are rejected as placeholders:
 a config for a chain whose tokens are still deploying fails to load rather than
 booting a registry that resolves nothing.
 
+The deployed configs carry no `[[tokens]]`. A `[registry]` section names T0's
+token file in the bucket (`st0x.registry` `t0/<env>.toml`), and boot takes every
+slot on the config's chain with `pricing = "enabled"` and `raindex` in its
+`venues`. Production pins the
+object `generation`, so a token change ships with a gated release. Check a config
+in full with `st0x-oracle-server validate <config> --registry-file <tokens.toml>`.
+
 ### Chains
 
 One deployment serves one chain. The chain rides the oracle URL — a deploy-time
@@ -140,15 +147,14 @@ can't be re-pointed without rewriting the strategy.
 Robinhood Chain settles in USDG (Global Dollar), not Circle USDC — Circle's USDC
 is deployed there too and is not what the chain settles in.
 
-Robinhood Chain is staged, not live. Its registry is deliberately three wt
-tokens, wtDNUT and wtFGI plus the wtSGOV probe: exactly the set st0x.pricing
-publishes on 4663 in production after the 2026-09-11 incident, every address
-read back from the chain (provenance and a fixed-block observation are recorded
-next to the rows in `deploy/config/robinhood.toml`). The other deployed tokens
-return one pair at a time. The first Robinhood rollout must be dispatched from a
-NEW tag cut after the two-token config merged (v1.3.0); `robinhood-release`
-reads both the image and the config from the tag, so dispatching v1.2.0 would
-deploy the old 48-token file.
+Robinhood Chain is staged, not live. Its tokens are whatever the production
+token file prices for raindex on chain 4663 (five wt tokens at the pinned
+generation: wtDNUT, wtFGI, wtGRND, wtPLBY and the wtSGOV probe), the same set
+st0x.pricing publishes there; `tests/fixtures/tokens-production.toml` is the
+snapshot the tests check against. `robinhood-release` reads both the image and
+the config from the tag, so a rollout must be dispatched from a tag cut after
+`deploy/config/robinhood.toml` switched to `[registry]`; an older tag would
+deploy its inline rows.
 
 #### The chain is in the signature (v7)
 
@@ -189,9 +195,9 @@ before any grant is requested.
 
 #### Robinhood Chain: what is done and what is not
 
-Done in this repo: the config (two wt tokens, wtDNUT and wtFGI,
-`chain_id = 4663`, USDG quote token), the PR-time validation, and the release
-workflow. The binary reads only the pricing frames stamped with its own
+Done in this repo: the config (`chain_id = 4663`, USDG quote token, its
+tokens read from the production token file as described above), the PR-time
+validation, and the release workflow. The binary reads only the pricing frames stamped with its own
 `chain_id` (RAI-2130), so Base and Robinhood frames for one symbol no longer
 collide.
 
@@ -201,12 +207,10 @@ tag that carries it.
 
 Not done, and it gates signing:
 
-- **st0x.pricing must publish chain 4663 for the same two symbols.** Production
-  pricing pulled 4663 on 2026-09-11 (st0x.pricing #104); st0x.pricing #107
-  re-adds it with wtDNUT and wtFGI only, behind the fan-out fix (#105) and a
-  staging soak. Until that lands a Robinhood oracle pointed at production
-  pricing connects, subscribes, and serves nothing: both symbols sit in the
-  missing-symbols count on `/status`.
+- **st0x.pricing must publish chain 4663 for every token the file prices
+  there.** Both read the same token file, so the sets match once pricing reads
+  it too (st0x.pricing #221). Until then any symbol pricing does not publish
+  on 4663 sits in the missing-symbols count on `/status` and is not signed.
 
 #### GCP prerequisites
 
