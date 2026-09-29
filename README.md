@@ -294,9 +294,18 @@ matching the request:
 ```
 
 If the requested symbol has no usable pricing quote, executable schemas return
-HTTP 503 with one of two stable machine-readable `error` values: `no_live_quote`
-when the cache has no live entry, or `expired_quote` when the cached quote has
-reached its exclusive expiry deadline. `detail` is for humans; clients must
+HTTP 503 with one of three stable machine-readable `error` values: `no_live_quote`
+when the cache has no live entry, `expired_quote` when the cached quote has
+reached its exclusive expiry deadline, or `market_closed` when the US market is
+closed (overnight, weekends, holidays). A `market_closed` answer says when to
+come back: a `Retry-After` header with the seconds until the next session opens,
+and the same in the body as `next_open` (RFC 3339, UTC) and `retry_after_s`.
+Clients should wait until then rather than poll:
+
+```json
+{ "error": "market_closed", "detail": "The US market is closed; the next session opens at 2026-09-29T08:00:00Z.", "next_open": "2026-09-29T08:00:00Z", "retry_after_s": 21600 }
+```
+ `detail` is for humans; clients must
 match `error` exactly. Without the `allowFailure` flag (see below) a batch fails
 as one request and never returns a partial response array. Schemas v5, v6, and
 v7 encode the earlier of the pricing frame's freshness expiry and execution
@@ -332,7 +341,8 @@ context or an error, in request order:
 ```
 
 The `error` codes are the same as the HTTP error bodies: `bad_request`,
-`no_live_quote`, `expired_quote`, `legacy_schema`, and `internal_error`. The
+`no_live_quote`, `expired_quote`, `market_closed` (with `next_open` and
+`retry_after_s`), `legacy_schema`, and `internal_error`. The
 expiry check at the end of a batch also applies per item: a slot that expired
 while the batch signed is an error item, and the other slots are still
 delivered.
