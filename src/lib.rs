@@ -217,14 +217,23 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
 /// for a body over the default 2 MiB limit. The batch envelope
 /// (`allowFailure=true`) reuses the same shape per failed item, so it is
 /// public and round-trippable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ErrorResponse {
-    /// Stable machine-readable code: `bad_request`, `internal_error`, or
-    /// one of the `UnavailableReason` codes (`no_live_quote`,
-    /// `expired_quote`). Mirrors the HTTP status `AppError` maps to.
+    /// Stable machine-readable code: `bad_request`, `internal_error`,
+    /// `market_closed`, or one of the `UnavailableReason` codes
+    /// (`no_live_quote`, `expired_quote`). Mirrors the HTTP status
+    /// `AppError` maps to.
     pub error: String,
     /// Human-readable detail for logs and debugging.
     pub detail: String,
+    /// For `market_closed` only: when the next session opens (RFC 3339,
+    /// UTC), so a caller can sleep until then instead of polling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_open: Option<String>,
+    /// For `market_closed` only: seconds until `next_open`, the same number
+    /// the `Retry-After` header carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_s: Option<u64>,
 }
 
 /// A decoded `/context/v*` body plus the wire shape it arrived in.
@@ -821,7 +830,8 @@ async fn post_signed_context_pair_bound(
 
     // Session classification is snapshot once per batch; publish_time is
     // per-quote (the pricing quote's own source_ts), read inside the builder.
-    let session_info = state.market_hours.session_info_for(Utc::now()).await;
+    let now = Utc::now();
+    let session_info = state.market_hours.session_info_for(now).await;
 
     let mut built: Vec<Result<BuiltSlot<'_>, AppError>> = Vec::with_capacity(resolved.len());
     for slot in resolved {
@@ -846,6 +856,7 @@ async fn post_signed_context_pair_bound(
                 }),
             },
         };
+        let item = item.map_err(|err| when_closed(err, &session_info, now));
         // Strict mode stops at the first failure, as before: nothing
         // after it is signed.
         if !envelope {
@@ -871,7 +882,11 @@ async fn post_signed_context_pair_bound(
         &current,
         envelope,
     )
-    .map_err(|err| strict_abort(endpoint, err))?;
+    .map_err(|err| strict_abort(endpoint, when_closed(err, &session_info, now)))?;
+    let items = items
+        .into_iter()
+        .map(|item| item.map_err(|err| when_closed(err, &session_info, now)))
+        .collect();
 
     finish(endpoint, items, envelope)
 }
@@ -1659,6 +1674,40 @@ pub enum AppError {
         reason: UnavailableReason,
         detail: String,
     },
+    /// No quote because the US market is closed: overnight, at weekends,
+    /// on holidays. Still a 503, but it says when to come back, in the
+    /// `Retry-After` header and in the body, so a caller can wait for the
+    /// next session instead of asking hundreds of times a second (two
+    /// callers did, 15 to 40 million refusals a day, measured 2026-09-29).
+    MarketClosed {
+        next_open: chrono::DateTime<chrono::Utc>,
+        retry_after_s: u64,
+    },
+}
+
+/// A quote refusal decided while the market is closed becomes
+/// `MarketClosed`: same status, a code that says why, and when to come
+/// back. Anything else passes through. Only refusals for want of a live
+/// quote are converted; a bad request is still a bad request.
+fn when_closed(
+    err: AppError,
+    session: &market_hours::SessionInfo,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AppError {
+    let closed = matches!(
+        session.session,
+        market_hours::Session::OvernightClosed | market_hours::Session::WeekendClosed
+    );
+    match err {
+        AppError::Unavailable {
+            reason: UnavailableReason::NoLiveQuote | UnavailableReason::ExpiredQuote,
+            ..
+        } if closed && session.end > now => AppError::MarketClosed {
+            next_open: session.end,
+            retry_after_s: u64::try_from((session.end - now).num_seconds().max(1)).unwrap_or(1),
+        },
+        other => other,
+    }
 }
 
 impl AppError {
@@ -1669,7 +1718,9 @@ impl AppError {
         match self {
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            AppError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::Unavailable { .. } | AppError::MarketClosed { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -1681,6 +1732,7 @@ impl AppError {
             AppError::Internal(_) => "internal_error",
             AppError::BadRequest(_) => "bad_request",
             AppError::Unavailable { reason, .. } => reason.code(),
+            AppError::MarketClosed { .. } => "market_closed",
         }
     }
 
@@ -1691,10 +1743,26 @@ impl AppError {
         let detail = match self {
             AppError::Internal(err) => format!("{}", err),
             AppError::BadRequest(detail) | AppError::Unavailable { detail, .. } => detail.clone(),
+            AppError::MarketClosed { next_open, .. } => format!(
+                "The US market is closed; the next session opens at {}.",
+                next_open.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+        };
+        let (next_open, retry_after_s) = match self {
+            AppError::MarketClosed {
+                next_open,
+                retry_after_s,
+            } => (
+                Some(next_open.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                Some(*retry_after_s),
+            ),
+            _ => (None, None),
         };
         ErrorResponse {
             error: self.code().to_string(),
             detail,
+            next_open,
+            retry_after_s,
         }
     }
 
@@ -1711,7 +1779,7 @@ impl AppError {
         match self {
             AppError::Internal(err) => tracing::error!("Internal error: {:?}", err),
             AppError::BadRequest(detail) => tracing::trace!("Bad request: {}", detail),
-            AppError::Unavailable { .. } => {}
+            AppError::Unavailable { .. } | AppError::MarketClosed { .. } => {}
         }
     }
 
@@ -1743,6 +1811,9 @@ impl AppError {
                 "Batch item failed (unavailable): {}",
                 detail
             ),
+            AppError::MarketClosed { .. } => {
+                tracing::trace!(endpoint, index, "Batch item failed (market closed)")
+            }
         }
     }
 }
@@ -1750,7 +1821,15 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         self.log();
-        (self.status_code(), Json(self.to_error_response())).into_response()
+        let mut response = (self.status_code(), Json(self.to_error_response())).into_response();
+        if let AppError::MarketClosed { retry_after_s, .. } = &self {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_s.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -2417,6 +2496,7 @@ mod app_error_tests {
                 ErrorResponse {
                     error: code.to_string(),
                     detail: detail.to_string(),
+                    ..Default::default()
                 }
             );
         }
@@ -2427,6 +2507,7 @@ mod app_error_tests {
         let original = ErrorResponse {
             error: "bad_request".into(),
             detail: "Invalid input IO index".into(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&original).unwrap();
         assert_eq!(
@@ -2775,5 +2856,91 @@ mod context_query_tests {
         }
         // Empty pairs around a well-formed flag are harmless.
         assert!(allow(Some("&allowFailure=true&")));
+    }
+}
+
+#[cfg(test)]
+mod market_closed_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use market_hours::{Session, SessionInfo};
+
+    fn at(h: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 29, h, 0, 0).unwrap()
+    }
+    fn closed() -> SessionInfo {
+        SessionInfo {
+            session: Session::OvernightClosed,
+            start: at(0),
+            end: at(8),
+        }
+    }
+    fn refusal() -> AppError {
+        AppError::Unavailable {
+            reason: UnavailableReason::NoLiveQuote,
+            detail: "No live quote for SGOV.".into(),
+        }
+    }
+
+    #[test]
+    fn a_refusal_while_closed_says_when_to_come_back() {
+        let err = when_closed(refusal(), &closed(), at(2));
+        assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), "market_closed");
+        let body = err.to_error_response();
+        assert_eq!(body.next_open.as_deref(), Some("2026-09-29T08:00:00Z"));
+        assert_eq!(body.retry_after_s, Some(6 * 3600));
+        let response = err.into_response();
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "21600");
+    }
+
+    #[test]
+    fn a_refusal_in_session_is_unchanged() {
+        let rth = SessionInfo {
+            session: Session::Rth,
+            start: at(13),
+            end: at(20),
+        };
+        let err = when_closed(refusal(), &rth, at(14));
+        assert_eq!(err.code(), "no_live_quote");
+        let body = err.to_error_response();
+        assert!(body.next_open.is_none() && body.retry_after_s.is_none());
+        assert!(err
+            .into_response()
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+    }
+
+    #[test]
+    fn a_bad_request_while_closed_stays_a_bad_request() {
+        let err = when_closed(
+            AppError::BadRequest("Invalid input IO index".into()),
+            &closed(),
+            at(2),
+        );
+        assert_eq!(err.code(), "bad_request");
+    }
+
+    #[test]
+    fn a_calendar_not_primed_yet_leaves_the_refusal_alone() {
+        // No cached windows: session_info_for answers OvernightClosed with
+        // start = end = now, so there is no next open to promise.
+        let blind = SessionInfo {
+            session: Session::OvernightClosed,
+            start: at(2),
+            end: at(2),
+        };
+        assert_eq!(
+            when_closed(refusal(), &blind, at(2)).code(),
+            "no_live_quote"
+        );
+    }
+
+    #[test]
+    fn the_new_fields_stay_off_the_wire_for_other_errors() {
+        let json =
+            serde_json::to_string(&AppError::BadRequest("x".into()).to_error_response()).unwrap();
+        assert_eq!(json, r#"{"error":"bad_request","detail":"x"}"#);
     }
 }

@@ -1105,6 +1105,7 @@ mod batch_item_tests {
         let item = BatchItemResponse::Error(ErrorResponse {
             error: "no_live_quote".into(),
             detail: "No live quote for DRAM yet.".into(),
+            ..Default::default()
         });
         let json = serde_json::to_string(&item).unwrap();
         assert_eq!(
@@ -1120,6 +1121,7 @@ mod batch_item_tests {
             BatchItemResponse::Error(ErrorResponse {
                 error: "bad_request".into(),
                 detail: "Invalid input IO index".into(),
+                ..Default::default()
             }),
         ];
         let json = serde_json::to_string(&items).unwrap();
