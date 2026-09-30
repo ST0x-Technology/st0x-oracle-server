@@ -376,6 +376,62 @@ async fn missing_quotes_return_stable_no_live_quote_reason() {
     }
 }
 
+async fn metrics_body(app: axum::Router) -> String {
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+/// Pricing and the oracle read the token file on their own schedules, so
+/// after a slot's address changes pricing can still price the old token
+/// under the same symbol. Every signing schema, single or batched, refuses
+/// that quote as "no live quote" instead of binding the new token to the
+/// old vault's price, and each refusal is counted.
+#[tokio::test]
+async fn a_quote_for_another_address_is_refused() {
+    const SYMBOL: &str = "MISMATCHED";
+    let requests = [
+        ("/context/v5", encode_single(USDC, WCOIN)),
+        ("/context/v6", encode_single(WCOIN, USDC)),
+        ("/context/v7", encode_single(USDC, WCOIN)),
+        ("/context/v7", encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)])),
+    ];
+    let mut app = None;
+    for (endpoint, body) in requests {
+        let quote = fake_quote(SYMBOL, WDRAM, "0.01", "100");
+        let served = test_app_with_quotes(&[(WCOIN, SYMBOL)], vec![quote]).await;
+        let (status, json) = post_status_and_json(served.clone(), endpoint, body).await;
+        assert_eq!(status, 503, "{endpoint}: {json}");
+        assert_eq!(json["error"], "no_live_quote", "{endpoint}");
+        app = Some(served);
+    }
+
+    let body = metrics_body(app.unwrap()).await;
+    let count = body
+        .lines()
+        .find(|line| {
+            line.starts_with("oracle_quote_address_mismatch_total{")
+                && line.contains(&format!("symbol=\"{SYMBOL}\""))
+        })
+        .expect("address mismatch metric");
+    // The strict batch aborts at its first slot, so four requests refuse
+    // four quotes.
+    assert_eq!(count.split_whitespace().last(), Some("4"), "{count}");
+
+    let quote = fake_quote(SYMBOL, WCOIN, "0.01", "100");
+    let app = test_app_with_quotes(&[(WCOIN, SYMBOL)], vec![quote]).await;
+    let (status, _) = post_status_and_json(app, "/context/v7", encode_single(USDC, WCOIN)).await;
+    assert_eq!(status, 200, "the same quote for the resolved address signs");
+}
+
 #[tokio::test]
 async fn mixed_batch_fails_whole_request_when_second_quote_is_expired() {
     let live = fake_quote("COIN", WCOIN, "0.01", "100");
