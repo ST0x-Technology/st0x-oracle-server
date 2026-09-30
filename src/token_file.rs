@@ -546,14 +546,19 @@ mod tests {
     }
 
     /// The token file projects into exactly the rows each inline config
-    /// carried the day it was replaced. Staging drops wtSGOV, which the
-    /// staging token file (like staging pricing) has switched off.
+    /// carried the day it was replaced, plus the rows listed since then.
+    /// Staging drops wtSGOV, which the staging token file (like staging
+    /// pricing) has switched off.
     #[test]
     fn registry_projects_to_the_inline_rows_it_replaced() {
-        for (plane, env, dropped) in [
-            ("production", "production", None),
-            ("robinhood", "production", None),
-            ("staging", "staging", Some("wtSGOV")),
+        let base_added: &[(&str, &str)] =
+            &[("wtSPY", "0x9aa9c5a24e976096a6a7ab44986dae8230fa5b27")];
+        let robinhood_added: &[(&str, &str)] =
+            &[("wtSNES", "0x06096908dbc38fc54509024674e4fd1891b5f7ca")];
+        for (plane, env, dropped, added) in [
+            ("production", "production", None, base_added),
+            ("robinhood", "production", None, robinhood_added),
+            ("staging", "staging", Some("wtSGOV"), &[][..]),
         ] {
             let path = deployed(plane);
             let table = Config::parse_table(Path::new(&path)).unwrap();
@@ -567,6 +572,11 @@ mod tests {
             if let Some(sym) = dropped {
                 expected.retain(|(s, _)| s != sym);
             }
+            expected.extend(
+                added
+                    .iter()
+                    .map(|(sym, addr)| ((*sym).to_string(), (*addr).to_string())),
+            );
             assert_eq!(p.rows(), expected, "{plane}");
         }
     }
@@ -574,8 +584,8 @@ mod tests {
     #[test]
     fn the_deployed_configs_load_through_the_registry() {
         for (plane, env, chain_id, count) in [
-            ("production", "production", 8453, 47),
-            ("robinhood", "production", 4663, 5),
+            ("production", "production", 8453, 48),
+            ("robinhood", "production", 4663, 6),
             ("staging", "staging", 8453, 46),
         ] {
             let path = deployed(plane);

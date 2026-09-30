@@ -33,7 +33,7 @@ quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 contract = "0x242FdEc55623187E80A690ff15302e63dddd7130"
 inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
 
-[[trading_state.scopes]]  # pricing, unchanged
+[[trading_state.scopes]] # pricing, unchanged
 id = "alpaca-regular"
 profile_revision = "production-existing-v1"
 sessions = "regular"
@@ -43,7 +43,56 @@ assets = ["RKLB"]
 id = "alpaca-extended"
 profile_revision = "production-existing-v1"
 sessions = "extended"
-assets = ["COIN", "TSLA", "SPYM", "SGOV", "AMZN", "ARKK", "ASML", "BMNR", "CEG", "CRCL", "DRAM", "IAU", "MSTR", "NVDA", "PPLT", "QQQM", "SIVR", "SKHY", "SPCX", "TSM", "VWO", "MU", "AMD", "AVGO", "AMAT", "LRCX", "TTWO", "AAPL", "BABA", "GOOGL", "HOOD", "INTC", "LLY", "MSFT", "ORCL", "PTY", "SMCI", "TQQQ", "MCD", "NKE", "GRND", "DNUT", "FGI", "PLBY", "TR", "WEN"]
+assets = [
+  "COIN",
+  "TSLA",
+  "SPYM",
+  "SPY",
+  "SGOV",
+  "AMZN",
+  "ARKK",
+  "ASML",
+  "BMNR",
+  "CEG",
+  "CRCL",
+  "DRAM",
+  "IAU",
+  "MSTR",
+  "NVDA",
+  "PPLT",
+  "QQQM",
+  "SIVR",
+  "SKHY",
+  "SPCX",
+  "TSM",
+  "VWO",
+  "MU",
+  "AMD",
+  "AVGO",
+  "AMAT",
+  "LRCX",
+  "TTWO",
+  "AAPL",
+  "BABA",
+  "GOOGL",
+  "HOOD",
+  "INTC",
+  "LLY",
+  "MSFT",
+  "ORCL",
+  "PTY",
+  "SMCI",
+  "TQQQ",
+  "MCD",
+  "NKE",
+  "GRND",
+  "DNUT",
+  "FGI",
+  "SNES",
+  "PLBY",
+  "TR",
+  "WEN",
+]
 
 [[trading_state.scopes]]
 id = "alpaca-ethereum-regular"
@@ -1199,6 +1248,45 @@ trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 
+[assets.equities.SNES]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.SNES.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 400.0
+quote_staleness_seconds = 20
+[[assets.equities.SNES.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 4000.0
+quote_staleness_seconds = 20
+[[assets.equities.SNES.spread_model.profiles]]
+session = "post"
+half_spread_bps = 2000.0
+quote_staleness_seconds = 20
+[[assets.equities.SNES.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 400.0
+quote_staleness_seconds = 70
+[[assets.equities.SNES.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 4000.0
+quote_staleness_seconds = 70
+[[assets.equities.SNES.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 2000.0
+quote_staleness_seconds = 70
+[chains.robinhood.assets.equities.SNES]
+tokenized_equity = "0xf8bf43d61e4cd2a5b5dfad01bac84693d7b95e51"
+tokenized_equity_derivative = "0x06096908dbc38fc54509024674e4fd1891b5f7ca"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+
 [assets.equities.SPCX]
 extended_hours_counter_trading = "enabled"
 [[assets.equities.SPCX.spread_model.profiles]]
@@ -1270,6 +1358,45 @@ quote_staleness_seconds = 70
 [chains.base.assets.equities.SPYM]
 tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
 tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.SPY]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.SPY.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 50.0
+quote_staleness_seconds = 20
+[[assets.equities.SPY.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 50.0
+quote_staleness_seconds = 20
+[[assets.equities.SPY.spread_model.profiles]]
+session = "post"
+half_spread_bps = 50.0
+quote_staleness_seconds = 20
+[[assets.equities.SPY.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 50.0
+quote_staleness_seconds = 70
+[[assets.equities.SPY.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 50.0
+quote_staleness_seconds = 70
+[[assets.equities.SPY.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 50.0
+quote_staleness_seconds = 70
+[chains.base.assets.equities.SPY]
+tokenized_equity = "0xda2e8d6e2a7d0a38a6b39a274d6911476062298b"
+tokenized_equity_derivative = "0x9aa9c5a24e976096a6a7ab44986dae8230fa5b27"
 vault_ids = ["0xfab"]
 pricing = "enabled"
 venues = ["raindex", "bebop"]

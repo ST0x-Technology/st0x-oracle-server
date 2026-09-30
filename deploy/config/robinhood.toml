@@ -91,5 +91,5 @@ consumer = "oracle"
 # Running instances report a newer copy on oracle_registry_pending_restart.
 [registry]
 url = "gs://t0-artifacts-tokens/production/tokens.toml"
-generation = 1790341753647581
+generation = 1790782803062872
 refresh_secs = 60

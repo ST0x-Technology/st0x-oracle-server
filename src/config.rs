@@ -234,7 +234,7 @@ mod tests {
         "#;
 
     #[test]
-    fn committed_robinhood_config_serves_exactly_its_five_pinned_rows() {
+    fn committed_robinhood_config_serves_exactly_its_six_pinned_rows() {
         // Exact membership catches both unpriced registry rows and orders whose
         // token is missing here. Independent address literals also catch an
         // accidental substitution in the token file.
@@ -271,6 +271,10 @@ mod tests {
                 (
                     "wtSGOV".to_string(),
                     "0x06b17e431a957dd8522bf106653bac6b39f437e6".to_string()
+                ),
+                (
+                    "wtSNES".to_string(),
+                    "0x06096908dbc38fc54509024674e4fd1891b5f7ca".to_string()
                 ),
             ]
         );
