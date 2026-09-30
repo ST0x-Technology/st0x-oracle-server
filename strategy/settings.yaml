@@ -13,6 +13,7 @@ subgraphs:
   base: https://api.subgraph.ormilabs.com/api/public/9f4fc2fa-4a15-44f7-a7c1-66fdaa518a71/subgraphs/ob4-base/prod/gn
 metaboards:
   base: https://api.subgraph.ormilabs.com/api/public/9f4fc2fa-4a15-44f7-a7c1-66fdaa518a71/subgraphs/metadata-base/prod/gn
+  robinhood: https://api.subgraph.ormilabs.com/api/public/9f4fc2fa-4a15-44f7-a7c1-66fdaa518a71/subgraphs/metadata-robinhood/prod/gn
 raindexes:
   base:
     address: 0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D
