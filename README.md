@@ -119,9 +119,9 @@ booting a registry that resolves nothing.
 The deployed configs carry no `[[tokens]]`. A `[registry]` section names T0's
 token file in the bucket (`st0x.registry` `t0/<env>.toml`), and boot takes every
 slot on the config's chain with `pricing = "enabled"` and `raindex` in its
-`venues`. Production pins the
-object `generation`, so a token change ships with a gated release. Check a config
-in full with `st0x-oracle-server validate <config> --registry-file <tokens.toml>`.
+`venues`. Production pins the object `generation`, so a token change ships with
+a gated release. Check a config in full with
+`st0x-oracle-server validate <config> --registry-file <tokens.toml>`.
 
 ### Chains
 
@@ -195,11 +195,11 @@ before any grant is requested.
 
 #### Robinhood Chain: what is done and what is not
 
-Done in this repo: the config (`chain_id = 4663`, USDG quote token, its
-tokens read from the production token file as described above), the PR-time
-validation, and the release workflow. The binary reads only the pricing frames stamped with its own
-`chain_id` (RAI-2130), so Base and Robinhood frames for one symbol no longer
-collide.
+Done in this repo: the config (`chain_id = 4663`, USDG quote token, its tokens
+read from the production token file as described above), the PR-time validation,
+and the release workflow. The binary reads only the pricing frames stamped with
+its own `chain_id` (RAI-2130), so Base and Robinhood frames for one symbol no
+longer collide.
 
 Done since RAI-1991 landed: `/context/v7` signs the deployment's `chain_id` at
 slot 9 (see "The chain is in the signature" above), so release this plane from a
@@ -209,8 +209,8 @@ Not done, and it gates signing:
 
 - **st0x.pricing must publish chain 4663 for every token the file prices
   there.** Both read the same token file, so the sets match once pricing reads
-  it too (st0x.pricing #221). Until then any symbol pricing does not publish
-  on 4663 sits in the missing-symbols count on `/status` and is not signed.
+  it too (st0x.pricing #221). Until then any symbol pricing does not publish on
+  4663 sits in the missing-symbols count on `/status` and is not signed.
 
 #### GCP prerequisites
 
@@ -349,6 +349,19 @@ Rules:
 
 The flag applies to all `/context/v*` endpoints. The key is case-sensitive.
 Unknown query keys are ignored.
+
+A batch with the flag builds its items concurrently. The server builds at most
+10 items at the same time. The server starts the next item as soon as any item
+finishes.
+
+Signing is the slow step. If the signer fails, a batch of 10 items or fewer
+costs one wait. Each further group of 10 items costs one more wait. A partly
+slow signer costs less, because the server starts new items around the slow
+ones.
+
+A batch without the flag stops at the first failure. It stays sequential.
+Concurrency applies to v5, v6 and v7 only. v1 and v4 refuse new signatures, so
+they never sign.
 
 Do not put the flag in the on-chain oracle meta URL of an order. A client that
 does not understand the item format cannot parse the response. The client adds

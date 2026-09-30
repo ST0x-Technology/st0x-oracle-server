@@ -20,6 +20,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt as _;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use sign::Signer;
@@ -500,6 +501,120 @@ impl IntoResponse for ContextResponse {
     }
 }
 
+/// Upper bound on slots built at the same time WITHIN ONE REQUEST. It
+/// keeps a single large batch from opening a KMS call per item at once:
+/// nothing limits batch size but axum's 2 MiB body limit, which admits
+/// far more items than one request should have in flight.
+///
+/// This is NOT a bound on KMS load. It is per `build_slots` call, so K
+/// concurrent cold-cache envelope requests can have up to `K * cap` signs
+/// in flight, and each sign runs on a detached task that outlives the
+/// caller (see `sign::Signer::spawn_sign`). Bounding signs process-wide
+/// needs a shared permit inside `Signer`, which is a separate change.
+///
+/// The cap is also what bounds the win. At most this many slots are in
+/// flight, so under a signer outage — where every slot takes the full
+/// wait, about `WAIT_TIMEOUT` (~11s) — a batch of N slots costs:
+///
+/// - N <= cap — one wait, whatever N is.
+/// - N > cap  — `ceil(N / cap)` waits. Eleven slots pay two, not one.
+///
+/// Never one wait per item, which is the failure this exists to fix. Raise
+/// the cap to widen the one-wait band, at the cost of more concurrent KMS
+/// calls; there is no value that gives one wait for an unbounded N.
+const MAX_CONCURRENT_SLOT_BUILDS: usize = 10;
+
+/// Run `build_one` over every resolved slot, and return one result per
+/// slot in REQUEST ORDER.
+///
+/// Envelope mode builds the slots CONCURRENTLY. Signing is the slow step:
+/// on a cache miss it is a KMS round trip that the signer waits out before
+/// it gives up. Built one after another, a signer outage costs that wait
+/// once per item, so the caller that opted into per-item results times out
+/// long before a strict caller would — the flag made the outage worse for
+/// the caller it was meant to help.
+///
+/// Built concurrently, at most `MAX_CONCURRENT_SLOT_BUILDS` slots are in
+/// flight and a place frees the moment ANY slot finishes, not when the
+/// next one in request order does. A batch that fits the cap therefore
+/// costs one wait; above the cap a signer outage, where every slot takes
+/// the full wait, costs `ceil(N / cap)`. See that constant for why the
+/// bound is not flatly one, and `build_slots_tests` for where it is
+/// pinned — including the mixed-speed case a rolling window must handle.
+///
+/// The signature cache deduplicates identical in-flight contexts, so
+/// concurrent builds never sign the same bytes twice.
+///
+/// One metrics caveat: two IDENTICAL slots in one envelope batch now both
+/// reach `reuse::ReuseCache::lookup` before either reaches `store`, so
+/// both miss and `oracle_signature_reuse_total` does not count the second
+/// one. No extra KMS call results — the content cache still collapses the
+/// bytes — so the saving shows on `oracle_signature_cache_hits_total`
+/// instead. Reuse across separate requests is unaffected.
+///
+/// Strict mode stays sequential and returns at the first error, because
+/// nothing after that error may be signed.
+///
+/// There is deliberately NO circuit breaker: nothing copies one slot's
+/// failure into the remaining slots. That would couple the items again,
+/// and the server cannot tell a signer outage from a per-item internal
+/// error such as a zero rate.
+///
+/// Slots that already failed resolution pass through untouched and keep
+/// their position.
+async fn build_slots<S, T, F, Fut>(
+    slots: Vec<Result<S, AppError>>,
+    envelope: bool,
+    build_one: F,
+) -> Result<Vec<Result<T, AppError>>, AppError>
+where
+    F: Fn(S) -> Fut,
+    Fut: std::future::Future<Output = Result<T, AppError>>,
+{
+    if !envelope {
+        let mut built = Vec::with_capacity(slots.len());
+        for slot in slots {
+            built.push(Ok(build_one(slot?).await?));
+        }
+        return Ok(built);
+    }
+    // Borrow the closure instead of moving it into each future: every
+    // slot's future needs it, and they are all alive at once.
+    let build_one = &build_one;
+    // Each future carries its own index, so the window can complete in
+    // any order and the results still go back where they belong.
+    //
+    // `buffer_unordered`, NOT `buffered`: `buffered` is built on
+    // `FuturesOrdered`, which holds a finished future's place until every
+    // earlier slot has been yielded. One slow slot at the head would then
+    // keep the window shut behind it, and the slots after it would
+    // serialise against it even while places were free — exactly the
+    // per-item cost this function exists to remove. Ordering is restored
+    // by index below instead, which costs one `Vec` and no concurrency.
+    // Sized up front from the slot count, so every index the stream
+    // yields is already in range and the `expect` below is total by
+    // construction: the stream produces each index exactly once.
+    let mut built: Vec<Option<Result<T, AppError>>> = (0..slots.len()).map(|_| None).collect();
+    let futures = slots
+        .into_iter()
+        .enumerate()
+        .map(move |(index, slot)| async move {
+            match slot {
+                Err(err) => (index, Err(err)),
+                Ok(value) => (index, build_one(value).await),
+            }
+        });
+    let mut stream =
+        futures_util::stream::iter(futures).buffer_unordered(MAX_CONCURRENT_SLOT_BUILDS);
+    while let Some((index, result)) = stream.next().await {
+        built[index] = Some(result);
+    }
+    Ok(built
+        .into_iter()
+        .map(|slot| slot.expect("every index is produced exactly once"))
+        .collect())
+}
+
 /// Turn the per-item results of one request into its response. This is
 /// the single place the strict/envelope decision is applied, shared by
 /// every schema so they cannot drift.
@@ -510,6 +625,10 @@ impl IntoResponse for ContextResponse {
 /// - Strict: the first `Err` becomes the whole-request error. Callers
 ///   already short-circuit before reaching here in strict mode, so the
 ///   `Err` arm is a fallback that keeps the function total.
+///
+/// `items` is in request order even when the slots were built
+/// concurrently (see `build_slots`), so the response array, the per-item
+/// metrics and the indexed error logs all stay aligned with the request.
 fn finish(
     endpoint: &'static str,
     items: Vec<Result<oracle::OracleResponse, AppError>>,
@@ -747,6 +866,21 @@ impl PairSchema {
 
 /// Shared body for `/context/v4`, `/context/v5`, `/context/v6` and
 /// `/context/v7`.
+///
+/// Registry resolution is sequential in both modes: it is pure and cheap,
+/// and strict mode must surface the FIRST resolution failure before it
+/// touches the cache. The build pass that follows is where signing
+/// happens, so envelope mode runs it concurrently and strict mode does
+/// not — see `build_slots`. The batch-final revalidation is sequential
+/// again: it signs nothing and checks every built slot against one common
+/// timestamp.
+///
+/// Logging note: the per-slot build traces INTERLEAVE in envelope mode,
+/// so their order no longer identifies which slot produced them. They
+/// carry `symbol`, `direction` and both token addresses, which name the
+/// slot uniquely unless one batch asks for the same pair twice. The
+/// indexed error log in `finish` is unaffected — it runs after the join,
+/// in request order.
 async fn post_signed_context_pair_bound(
     state: Arc<AppState>,
     query: ContextQuery,
@@ -823,38 +957,33 @@ async fn post_signed_context_pair_bound(
     // per-quote (the pricing quote's own source_ts), read inside the builder.
     let session_info = state.market_hours.session_info_for(Utc::now()).await;
 
-    let mut built: Vec<Result<BuiltSlot<'_>, AppError>> = Vec::with_capacity(resolved.len());
-    for slot in resolved {
-        let item = match slot {
-            Err(err) => Err(err),
-            Ok((input_token, output_token, pair)) => match snapshot.get(&pair.symbol) {
-                None => Err(no_live_quote(endpoint, &pair.symbol)),
-                Some(quote) => build_response_from_quote_pair_bound(
-                    &state,
-                    &pair,
-                    quote,
-                    input_token,
-                    output_token,
-                    &session_info,
-                    schema,
-                )
-                .await
-                .map(|response| BuiltSlot {
-                    pair,
-                    quote,
-                    response,
-                }),
-            },
-        };
-        // Strict mode stops at the first failure, as before: nothing
-        // after it is signed.
-        if !envelope {
-            if let Err(err) = item {
-                return Err(strict_abort(endpoint, err));
-            }
+    let built = build_slots(resolved, envelope, |(input_token, output_token, pair)| {
+        let state = &state;
+        let snapshot = &snapshot;
+        let session_info = &session_info;
+        async move {
+            let quote = snapshot
+                .get(&pair.symbol)
+                .ok_or_else(|| no_live_quote(endpoint, &pair.symbol))?;
+            let response = build_response_from_quote_pair_bound(
+                state,
+                &pair,
+                quote,
+                input_token,
+                output_token,
+                session_info,
+                schema,
+            )
+            .await?;
+            Ok(BuiltSlot {
+                pair,
+                quote,
+                response,
+            })
         }
-        built.push(item);
-    }
+    })
+    .await
+    .map_err(|err| strict_abort(endpoint, err))?;
 
     let current_symbols: Vec<&str> = built
         .iter()
@@ -1885,9 +2014,19 @@ mod expiry_tests {
     }
 
     async fn two_symbol_state(clock: Arc<dyn Clock>, quotes: Vec<Quote>) -> Arc<AppState> {
+        two_symbol_state_with_signer(Signer::new(TEST_KEY).unwrap(), clock, quotes).await
+    }
+
+    /// `two_symbol_state` with the signer supplied, so a test can slow
+    /// signing down and time the batch around it.
+    async fn two_symbol_state_with_signer(
+        signer: Signer,
+        clock: Arc<dyn Clock>,
+        quotes: Vec<Quote>,
+    ) -> Arc<AppState> {
         Arc::new(
             AppState::new(
-                Signer::new(TEST_KEY).unwrap(),
+                signer,
                 TokenRegistry::new(
                     vec![
                         (
@@ -1916,6 +2055,23 @@ mod expiry_tests {
         request_body(vec![
             request_tuple(Address::from([0x22; 20]), Address::from([0x11; 20])),
             request_tuple(Address::from([0x22; 20]), Address::from([0x33; 20])),
+        ])
+    }
+
+    /// Four slots that all sign DIFFERENT bytes: both symbols of the
+    /// two-symbol registry, in both directions. The input and output
+    /// token land in signed-context slots 6 and 7, so no two of these
+    /// four share a context hash and the signature cache cannot collapse
+    /// them into one sign.
+    fn four_slot_request_body() -> Bytes {
+        let quote_token = Address::from([0x22; 20]);
+        let coin = Address::from([0x11; 20]);
+        let dram = Address::from([0x33; 20]);
+        request_body(vec![
+            request_tuple(quote_token, coin),
+            request_tuple(coin, quote_token),
+            request_tuple(quote_token, dram),
+            request_tuple(dram, quote_token),
         ])
     }
 
@@ -2177,15 +2333,24 @@ mod expiry_tests {
         ));
     }
 
-    /// Same clock as above, but the caller opted into per-item results:
+    /// Same two slots as above, but the caller opted into per-item results:
     /// the slot that expired during the batch fails alone, the live slot
     /// is still delivered, and the request is a `200` envelope.
+    ///
+    /// The clock is flat through the build phase ON PURPOSE. Envelope
+    /// builds run concurrently, so the two slots interleave their clock
+    /// reads and no fixed value can be pinned to a named slot any more.
+    /// Every build-phase read is the same, and only the batch-final read
+    /// crosses the first slot's expiry, so the test asserts the
+    /// revalidation rule rather than an interleaving.
     #[tokio::test]
     async fn envelope_batch_keeps_final_revalidation_per_slot() {
         let clock = Arc::new(SequenceClock::new([
-            1_000, 1_000, 1_000, 1_000, // first response completes while live
-            1_000, 1_000, 1_000, 3_000, // second response crosses the first deadline
-            3_000, // one common final validation timestamp
+            // Four reads per slot, both slots still live for all of them.
+            1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000,
+            // One common final validation timestamp, past the first
+            // slot's 3_000 expiry and short of the second's 4_000.
+            3_000,
         ]));
         let state = two_symbol_state(clock, two_symbol_quotes(3_000, 4_000)).await;
 
@@ -2212,6 +2377,87 @@ mod expiry_tests {
             matches!(items[1], oracle::BatchItemResponse::Ok(_)),
             "{:?}",
             items[1]
+        );
+    }
+
+    /// The point of DEVOPS-233: a signer outage must NOT cost one wait
+    /// per item. Four slots that each sign different bytes, against a
+    /// signer that takes a fixed time per sign. Enveloped, the batch
+    /// costs about one delay; strict, it costs four.
+    ///
+    /// Four slots sit under `MAX_CONCURRENT_SLOT_BUILDS`, so this case
+    /// pays exactly one wait. Batches above the cap pay `ceil(N / cap)`;
+    /// `build_slots_tests` covers that boundary.
+    ///
+    /// Time is paused, so the delays are virtual: the assertions are
+    /// exact and the test costs no wall-clock time. `tokio::time::Instant`
+    /// reads that same paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn envelope_batch_builds_its_slots_concurrently() {
+        const DELAY: Duration = Duration::from_millis(200);
+        // Far enough ahead that no slot can expire during the batch: the
+        // paused tokio clock the delay runs on is independent of the
+        // `SequenceClock` the expiry checks read.
+        const EXPIRY: i64 = 1_000_000;
+
+        async fn delayed_state() -> Arc<AppState> {
+            two_symbol_state_with_signer(
+                Signer::new(TEST_KEY).unwrap().with_test_delay(DELAY),
+                Arc::new(SequenceClock::new([1_000])),
+                two_symbol_quotes(EXPIRY, EXPIRY),
+            )
+            .await
+        }
+
+        // Build the app BEFORE the clock starts: only the request belongs
+        // inside the measured window, or a future timed step in fixture
+        // setup would be charged to the concurrency budget.
+        let state = delayed_state().await;
+        let started = tokio::time::Instant::now();
+        let response = post_signed_context_pair_bound(
+            state,
+            ContextQuery {
+                allow_failure: true,
+            },
+            four_slot_request_body(),
+            PairSchema::V5,
+        )
+        .await
+        .unwrap();
+        let concurrent = started.elapsed();
+
+        let ContextResponse::Envelope(items) = response else {
+            panic!("expected envelope, got {response:?}");
+        };
+        assert_eq!(items.len(), 4);
+        assert!(
+            items
+                .iter()
+                .all(|item| matches!(item, oracle::BatchItemResponse::Ok(_))),
+            "{items:?}"
+        );
+        assert!(
+            concurrent < 2 * DELAY,
+            "four concurrent signs must cost about one delay, took {concurrent:?}"
+        );
+
+        // A FRESH app for the strict run: the first run's signature cache
+        // holds all four signatures, so reusing the app would serve the
+        // second run with no sign at all.
+        let state = delayed_state().await;
+        let started = tokio::time::Instant::now();
+        post_signed_context_pair_bound(
+            state,
+            ContextQuery::default(),
+            four_slot_request_body(),
+            PairSchema::V5,
+        )
+        .await
+        .unwrap();
+        let sequential = started.elapsed();
+        assert!(
+            sequential >= 4 * DELAY,
+            "strict mode stays sequential, took {sequential:?}"
         );
     }
 
@@ -2775,5 +3021,244 @@ mod context_query_tests {
         }
         // Empty pairs around a well-formed flag are harmless.
         assert!(allow(Some("&allowFailure=true&")));
+    }
+}
+
+/// The timing contract of `build_slots`, exercised directly rather than
+/// through a handler: a synthetic `build_one` stands in for the signer, so
+/// these cover batch sizes above the concurrency cap without needing a
+/// registry symbol per slot.
+#[cfg(test)]
+mod build_slots_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// One unit of signer wait. Time is paused, so this is virtual and the
+    /// assertions are exact.
+    const WAIT: Duration = Duration::from_millis(100);
+
+    /// Slots that each take one WAIT, counting how many ever run at once.
+    async fn timed_build(
+        slots: usize,
+        envelope: bool,
+    ) -> (Vec<Result<usize, AppError>>, Duration, usize) {
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let built = build_slots(
+            (0..slots).map(Ok).collect::<Vec<Result<usize, AppError>>>(),
+            envelope,
+            |index| {
+                let in_flight = &in_flight;
+                let peak = &peak;
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(WAIT).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(index)
+                }
+            },
+        )
+        .await
+        .expect("no slot fails");
+        (built, started.elapsed(), peak.load(Ordering::SeqCst))
+    }
+
+    /// At most `MAX_CONCURRENT_SLOT_BUILDS` slots are in flight, so a
+    /// batch bigger than the cap cannot build in one pass. When EVERY
+    /// slot takes a full wait, as under a signer outage, the bound is
+    /// therefore `ceil(N / cap)` and NOT a flat one — eleven slots pay
+    /// two waits. The four-slot handler test sits below the cap and
+    /// cannot see this boundary, which is why the sizes here straddle it.
+    ///
+    /// Uniform slot durations are what make the arithmetic exact here.
+    /// The mixed-speed case is `a_slow_head_slot_does_not_block_the_window`.
+    #[tokio::test(start_paused = true)]
+    async fn envelope_costs_one_wait_per_generation() {
+        let cap = MAX_CONCURRENT_SLOT_BUILDS;
+        for slots in [1, cap - 1, cap, cap + 1, 2 * cap, 2 * cap + 1] {
+            let (built, elapsed, peak) = timed_build(slots, true).await;
+
+            assert_eq!(built.len(), slots);
+            assert!(
+                peak <= cap,
+                "{slots} slots ran {peak} at once, over the {cap} cap"
+            );
+            let generations = slots.div_ceil(cap) as u32;
+            assert!(
+                elapsed >= generations * WAIT && elapsed < (generations + 1) * WAIT,
+                "{slots} slots took {elapsed:?}, expected about {generations} waits"
+            );
+        }
+    }
+
+    /// Strict mode is sequential by design: it must stop at the first
+    /// failure, so it never has a second slot in flight and pays one wait
+    /// per slot.
+    #[tokio::test(start_paused = true)]
+    async fn strict_stays_sequential() {
+        let slots = MAX_CONCURRENT_SLOT_BUILDS + 1;
+        let (built, elapsed, peak) = timed_build(slots, false).await;
+
+        assert_eq!(built.len(), slots);
+        assert_eq!(peak, 1, "strict mode must never overlap two builds");
+        assert!(elapsed >= slots as u32 * WAIT, "took {elapsed:?}");
+    }
+
+    /// Results come back in REQUEST ORDER even though the slots finish out
+    /// of order. Nothing in `buffer_unordered` guarantees this — the order
+    /// comes ONLY from writing each result back at its own index. Delete
+    /// that index plumbing and this test is what fails; `finish`, the
+    /// per-item metrics and the response array all depend on it.
+    #[tokio::test(start_paused = true)]
+    async fn envelope_keeps_request_order_when_slots_finish_out_of_order() {
+        let slots = MAX_CONCURRENT_SLOT_BUILDS + 1;
+        let built = build_slots(
+            (0..slots).map(Ok).collect::<Vec<Result<usize, AppError>>>(),
+            true,
+            |index| async move {
+                // Later slots finish first.
+                tokio::time::sleep(Duration::from_millis((slots - index) as u64)).await;
+                Ok(index)
+            },
+        )
+        .await
+        .expect("no slot fails");
+
+        let order: Vec<usize> = built.into_iter().map(Result::unwrap).collect();
+        assert_eq!(order, (0..slots).collect::<Vec<_>>());
+    }
+
+    /// A slot that already failed resolution passes through untouched and
+    /// KEEPS ITS POSITION, in both modes. Envelope mode never calls
+    /// `build_one` for it and reports it in its own place; strict mode
+    /// surfaces it as the whole-request error.
+    #[tokio::test]
+    async fn a_failed_slot_keeps_its_position_and_is_never_built() {
+        let built_indices = std::sync::Mutex::new(Vec::<usize>::new());
+        let slots = || vec![Ok(0), Err(AppError::BadRequest("slot one".into())), Ok(2)];
+        let build_one = |index: usize| {
+            let built_indices = &built_indices;
+            async move {
+                built_indices.lock().unwrap().push(index);
+                Ok(index)
+            }
+        };
+
+        let envelope = build_slots(slots(), true, build_one)
+            .await
+            .expect("envelope mode never fails as a whole");
+        assert!(matches!(envelope[0], Ok(0)));
+        assert!(
+            matches!(&envelope[1], Err(AppError::BadRequest(detail)) if detail == "slot one"),
+            "the error must stay at index 1, got {:?}",
+            envelope[1]
+        );
+        assert!(matches!(envelope[2], Ok(2)));
+        // Sorted: `build_slots` promises nothing about the order it calls
+        // `build_one` in — that is what `buffer_unordered` gives up. The
+        // contract under test is only WHICH slots reach it.
+        let mut reached = built_indices.lock().unwrap().clone();
+        reached.sort_unstable();
+        assert_eq!(
+            reached,
+            vec![0, 2],
+            "the failed slot must never reach build_one"
+        );
+
+        let strict = build_slots(slots(), false, build_one)
+            .await
+            .expect_err("strict mode fails the whole request");
+        assert!(matches!(strict, AppError::BadRequest(detail) if detail == "slot one"));
+    }
+
+    /// A slot whose BUILD fails — the signer refused, the rate was zero —
+    /// fails alone and at its own index. This is the no-circuit-breaker
+    /// contract: one slot's failure never reaches its neighbours, and the
+    /// error never lands at the completion-order position instead of the
+    /// request-order one.
+    ///
+    /// Distinct from the test above, which fails slots BEFORE the build.
+    /// Those take the passthrough arm and never enter `build_one`; these
+    /// fail inside it, on the concurrent path, with ten healthy slots
+    /// around them.
+    #[tokio::test(start_paused = true)]
+    async fn a_build_failure_fails_only_its_own_slot() {
+        let slots = MAX_CONCURRENT_SLOT_BUILDS + 1;
+        let failing = 1;
+        let built = build_slots(
+            (0..slots).map(Ok).collect::<Vec<Result<usize, AppError>>>(),
+            true,
+            |index| async move {
+                // DESCENDING, so completion order is not request order:
+                // the last slots finish first. Write the results in
+                // completion order instead of by index and every
+                // assertion below moves, including the failure's.
+                tokio::time::sleep(Duration::from_millis((slots - index) as u64)).await;
+                if index == failing {
+                    return Err(AppError::BadRequest(format!("slot {index} refused")));
+                }
+                Ok(index)
+            },
+        )
+        .await
+        .expect("envelope mode never fails as a whole");
+
+        assert_eq!(built.len(), slots, "every slot keeps a place");
+        for (index, slot) in built.into_iter().enumerate() {
+            if index == failing {
+                assert!(
+                    matches!(&slot, Err(AppError::BadRequest(d)) if d == "slot 1 refused"),
+                    "the failure must stay at index {index}, got {slot:?}"
+                );
+            } else {
+                assert!(
+                    matches!(slot, Ok(value) if value == index),
+                    "slot {index} must survive its neighbour's failure, got {slot:?}"
+                );
+            }
+        }
+    }
+
+    /// A slow slot must not hold the window shut behind it. Slot 0 signs
+    /// slowly, the nine behind it are ready at once (a cache hit, or a
+    /// slot that already failed resolution), and the last slot signs
+    /// slowly too. The two slow signs must OVERLAP: the batch pays one
+    /// wait, not two.
+    ///
+    /// `buffered` fails this. It is built on `FuturesOrdered`, which holds
+    /// a finished future's place until every earlier slot has been
+    /// yielded, so the window never refills past a slow head and the last
+    /// slot starts only after the first one finishes.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_head_slot_does_not_block_the_window() {
+        let slots = MAX_CONCURRENT_SLOT_BUILDS + 1;
+        let slow = [0, slots - 1];
+        let started = tokio::time::Instant::now();
+        let built = build_slots(
+            (0..slots).map(Ok).collect::<Vec<Result<usize, AppError>>>(),
+            true,
+            |index| async move {
+                if slow.contains(&index) {
+                    tokio::time::sleep(WAIT).await;
+                }
+                Ok(index)
+            },
+        )
+        .await
+        .expect("no slot fails");
+
+        let elapsed = started.elapsed();
+        assert_eq!(
+            built.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+            (0..slots).collect::<Vec<_>>(),
+            "order must survive out-of-order completion"
+        );
+        assert!(
+            elapsed < 2 * WAIT,
+            "the two slow slots must overlap, took {elapsed:?}"
+        );
     }
 }
