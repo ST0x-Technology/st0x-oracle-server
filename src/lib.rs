@@ -5,6 +5,7 @@ pub mod metrics;
 pub mod oracle;
 pub mod pricing_client;
 pub mod registry;
+pub mod reload;
 pub mod reuse;
 pub mod sign;
 pub mod token_file;
@@ -423,11 +424,20 @@ fn revalidate_batch(
     validated_at_unix_ms: i64,
     built: Vec<Result<BuiltSlot<'_>, AppError>>,
     current: &std::collections::HashMap<String, QuoteSnapshot>,
+    registry: &TokenRegistry,
     envelope: bool,
 ) -> Result<Vec<Result<oracle::OracleResponse, AppError>>, AppError> {
     let mut items = Vec::with_capacity(built.len());
     for slot in built {
         let item = slot.and_then(|slot| {
+            let mapping = registry.resolve(slot.pair.token, registry.quote_token);
+            if !mapping.is_ok_and(|pair| pair.symbol == slot.pair.symbol) {
+                return Err(no_live_quote_at(
+                    endpoint,
+                    &slot.pair.symbol,
+                    RefusalPhase::BatchFinal,
+                ));
+            }
             validate_quote_liveness(
                 slot.quote,
                 endpoint,
@@ -454,6 +464,7 @@ fn revalidate_batch(
             validate_quote_address(
                 current_quote,
                 &slot.pair,
+                registry.quote_token,
                 endpoint,
                 RefusalPhase::BatchFinal,
             )?;
@@ -942,7 +953,8 @@ async fn post_signed_context_pair_bound(
     // envelope mode; strict mode surfaces the FIRST one before touching
     // the cache, preserving the historical resolve-before-build order.
     //
-    // One token set for the whole request, taken here and never again.
+    // One token set for resolution; the final pass also checks that each
+    // resolved mapping still exists in the running set.
     let set = state.tokens.current();
     let resolved: Vec<Result<(Address, Address, ResolvedPair), AppError>> = requests
         .iter()
@@ -1030,6 +1042,10 @@ async fn post_signed_context_pair_bound(
         .map(|slot| slot.pair.symbol.as_str())
         .collect();
     let current = state.pricing.snapshot_many(&current_symbols).await;
+    // Take the current token set after the last await: a request may have
+    // resolved an old address before reload and then picked up a fresh
+    // pricing frame for that retired address after cache eviction.
+    let current_set = state.tokens.current();
     let validated_at_unix_ms = state.clock.now_unix_ms();
     let items = revalidate_batch(
         endpoint,
@@ -1037,6 +1053,7 @@ async fn post_signed_context_pair_bound(
         validated_at_unix_ms,
         built,
         &current,
+        &current_set.registry,
         envelope,
     )
     .map_err(|err| strict_abort(endpoint, err))?;
@@ -1424,15 +1441,18 @@ fn validate_quote_liveness(
 /// the request resolved. Pricing and the oracle each read the token file
 /// on their own schedule, so after a slot's address changes one of them can
 /// still hold the old address under the same symbol. Signing that quote
-/// would bind the new token to the old vault's price.
+/// would bind the new token to the old vault's price. The settlement
+/// currency must match too, so rates cannot cross currency changes.
 fn validate_quote_address(
     quote: &Quote,
     pair: &ResolvedPair,
+    settlement: Address,
     endpoint: &'static str,
     phase: RefusalPhase,
 ) -> Result<(), AppError> {
     let priced = Address::from(quote.base.0);
-    if priced == pair.token {
+    let priced_settlement = Address::from(quote.quote.0);
+    if priced == pair.token && priced_settlement == settlement {
         return Ok(());
     }
     ::metrics::counter!(
@@ -1440,7 +1460,12 @@ fn validate_quote_address(
         "symbol" => pair.symbol.clone(),
     )
     .increment(1);
-    note_address_mismatch(&pair.symbol, priced, pair.token);
+    if priced != pair.token {
+        note_address_mismatch(&pair.symbol, priced, pair.token);
+    }
+    if priced_settlement != settlement {
+        note_address_mismatch(&pair.symbol, priced_settlement, settlement);
+    }
     Err(no_live_quote_at(endpoint, &pair.symbol, phase))
 }
 
@@ -1631,7 +1656,13 @@ async fn build_response_from_quote_pair_bound(
     schema: PairSchema,
 ) -> Result<BuiltResponse, AppError> {
     validate_quote_liveness(quote, schema.tag(), &pair.symbol, RefusalPhase::Admission)?;
-    validate_quote_address(quote, pair, schema.tag(), RefusalPhase::Admission)?;
+    validate_quote_address(
+        quote,
+        pair,
+        state.tokens.current().registry.quote_token,
+        schema.tag(),
+        RefusalPhase::Admission,
+    )?;
     validate_quote_expiry(
         quote,
         state.clock.now_unix_ms(),
@@ -2458,6 +2489,196 @@ mod expiry_tests {
                 assert!(result.is_ok());
             } else {
                 assert!(matches!(result, Err(AppError::Unavailable { .. })));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_change_during_signing_refuses_in_flight_batches() {
+        for change in ["removed", "readdressed", "settlement"] {
+            for envelope in [false, true] {
+                let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let state = two_symbol_state_with_signer(
+                    Signer::new(TEST_KEY)
+                        .unwrap()
+                        .with_gate(entered.clone(), release.clone()),
+                    Arc::new(SequenceClock::new([1_000])),
+                    two_symbol_quotes(120_000, 120_000),
+                )
+                .await;
+                let request = request_body(vec![
+                    request_tuple(Address::from([0x22; 20]), Address::from([0x11; 20])),
+                    request_tuple(Address::from([0x11; 20]), Address::from([0x22; 20])),
+                ]);
+                let request_state = state.clone();
+                let in_flight = tokio::spawn(async move {
+                    post_signed_context_pair_bound(
+                        request_state,
+                        ContextQuery {
+                            allow_failure: envelope,
+                        },
+                        request,
+                        PairSchema::V5,
+                    )
+                    .await
+                });
+                entered.acquire().await.unwrap().forget();
+
+                let mut quote = test_quote(120_000);
+                if change == "settlement" {
+                    quote.quote = WireAddress::from_bytes([0x55; 20]);
+                } else {
+                    let mut entries = vec![(Address::from([0x33; 20]).to_string(), "DRAM".into())];
+                    if change == "readdressed" {
+                        entries.push((Address::from([0x55; 20]).to_string(), "COIN".into()));
+                    }
+                    state.tokens.replace(TokenSet::new(
+                        TokenRegistry::new(entries, "0x2222222222222222222222222222222222222222")
+                            .unwrap(),
+                        vec!["DRAM".into()],
+                    ));
+                }
+                // Keep the request's quote generation live to exercise the
+                // final registry and currency checks independently of eviction.
+                state.pricing.seed(quote).await;
+                release.add_permits(2);
+                let result = tokio::time::timeout(Duration::from_secs(2), in_flight)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if envelope {
+                    let ContextResponse::Envelope(items) = result.unwrap() else {
+                        panic!("expected envelope");
+                    };
+                    assert_eq!(items.len(), 2);
+                    assert!(items.iter().all(|item| matches!(item,
+                        oracle::BatchItemResponse::Error(error) if error.error == "no_live_quote"
+                    )), "{change}: {items:?}");
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(AppError::Unavailable {
+                                reason: UnavailableReason::NoLiveQuote,
+                                ..
+                            })
+                        ),
+                        "{change}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_final_refuses_retired_pairs_even_with_fresh_quotes() {
+        for change in ["removed", "readdressed", "added"] {
+            let state = two_symbol_state(
+                Arc::new(SequenceClock::new([1_000])),
+                two_symbol_quotes(10_000, 10_000),
+            )
+            .await;
+            let old_set = state.tokens.current();
+            let pairs: Vec<_> = [Address::from([0x33; 20]), Address::from([0x11; 20])]
+                .into_iter()
+                .map(|token| {
+                    old_set
+                        .registry
+                        .resolve(token, Address::from([0x22; 20]))
+                        .unwrap()
+                })
+                .collect();
+            let old_quote = state.pricing.snapshot_many(&["COIN"]).await;
+            let mut entries = match change {
+                "removed" => vec![],
+                "readdressed" => vec![(Address::from([0x55; 20]).to_string(), "COIN".into())],
+                "added" => vec![
+                    (Address::from([0x11; 20]).to_string(), "COIN".into()),
+                    (Address::from([0x55; 20]).to_string(), "EXTRA".into()),
+                ],
+                _ => unreachable!(),
+            };
+            entries.push((Address::from([0x33; 20]).to_string(), "DRAM".into()));
+            state.tokens.replace(TokenSet::new(
+                TokenRegistry::new(entries, "0x2222222222222222222222222222222222222222").unwrap(),
+                vec![],
+            ));
+            state.pricing.forget(&["COIN".into()]).await;
+            assert!(!old_quote["COIN"].is_live());
+            // Pricing is still pinned: its next frame repopulates the old
+            // address with a fresh, unrevoked generation.
+            state.pricing.seed(test_quote(10_000)).await;
+            let fresh = state.pricing.snapshot_many(&["DRAM", "COIN"]).await;
+            assert!(fresh["COIN"].is_live());
+            let session = SessionInfo {
+                session: Session::Rth,
+                start: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                end: chrono::DateTime::from_timestamp(30, 0).unwrap(),
+            };
+            for envelope in [false, true] {
+                let mut built = Vec::new();
+                for pair in &pairs {
+                    let quote = &fresh[&pair.symbol];
+                    let response = build_response_from_quote_pair_bound(
+                        &state,
+                        pair,
+                        quote,
+                        pair.token,
+                        Address::from([0x22; 20]),
+                        &session,
+                        PairSchema::V5,
+                    )
+                    .await
+                    .unwrap();
+                    built.push(Ok(BuiltSlot {
+                        pair: pair.clone(),
+                        quote,
+                        response,
+                    }));
+                }
+                let current = state.pricing.snapshot_many(&["DRAM", "COIN"]).await;
+                let current_set = state.tokens.current();
+                let result = revalidate_batch(
+                    "v5",
+                    true,
+                    1_000,
+                    built,
+                    &current,
+                    &current_set.registry,
+                    envelope,
+                );
+                if change == "added" {
+                    assert!(
+                        result.unwrap().iter().all(Result::is_ok),
+                        "unrelated additions preserve both pairs"
+                    );
+                } else if envelope {
+                    let items = result.unwrap();
+                    assert_eq!(items.len(), 2);
+                    assert!(items[0].is_ok(), "the unchanged DRAM pair remains live");
+                    assert!(
+                        matches!(
+                            &items[1],
+                            Err(AppError::Unavailable {
+                                reason: UnavailableReason::NoLiveQuote,
+                                ..
+                            })
+                        ),
+                        "{change}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(AppError::Unavailable {
+                                reason: UnavailableReason::NoLiveQuote,
+                                ..
+                            })
+                        ),
+                        "{change}"
+                    );
+                }
             }
         }
     }

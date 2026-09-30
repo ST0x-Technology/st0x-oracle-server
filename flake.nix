@@ -11,8 +11,6 @@
 
   outputs =
     {
-      self,
-      nixpkgs,
       flake-utils,
       rainix,
       crane,
@@ -54,7 +52,9 @@
 
           # OCI image for Cloud Run — the nix-built binary containerised
           # with NO base image: just the binary's runtime closure + CA
-          # certs + the non-secret config. No shell, no package manager —
+          # certs. No config is baked in: every service mounts its config
+          # and sets CONFIG_PATH, and one that does not fails to boot
+          # instead of starting on stale rows. No shell, no package manager —
           # less surface than distroless. `created` is pinned so the same
           # commit rebuilds to the same digest (promote-by-digest =
           # content-address of the commit). Built in CI (linux) and
@@ -67,16 +67,11 @@
             contents = [
               rust.package
               pkgs.cacert
-              (pkgs.runCommand "oracle-config" { } ''
-                mkdir -p $out/etc
-                cp ${./config/st0x-oracle-server.toml} $out/etc/st0x-oracle-server.toml
-              '')
             ];
             config = {
               Cmd = [ "${rust.package}/bin/st0x-oracle-server" ];
               Env = [
                 "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-                "CONFIG_PATH=/etc/st0x-oracle-server.toml"
               ];
               ExposedPorts."3000/tcp" = { };
             };
