@@ -8,6 +8,7 @@ pub mod registry;
 pub mod reuse;
 pub mod sign;
 pub mod token_file;
+pub mod tokens;
 
 use alloy::primitives::{Address, B256};
 use alloy::sol;
@@ -31,6 +32,7 @@ use crate::market_hours::MarketHoursCache;
 use crate::metrics::MetricsHandle;
 use crate::pricing_client::{LiveClient, QuoteSnapshot};
 use crate::registry::{PriceDirection, ResolvedPair, TokenRegistry};
+use crate::tokens::{TokenSet, Tokens};
 use chrono::Utc;
 use st0x_pricing_types::Quote;
 
@@ -88,7 +90,10 @@ type OracleRequestTuple = (
 
 pub struct AppState {
     signer: Signer,
-    registry: TokenRegistry,
+    /// The running token set. It can be replaced while the server runs;
+    /// each handler takes one snapshot and resolves the whole request
+    /// against it.
+    tokens: Tokens,
     /// The chain this deployment signs for, from config. Scopes the
     /// pricing quote cache (only this chain's frames are served) and is
     /// carried at slot 9 of `/context/v7`, inside the signature, so a
@@ -99,9 +104,6 @@ pub struct AppState {
     /// the latest `Quote` per symbol in an RwLock<HashMap>. Replaces
     /// the Alpaca polling cache (pre-RAI-360).
     pricing: LiveClient,
-    /// Every symbol declared in config.toml. /status compares this
-    /// against the pricing cache to surface the partial-serving set.
-    configured_symbols: Vec<String>,
     /// Market-hours source from Alpaca's calendar, used ONLY to classify
     /// the current session for the v4/v5 session slots (tag +
     /// start/end bounds). `publish_time` comes from the pricing quote's
@@ -124,12 +126,31 @@ impl AppState {
         market_hours: Arc<MarketHoursCache>,
         metrics: MetricsHandle,
     ) -> Self {
-        Self {
+        Self::with_tokens(
             signer,
-            registry,
+            Tokens::new(TokenSet::new(registry, configured_symbols)),
             chain_id,
             pricing,
-            configured_symbols,
+            market_hours,
+            metrics,
+        )
+    }
+
+    /// Like `new`, but sharing a `Tokens` handle the caller can replace
+    /// while the server runs.
+    pub fn with_tokens(
+        signer: Signer,
+        tokens: Tokens,
+        chain_id: u64,
+        pricing: LiveClient,
+        market_hours: Arc<MarketHoursCache>,
+        metrics: MetricsHandle,
+    ) -> Self {
+        Self {
+            signer,
+            tokens,
+            chain_id,
+            pricing,
             market_hours,
             metrics,
             // Off until `with_signature_reuse` is called: `main.rs` passes
@@ -187,6 +208,9 @@ struct StatusResponse {
     signer: String,
     configured_symbols: Vec<String>,
     missing_symbols: Vec<String>,
+    /// The token file generation this instance runs; `null` when its
+    /// tokens did not come from the bucket.
+    registry_generation: Option<i64>,
 }
 
 /// Operational status of the server. `/health` is for Fly liveness and
@@ -195,11 +219,12 @@ struct StatusResponse {
 /// missing broker position is visible without parsing logs. Always
 /// returns 200; consumers gate on the contents of `missing_symbols`.
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
-    let missing = state.pricing.missing(&state.configured_symbols).await;
+    let set = state.tokens.current();
+    let missing = state.pricing.missing(&set.symbols).await;
     // Side-effect: refresh coverage + freshness gauges every /status hit
     // so dashboards don't need a dedicated background tick. /status is
     // already on the obs scrape path, so this is free.
-    ::metrics::gauge!("oracle_configured_symbols").set(state.configured_symbols.len() as f64);
+    ::metrics::gauge!("oracle_configured_symbols").set(set.symbols.len() as f64);
     ::metrics::gauge!("oracle_missing_symbols").set(missing.len() as f64);
     if let Some(newest_ms) = state.pricing.newest_source_ts_ms().await {
         let age_secs = (Utc::now().timestamp_millis() - newest_ms) as f64 / 1000.0;
@@ -207,8 +232,9 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     }
     Json(StatusResponse {
         signer: format!("{:?}", state.signer.address()),
-        configured_symbols: state.configured_symbols.clone(),
+        configured_symbols: set.symbols.clone(),
         missing_symbols: missing,
+        registry_generation: set.generation,
     })
 }
 
@@ -346,10 +372,14 @@ async fn post_signed_context_v1_inner(
     // did resolve. Strict mode surfaces the FIRST resolution failure
     // before touching the cache — exactly the order the all-or-nothing
     // path has always used.
+    //
+    // One token set for the whole request, so no two items resolve
+    // against different sets.
+    let set = state.tokens.current();
     let resolved: Vec<Result<ResolvedPair, AppError>> = requests
         .iter()
         .map(|(order, input_io_index, output_io_index, _counterparty)| {
-            resolve_pair_for_order(&state, order, *input_io_index, *output_io_index)
+            resolve_pair_for_order(&set.registry, order, *input_io_index, *output_io_index)
         })
         .collect();
     if !envelope && resolved.iter().any(Result::is_err) {
@@ -911,12 +941,15 @@ async fn post_signed_context_pair_bound(
     // Per-item, same as v1: a failed resolution stays in its slot for
     // envelope mode; strict mode surfaces the FIRST one before touching
     // the cache, preserving the historical resolve-before-build order.
+    //
+    // One token set for the whole request, taken here and never again.
+    let set = state.tokens.current();
     let resolved: Vec<Result<(Address, Address, ResolvedPair), AppError>> = requests
         .iter()
         .map(|(order, input_io_index, output_io_index, _counterparty)| {
             let (input_token, output_token) =
                 io_tokens_for(order, *input_io_index, *output_io_index)?;
-            let pair = state
+            let pair = set
                 .registry
                 .resolve(input_token, output_token)
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -1054,7 +1087,7 @@ fn io_tokens_for(
 /// Decode a request's IO indices into the actual input/output addresses
 /// and look them up in the token registry. Pure: never touches the cache.
 fn resolve_pair_for_order(
-    state: &AppState,
+    registry: &TokenRegistry,
     order: &OrderV4,
     input_io_index: alloy::primitives::U256,
     output_io_index: alloy::primitives::U256,
@@ -1086,8 +1119,7 @@ fn resolve_pair_for_order(
         })?
         .token;
 
-    let pair: ResolvedPair = state
-        .registry
+    let pair: ResolvedPair = registry
         .resolve(input_token, output_token)
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
@@ -2280,6 +2312,75 @@ mod expiry_tests {
         assert_eq!(
             error.into_response().status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// A request that resolved against the old token set and is signing
+    /// when the token is removed must not return that signature: the
+    /// removal revokes the quote it snapshotted.
+    #[tokio::test]
+    async fn a_removed_token_fails_a_request_already_signing_it() {
+        let pricing = LiveClient::with_seeded(vec![test_quote(i64::MAX)], 1).await;
+        let state = Arc::new(
+            AppState::new(
+                Signer::new(TEST_KEY)
+                    .unwrap()
+                    .with_test_delay(Duration::from_millis(100)),
+                TokenRegistry::new(
+                    vec![(
+                        "0x1111111111111111111111111111111111111111".into(),
+                        "COIN".into(),
+                    )],
+                    "0x2222222222222222222222222222222222222222",
+                )
+                .unwrap(),
+                1,
+                pricing.clone(),
+                vec!["COIN".into()],
+                Arc::new(MarketHoursCache::new()),
+                MetricsHandle::install().unwrap(),
+            )
+            .with_clock(Arc::new(SequenceClock::new([1_000]))),
+        );
+        let request = request_body(vec![request_tuple(
+            Address::from([0x22; 20]),
+            Address::from([0x11; 20]),
+        )]);
+
+        let request_state = Arc::clone(&state);
+        let in_flight = tokio::spawn(async move {
+            post_signed_context_pair_bound(
+                request_state,
+                ContextQuery::default(),
+                request,
+                PairSchema::V7,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.signer.cache_stats().misses == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request must reach the delayed signer");
+
+        state.tokens.replace(TokenSet::new(
+            TokenRegistry::new(vec![], "0x2222222222222222222222222222222222222222").unwrap(),
+            vec![],
+        ));
+        assert_eq!(pricing.forget(&["COIN".to_string()]).await, 1);
+
+        let error = in_flight.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AppError::Unavailable {
+                    reason: UnavailableReason::NoLiveQuote,
+                    ..
+                }
+            ),
+            "{error:?}"
         );
     }
 
