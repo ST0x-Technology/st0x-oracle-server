@@ -148,13 +148,13 @@ Robinhood Chain settles in USDG (Global Dollar), not Circle USDC — Circle's US
 is deployed there too and is not what the chain settles in.
 
 Robinhood Chain is staged, not live. Its tokens are whatever the production
-token file prices for raindex on chain 4663 (five wt tokens at the pinned
-generation: wtDNUT, wtFGI, wtGRND, wtPLBY and the wtSGOV probe), the same set
-st0x.pricing publishes there; `tests/fixtures/tokens-production.toml` is the
-snapshot the tests check against. `robinhood-release` reads both the image and
-the config from the tag, so a rollout must be dispatched from a tag cut after
-`deploy/config/robinhood.toml` switched to `[registry]`; an older tag would
-deploy its inline rows.
+token file prices for raindex on chain 4663 (six wt tokens at the pinned
+generation: wtDNUT, wtFGI, wtGRND, wtPLBY, wtSNES and the wtSGOV probe), the
+same set st0x.pricing publishes there; `tests/fixtures/tokens-production.toml`
+is the snapshot the tests check against. `robinhood-release` reads both the
+image and the config from the tag, so a rollout must be dispatched from a tag
+cut after `deploy/config/robinhood.toml` switched to `[registry]`; an older tag
+would deploy its inline rows.
 
 #### The chain is in the signature (v7)
 
