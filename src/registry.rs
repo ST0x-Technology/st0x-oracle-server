@@ -53,6 +53,9 @@ impl PriceDirection {
 pub struct ResolvedPair {
     /// Pricing-service asset symbol (e.g. "COIN").
     pub symbol: String,
+    /// The tStock address the request named. A quote is signed for this
+    /// pair only if pricing priced this same address (its `base`).
+    pub token: Address,
     /// Which of the two rates in the live `Quote` to sign for this
     /// request. Determined by which side of the swap is the quote token.
     pub direction: PriceDirection,
@@ -105,6 +108,7 @@ impl TokenRegistry {
             })?;
             return Ok(ResolvedPair {
                 symbol: symbol.clone(),
+                token: output_token,
                 direction: PriceDirection::QuoteToBase,
             });
         }
@@ -118,6 +122,7 @@ impl TokenRegistry {
             })?;
             return Ok(ResolvedPair {
                 symbol: symbol.clone(),
+                token: input_token,
                 direction: PriceDirection::BaseToQuote,
             });
         }
@@ -159,6 +164,7 @@ mod tests {
         let coin = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
         let pair = reg.resolve(usdc, coin).unwrap();
         assert_eq!(pair.symbol, "COIN");
+        assert_eq!(pair.token, coin);
         assert_eq!(pair.direction, PriceDirection::QuoteToBase);
     }
 
@@ -169,6 +175,7 @@ mod tests {
         let rklb = Address::from_str("0x2222222222222222222222222222222222222222").unwrap();
         let pair = reg.resolve(rklb, usdc).unwrap();
         assert_eq!(pair.symbol, "RKLB");
+        assert_eq!(pair.token, rklb);
         assert_eq!(pair.direction, PriceDirection::BaseToQuote);
     }
 

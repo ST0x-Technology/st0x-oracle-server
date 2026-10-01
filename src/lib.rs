@@ -421,6 +421,12 @@ fn revalidate_batch(
                 &slot.pair.symbol,
                 RefusalPhase::BatchFinal,
             )?;
+            validate_quote_address(
+                current_quote,
+                &slot.pair,
+                endpoint,
+                RefusalPhase::BatchFinal,
+            )?;
             validate_quote_expiry(
                 current_quote,
                 validated_at_unix_ms,
@@ -1382,6 +1388,51 @@ fn validate_quote_liveness(
     }
 }
 
+/// Refuse a quote that pricing published for another token than the one
+/// the request resolved. Pricing and the oracle each read the token file
+/// on their own schedule, so after a slot's address changes one of them can
+/// still hold the old address under the same symbol. Signing that quote
+/// would bind the new token to the old vault's price.
+fn validate_quote_address(
+    quote: &Quote,
+    pair: &ResolvedPair,
+    endpoint: &'static str,
+    phase: RefusalPhase,
+) -> Result<(), AppError> {
+    let priced = Address::from(quote.base.0);
+    if priced == pair.token {
+        return Ok(());
+    }
+    ::metrics::counter!(
+        "oracle_quote_address_mismatch_total",
+        "symbol" => pair.symbol.clone(),
+    )
+    .increment(1);
+    note_address_mismatch(&pair.symbol, priced, pair.token);
+    Err(no_live_quote_at(endpoint, &pair.symbol, phase))
+}
+
+/// ERROR once per (symbol, priced, resolved) triple, so a lasting mismatch
+/// on a polled symbol does not flood the log. The counter counts every one.
+fn note_address_mismatch(symbol: &str, priced: Address, resolved: Address) {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, Address, Address)>>,
+    > = std::sync::OnceLock::new();
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((symbol.to_owned(), priced, resolved));
+    if first {
+        tracing::error!(
+            symbol,
+            %priced,
+            %resolved,
+            "Pricing quotes this symbol for another token address; refusing to sign it"
+        );
+    }
+}
+
 fn validate_expiry_deadline(
     expiry_unix_ms: i64,
     checked_at_unix_ms: i64,
@@ -1548,6 +1599,7 @@ async fn build_response_from_quote_pair_bound(
     schema: PairSchema,
 ) -> Result<BuiltResponse, AppError> {
     validate_quote_liveness(quote, schema.tag(), &pair.symbol, RefusalPhase::Admission)?;
+    validate_quote_address(quote, pair, schema.tag(), RefusalPhase::Admission)?;
     validate_quote_expiry(
         quote,
         state.clock.now_unix_ms(),
@@ -1970,6 +2022,7 @@ mod expiry_tests {
     fn pair() -> ResolvedPair {
         ResolvedPair {
             symbol: "COIN".into(),
+            token: Address::from([0x11; 20]),
             direction: PriceDirection::BaseToQuote,
         }
     }
@@ -2007,6 +2060,7 @@ mod expiry_tests {
         let first = test_quote(first_expiry);
         let mut second = test_quote(second_expiry);
         second.asset = "DRAM".into();
+        second.base = WireAddress::from_bytes([0x33; 20]);
         let second_rate: B256 = Float::parse("50".to_string()).unwrap().into();
         second.rate_base_to_quote = WireFloat::from_bytes(second_rate.into());
         second.rate_quote_to_base = WireFloat::from_bytes(second_rate.into());
