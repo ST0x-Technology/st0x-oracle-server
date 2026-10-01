@@ -125,7 +125,7 @@ impl Config {
         if table.contains_key("registry") && !table.contains_key("tokens") {
             anyhow::bail!(
                 "config reads its tokens from [registry], which have not been merged in; \
-                 load it through token_file::load_into (or pass --registry-file to validate)"
+                 load it through token_file::boot (or pass --registry-file to validate)"
             );
         }
         let cfg: Config = table

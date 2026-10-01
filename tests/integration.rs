@@ -377,6 +377,23 @@ async fn missing_quotes_return_stable_no_live_quote_reason() {
     }
 }
 
+#[tokio::test]
+async fn a_quote_in_another_settlement_currency_is_refused() {
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
+        for body in [
+            encode_single(USDC, WCOIN),
+            encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)]),
+        ] {
+            let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+            quote.quote = WireAddress::from_bytes([0x55; 20]);
+            let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![quote]).await;
+            let (status, json) = post_status_and_json(app, endpoint, body).await;
+            assert_eq!(status, 503, "{endpoint}: {json}");
+            assert_eq!(json["error"], "no_live_quote", "{endpoint}");
+        }
+    }
+}
+
 async fn metrics_body(app: axum::Router) -> String {
     let response = app
         .oneshot(

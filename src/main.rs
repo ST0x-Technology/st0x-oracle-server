@@ -6,9 +6,10 @@ use st0x_oracle_server::market_hours::{
 };
 use st0x_oracle_server::metrics::MetricsHandle;
 use st0x_oracle_server::pricing_client::{LiveClient, LiveClientConfig};
-use st0x_oracle_server::registry::TokenRegistry;
+use st0x_oracle_server::reload::{record_applied, Reloader};
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::token_file;
+use st0x_oracle_server::tokens::Tokens;
 use st0x_oracle_server::{create_app, AppState};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -24,15 +25,11 @@ use tracing_subscriber::EnvFilter;
     Run `st0x-oracle-server validate [path] [--registry-file PATH]` to check a config file and exit.")]
 struct Cli {
     /// Path to config.toml. Contains port, pricing connection, and the
-    /// token registry — everything except secrets.
+    /// `[registry]` bucket the tokens come from — everything except
+    /// secrets. Outside GCP, set GCS_ACCESS_TOKEN (e.g. `gcloud auth
+    /// print-access-token`) to read the bucket.
     #[arg(long, default_value = "config.toml", env = "CONFIG_PATH")]
     config: PathBuf,
-
-    /// Read T0's token file from PATH instead of the bucket named in the
-    /// config's [registry]. For running locally; the deployed service
-    /// always reads the bucket.
-    #[arg(long, value_name = "PATH")]
-    registry_file: Option<PathBuf>,
 
     /// Private key for EIP-191 signing (hex, with or without 0x prefix).
     /// Local dev / tests only — production uses --signer-kms-key. Exactly
@@ -114,33 +111,25 @@ async fn main() -> anyhow::Result<()> {
     // would otherwise no-op. Matches the bebop / pricing pattern.
     let metrics = MetricsHandle::install()?;
 
-    // The token rows may live in the bucket rather than in the file. Merge
-    // them in before validation so the config is checked whole.
-    let mut table = Config::parse_table(&cli.config)?;
-    let static_table = table.clone();
-    let registry = token_file::source_of(&table)?;
-    let registry_live = match &registry {
-        Some(source) => {
-            let projection =
-                token_file::load_into(&mut table, source, cli.registry_file.as_deref()).await?;
-            tracing::info!(
-                url = %source.url,
-                generation = ?source.generation,
-                from_file = cli.registry_file.is_some(),
-                tokens = projection.tokens.len(),
-                "tokens loaded from the token file"
-            );
-            metrics::gauge!("oracle_registry_tokens").set(projection.tokens.len() as f64);
-            Some(projection)
-        }
-        None => None,
-    };
-    let config = Config::from_table(table)?;
-    if let (Some(source), Some(live)) = (registry, registry_live) {
-        if cli.registry_file.is_none() {
-            token_file::spawn_refresh(static_table, live, source);
-        }
-    }
+    // The first thing the server does is read the latest token file from
+    // the bucket and check it. Nothing listens until that succeeds: an
+    // instance that cannot read the live copy, or reads one that fails
+    // validation, exits instead of serving an old or unchecked token set.
+    let static_table = Config::parse_table(&cli.config)?;
+    let source = serve_source(&static_table)?;
+    let bucket = token_file::Bucket::from_env();
+    let (config, token_set) =
+        token_file::boot(&static_table, &source, &bucket, token_file::Retry::BOOT).await?;
+    tracing::info!(
+        url = %source.url,
+        generation = ?token_set.generation,
+        tokens = token_set.symbols.len(),
+        "tokens loaded from the latest token file"
+    );
+    record_applied(&token_set);
+    metrics::gauge!("oracle_registry_last_check_timestamp_seconds")
+        .set(chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+    metrics::gauge!("oracle_registry_invalid").set(0.0);
     tracing::info!(
         config = %cli.config.display(),
         port = config.port,
@@ -188,12 +177,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let alpaca = AlpacaClient::new(&cli.alpaca_api_key_id, &cli.alpaca_api_secret_key);
 
-    // The quote token comes from the config, not the binary: it is the
-    // one address in the registry that changes per chain — Base settles
-    // in USDC, Robinhood Chain in USDG — and it is keyed with the token
-    // list it has to agree with.
-    let registry = TokenRegistry::from_config(&config.tokens, &config.quote_token)?;
-
     tracing::info!("Signer address: {}", signer.address());
     tracing::info!(
         "Registered {} token(s): {}",
@@ -213,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
     // owns retry logic, so we don't gate startup on a successful
     // connect — that would block boot on a transient pricing-service
     // outage.
-    let symbols = config.symbols();
+    let symbols = token_set.symbols.clone();
+    let (assets_tx, assets_rx) = tokio::sync::watch::channel(symbols.clone());
     let pricing_ws_url = cli
         .pricing_ws_url
         .clone()
@@ -226,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
             symbols.clone(),
             config.chain_id,
         )
+        .with_assets(assets_rx)
         .with_iam_auth(cli.pricing_iam_auth),
     );
     tracing::info!(
@@ -254,12 +239,18 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(3600),
     );
 
-    let state = AppState::new(
+    let tokens = Tokens::new(token_set);
+    Reloader::new(tokens.clone(), assets_tx, pricing.clone()).spawn(
+        static_table,
+        config.clone(),
+        source,
+        bucket,
+    );
+    let state = AppState::with_tokens(
         signer,
-        registry,
+        tokens,
         config.chain_id,
         pricing,
-        symbols,
         market_hours,
         metrics,
     )
@@ -273,6 +264,17 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// The `[registry]` the server reads its tokens from. `serve` takes its
+/// tokens only from the live token file, never from rows in the config.
+fn serve_source(table: &toml::Table) -> anyhow::Result<token_file::RegistrySource> {
+    token_file::source_of(table)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the server reads its tokens only from the live token file; add [registry] \
+             (inline [[tokens]] are for `validate` and tests)"
+        )
+    })
 }
 
 /// The arguments after `validate`: one optional config path and an
@@ -304,16 +306,16 @@ fn validate_args(
 /// from the bucket is checked in full only with a copy of the token file;
 /// without one, everything else is checked and the output says so.
 fn validate(path: &str, registry_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let mut table = Config::parse_table(std::path::Path::new(path))?;
+    let table = Config::parse_table(std::path::Path::new(path))?;
     let config = match (token_file::source_of(&table)?, registry_file) {
         (None, _) => Config::from_table(table)?,
         (Some(_), Some(file)) => {
             let bytes = std::fs::read(file).map_err(|e| {
                 anyhow::anyhow!("reading the token file at {}: {e}", file.display())
             })?;
-            token_file::merge_bytes(&mut table, &bytes)?;
+            let (_, config, _) = token_file::candidate(&table, &bytes)?;
             println!("registry: tokens taken from {}", file.display());
-            Config::from_table(table)?
+            config
         }
         (Some(source), None) => {
             let config = Config::from_table_static(table)?;
@@ -346,6 +348,38 @@ mod tests {
 
     fn args(list: &[&str]) -> anyhow::Result<(Option<String>, Option<PathBuf>)> {
         validate_args(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn serve_refuses_inline_tokens_and_registry_file() {
+        let inline: toml::Table = toml::from_str(
+            r#"
+            [[tokens]]
+            address = "0x1111111111111111111111111111111111111111"
+            symbol = "wtCOIN"
+            "#,
+        )
+        .unwrap();
+        let err = serve_source(&inline).unwrap_err().to_string();
+        assert!(err.contains("add [registry]"), "{err}");
+
+        let registry: toml::Table = toml::from_str("[registry]\nurl = \"gs://b/o\"").unwrap();
+        assert_eq!(serve_source(&registry).unwrap().url, "gs://b/o");
+
+        let err = Cli::try_parse_from([
+            "st0x-oracle-server",
+            "--registry-file",
+            "t.toml",
+            "--pricing-api-key",
+            "k",
+            "--alpaca-api-key-id",
+            "a",
+            "--alpaca-api-secret-key",
+            "s",
+        ])
+        .err()
+        .expect("serve has no --registry-file");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

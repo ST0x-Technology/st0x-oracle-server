@@ -21,8 +21,9 @@ consumer = "oracle"
 # Tokens come from T0's token file in the bucket (st0x.registry
 # t0/staging.toml): every slot on this chain priced for raindex, as
 # `wt<SYM>` at its tokenized_equity_derivative (src/token_file.rs).
-# No `generation` pin: each new instance reads the latest copy.
-# Running instances report a newer copy on oracle_registry_pending_restart.
+# The oracle always runs the latest copy: boot reads it first and refuses
+# to start without a valid one, and running instances apply a valid new
+# copy within about 10s. A copy that fails validation is refused and
+# raises oracle_registry_invalid.
 [registry]
 url = "gs://t0-artifacts-tokens/staging/tokens.toml"
-refresh_secs = 60

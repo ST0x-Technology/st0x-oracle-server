@@ -59,21 +59,31 @@ impl MetricsHandle {
     fn declare() {
         metrics::describe_gauge!(
             "oracle_registry_tokens",
-            "Token rows this instance loaded from the token file at boot."
+            "Token rows this instance runs, from the token file generation on oracle_registry_generation."
         );
         metrics::describe_gauge!(
-            "oracle_registry_pending_restart",
-            "1 when the latest token file in the bucket differs from what this instance runs. \
-             It is not applied live; a release picks it up."
+            "oracle_registry_generation",
+            "Bucket object generation of the token file this instance runs."
         );
         metrics::describe_gauge!(
             "oracle_registry_invalid",
-            "1 when the latest token file in the bucket would be REFUSED at boot."
+            "1 while the latest token file in the bucket fails validation; this instance keeps \
+             the previous token set, and a new instance cannot start."
+        );
+        metrics::describe_counter!(
+            "oracle_registry_reload_total",
+            "Token file checks by result: applied (a new token set is live), unchanged, \
+             rejected (the latest copy fails validation, counted on every check while it stays \
+             the latest), fetch_error."
         );
         metrics::describe_gauge!(
-            "oracle_registry_pinned_unreadable",
-            "1 when the pinned token file generation failed three reads in a row. \
-             Boot reads only that generation, so the next cold start would fail."
+            "oracle_registry_last_applied_timestamp_seconds",
+            "Unix time the running token set was applied (boot or reload)."
+        );
+        metrics::describe_gauge!(
+            "oracle_registry_last_check_timestamp_seconds",
+            "Unix time of the last successful read of the token file. Stops advancing while the \
+             bucket cannot be read."
         );
         metrics::describe_counter!(
             "oracle_registry_fetch_errors_total",
@@ -103,7 +113,7 @@ impl MetricsHandle {
         );
         metrics::describe_gauge!(
             "oracle_configured_symbols",
-            "Number of symbols declared in config.toml — joined with oracle_missing_symbols on the dashboard for a coverage view"
+            "Number of symbols in the running token set — joined with oracle_missing_symbols on the dashboard for a coverage view"
         );
         metrics::describe_gauge!(
             "oracle_missing_symbols",
@@ -123,8 +133,8 @@ impl MetricsHandle {
         );
         metrics::describe_counter!(
             "oracle_quote_address_mismatch_total",
-            "Quotes refused because pricing priced another token address for the symbol than the \
-             one the request resolved (pricing and the oracle run different token sets)"
+            "Quotes refused because pricing priced another equity or settlement token address than the \
+             request's registry (pricing and the oracle run different token sets)"
         );
         metrics::describe_counter!(
             "oracle_quote_refusals_total",

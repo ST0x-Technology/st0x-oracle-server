@@ -101,12 +101,17 @@ Everything non-secret lives in `config.toml` at the repo root:
 
 ```toml
 port = 3000
-poll_interval_secs = 10
 
-[[tokens]]
-address = "0x5cDa0E1CA4ce2af96315f7F8963C85399c172204"
-symbol  = "COIN"
+[pricing]
+ws_url = "ws://st0x-pricing:8080/ws"
+consumer = "oracle"
+
+[registry]
+url = "gs://t0-artifacts-tokens/staging/tokens.toml"
 ```
+
+Inline `[[tokens]]` are accepted only by `validate` and tests. `serve` requires
+`[registry]` and reads the live bucket copy.
 
 The chain's settlement stable is the implicit quote token of every pair, and
 it's a property of the chain rather than of the protocol — it isn't even always
@@ -119,9 +124,38 @@ booting a registry that resolves nothing.
 The deployed configs carry no `[[tokens]]`. A `[registry]` section names T0's
 token file in the bucket (`st0x.registry` `t0/<env>.toml`), and boot takes every
 slot on the config's chain with `pricing = "enabled"` and `raindex` in its
-`venues`. Production pins the object `generation`, so a token change ships with
-a gated release. Check a config in full with
+`venues`. The server reads the latest bucket copy before it starts and refuses
+to start if the copy is unreachable or invalid. Check a config in full with
 `st0x-oracle-server validate <config> --registry-file <tokens.toml>`.
+
+### Live token-file reload
+
+The oracle conditionally polls the latest bucket object every 10 seconds. A
+valid change atomically replaces the token set and updates pricing
+subscriptions; removed or readdressed tokens have their cached quotes revoked.
+An invalid copy leaves the running set untouched. New instances still refuse
+that invalid copy. `[registry].generation` is refused, and `--registry-file` is
+available only for `validate`. For local serving, set `GCS_ACCESS_TOKEN` to a
+current access token.
+
+Production token publication is gated by the `tokens-production-publish` PAM
+grant. Its approval now authorizes a live oracle change. Pricing must also
+publish the new assets: an addition returns 503 until a live quote arrives, and
+a quote for a different token address is refused. Pricing hot reload is tracked
+separately in RAI-2784.
+
+`/status` exposes the running `registry_generation`. `/metrics` exposes
+`oracle_registry_generation`, `oracle_registry_invalid`,
+`oracle_registry_reload_total` (results: `applied`, `unchanged`, `rejected`,
+`fetch_error`), `oracle_registry_last_applied_timestamp_seconds`, and
+`oracle_registry_last_check_timestamp_seconds`. Alert on an invalid copy for
+five minutes or no successful check for two minutes.
+
+Release the new binary and pin-free config together from a version tag. Avoid a
+config-only production release before that rollout, or after rolling back to an
+older binary. A rollback tag carries its previous binary and config; reverting a
+valid but unwanted token change in st0x.registry and publishing it restores the
+live set within a poll interval.
 
 ### Chains
 
@@ -148,13 +182,13 @@ Robinhood Chain settles in USDG (Global Dollar), not Circle USDC — Circle's US
 is deployed there too and is not what the chain settles in.
 
 Robinhood Chain is staged, not live. Its tokens are whatever the production
-token file prices for raindex on chain 4663 (six wt tokens at the pinned
-generation: wtDNUT, wtFGI, wtGRND, wtPLBY, wtSNES and the wtSGOV probe), the
-same set st0x.pricing publishes there; `tests/fixtures/tokens-production.toml`
-is the snapshot the tests check against. `robinhood-release` reads both the
-image and the config from the tag, so a rollout must be dispatched from a tag
-cut after `deploy/config/robinhood.toml` switched to `[registry]`; an older tag
-would deploy its inline rows.
+token file prices for raindex on chain 4663.
+`tests/fixtures/tokens-production.toml` is the snapshot the tests check against
+(wtDNUT, wtFGI, wtGRND, wtPLBY, wtSNES and the wtSGOV probe); the live copy may
+change this set. `robinhood-release` reads both the image and the config from
+the tag, so a rollout must be dispatched from a tag cut after
+`deploy/config/robinhood.toml` switched to `[registry]`; an older tag would
+deploy its inline rows.
 
 #### The chain is in the signature (v7)
 
@@ -228,10 +262,8 @@ and region as the Base production service.
    `PRICING_API_KEY` or `PRICING_IAM_AUTH=true`, `ALPACA_API_KEY_ID`,
    `ALPACA_API_SECRET_KEY`.
 2. **`CONFIG_PATH=/config/st0x-oracle-server.toml` on that service.** The image
-   bakes `CONFIG_PATH=/etc/st0x-oracle-server.toml`, a Base registry with no
-   `chain_id`. A service that leaves the baked value serves Base prices on the
-   Robinhood URL and looks healthy doing it. This is the one env var that is
-   silently wrong rather than loudly missing.
+   carries no baked config or default `CONFIG_PATH`. The service must mount its
+   chain-specific config and set this path; a missing config fails boot.
 3. **Secret `oracle-runtime-config-robinhood`** in `t0-oracle` (t0.devops
    `modules/runtime-config`), mounted at `/config/st0x-oracle-server.toml`. The
    release adds versions to it; it never creates it. The service account the

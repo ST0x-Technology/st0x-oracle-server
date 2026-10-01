@@ -11,22 +11,23 @@
 //! The rows are merged into the parsed config table before it is
 //! deserialized, so [`Config::validate`] runs unchanged on the result.
 //!
-//! Every instance reads the file at boot. With `generation` set, it reads
-//! that exact object generation, so every instance of a revision signs for
-//! the same tokens and a change ships only through a release that bumps
-//! it. Without it, each new instance reads whatever the bucket holds. The
-//! refresh loop re-reads the latest copy and reports when it differs from
-//! what this instance runs, but never applies it. With a pin, it also
-//! checks the pinned generation is still readable.
+//! The oracle always runs the latest copy in the bucket. Boot reads it
+//! before anything else and refuses to start if it cannot read it or the
+//! copy fails validation; there is no pinned generation and no fallback.
+//! While running, the reload loop (`crate::reload`) checks for a newer
+//! generation every `refresh_secs` and applies a copy that passes the same
+//! checks boot runs ([`candidate`]).
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
 use toml::{Table, Value};
 
 use crate::config::{Config, USDC_BASE};
+use crate::registry::TokenRegistry;
+use crate::tokens::TokenSet;
 
 /// The `schema_version` this build understands.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -37,21 +38,26 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const METADATA_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
+const STORAGE_URL: &str = "https://storage.googleapis.com";
+
+/// Set to an OAuth access token (e.g. `gcloud auth print-access-token`) to
+/// read the bucket from outside GCP. Unset on the deployed service, which
+/// asks the metadata server.
+pub const ACCESS_TOKEN_ENV: &str = "GCS_ACCESS_TOKEN";
+
 /// `[registry]` in the oracle config.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrySource {
     /// `gs://bucket/object`, read with the runtime service account.
     pub url: String,
-    /// The object generation boot reads. Absent = the latest.
-    #[serde(default)]
-    pub generation: Option<u64>,
+    /// Seconds between checks for a newer copy. Floored at 5.
     #[serde(default = "default_refresh_secs")]
     pub refresh_secs: u64,
 }
 
 fn default_refresh_secs() -> u64 {
-    60
+    10
 }
 
 /// The oracle's slice of the token file for one chain.
@@ -63,13 +69,23 @@ pub struct Projection {
     pub tokens: Vec<Value>,
 }
 
+/// What changed between two projections, by symbol.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Change {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// In both, at another address.
+    pub readdressed: Vec<String>,
+    pub quote_token_changed: bool,
+}
+
 impl Projection {
     /// Same rows and quote token, ignoring address case.
     pub fn same_as(&self, other: &Projection) -> bool {
         self.rows() == other.rows() && self.quote_token.eq_ignore_ascii_case(&other.quote_token)
     }
 
-    fn rows(&self) -> BTreeSet<(String, String)> {
+    pub(crate) fn rows(&self) -> BTreeSet<(String, String)> {
         self.tokens
             .iter()
             .filter_map(|t| {
@@ -87,10 +103,16 @@ pub fn source_of(config: &Table) -> anyhow::Result<Option<RegistrySource>> {
     let Some(v) = config.get("registry") else {
         return Ok(None);
     };
+    if v.get("generation").is_some() {
+        bail!(
+            "[registry].generation is no longer supported: the oracle follows the latest \
+             bucket copy; delete it"
+        );
+    }
     let source: RegistrySource = v
         .clone()
         .try_into()
-        .context("[registry] must have `url` and, optionally, `generation` and `refresh_secs`")?;
+        .context("[registry] must have `url` and, optionally, `refresh_secs`")?;
     split_gs_url(&source.url)?;
     Ok(Some(source))
 }
@@ -250,74 +272,181 @@ pub fn http_client() -> reqwest::Client {
 #[derive(Deserialize)]
 struct MetadataToken {
     access_token: String,
+    expires_in: u64,
 }
 
-/// Read the object at a `gs://bucket/object` URL as the runtime service
-/// account. One `objects.get`; the reader role grants nothing else.
-pub async fn fetch(
-    http: &reqwest::Client,
-    gs_url: &str,
-    generation: Option<u64>,
-) -> anyhow::Result<Vec<u8>> {
-    let (bucket, object) = split_gs_url(gs_url)?;
+/// Where the bucket's access token comes from.
+enum TokenSource {
+    /// `GCS_ACCESS_TOKEN`, for runs outside GCP.
+    Fixed(String),
+    /// The metadata server, cached until a minute before it expires.
+    Metadata {
+        url: String,
+        cached: tokio::sync::Mutex<Option<(String, Instant)>>,
+    },
+}
 
-    let token = http
-        .get(METADATA_TOKEN_URL)
-        .header("Metadata-Flavor", "Google")
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .context("getting an access token to read the token file")?
-        .json::<MetadataToken>()
-        .await
-        .context("reading the metadata access token")?
-        .access_token;
-    let mut url = format!(
-        "https://storage.googleapis.com/storage/v1/b/{}/o/{}?alt=media",
-        percent(bucket),
-        percent(object)
-    );
-    if let Some(generation) = generation {
-        url.push_str(&format!("&generation={generation}"));
+/// One read of the object.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Read {
+    /// The latest generation is the one the read was conditional on.
+    Unchanged,
+    /// The latest copy and its generation, from the same response.
+    Copy { bytes: Vec<u8>, generation: i64 },
+}
+
+/// Reads the token file from the bucket as the runtime service account.
+/// Every read is one `objects.get`, which is all the reader role grants.
+pub struct Bucket {
+    http: reqwest::Client,
+    storage_url: String,
+    token: TokenSource,
+}
+
+impl Bucket {
+    /// Cloud Storage, authenticated by `GCS_ACCESS_TOKEN` when it is set
+    /// and by the metadata server otherwise.
+    pub fn from_env() -> Self {
+        let token = match std::env::var(ACCESS_TOKEN_ENV) {
+            Ok(t) if !t.trim().is_empty() => TokenSource::Fixed(t.trim().to_string()),
+            _ => TokenSource::Metadata {
+                url: METADATA_TOKEN_URL.to_string(),
+                cached: tokio::sync::Mutex::new(None),
+            },
+        };
+        Self {
+            http: http_client(),
+            storage_url: STORAGE_URL.to_string(),
+            token,
+        }
     }
-    let response = http
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .with_context(|| format!("fetching {gs_url}"))?;
-    let status = response.status();
-    let mut response = response;
-    if !status.is_success() {
-        // The first chunk is enough for the message; an error body is not
-        // worth reading up to MAX_BODY_BYTES.
-        let first = response.chunk().await.ok().flatten().unwrap_or_default();
-        bail!(
-            "fetching {gs_url} returned {status}: {}",
-            String::from_utf8_lossy(&first)
-                .chars()
-                .take(300)
-                .collect::<String>()
+
+    /// A bucket served at `storage_url`, for tests.
+    #[cfg(test)]
+    pub(crate) fn at(storage_url: &str, metadata_url: Option<&str>) -> Self {
+        Self {
+            http: http_client(),
+            storage_url: storage_url.to_string(),
+            token: match metadata_url {
+                Some(url) => TokenSource::Metadata {
+                    url: url.to_string(),
+                    cached: tokio::sync::Mutex::new(None),
+                },
+                None => TokenSource::Fixed("test-token".to_string()),
+            },
+        }
+    }
+
+    async fn access_token(&self) -> anyhow::Result<String> {
+        let (url, cached) = match &self.token {
+            TokenSource::Fixed(token) => return Ok(token.clone()),
+            TokenSource::Metadata { url, cached } => (url, cached),
+        };
+        let mut cached = cached.lock().await;
+        if let Some((token, until)) = cached.as_ref() {
+            if Instant::now() < *until {
+                return Ok(token.clone());
+            }
+        }
+        let fresh = self
+            .http
+            .get(url)
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .context("getting an access token to read the token file")?
+            .json::<MetadataToken>()
+            .await
+            .context("reading the metadata access token")?;
+        let until = Instant::now() + Duration::from_secs(fresh.expires_in.saturating_sub(60));
+        *cached = Some((fresh.access_token.clone(), until));
+        Ok(fresh.access_token)
+    }
+
+    async fn forget_access_token(&self) {
+        if let TokenSource::Metadata { cached, .. } = &self.token {
+            *cached.lock().await = None;
+        }
+    }
+
+    /// Read the latest copy of the object at a `gs://bucket/object` URL.
+    /// With `unless_generation`, a latest copy of that generation is not
+    /// sent again and the read is [`Read::Unchanged`].
+    pub async fn read(&self, gs_url: &str, unless_generation: Option<i64>) -> anyhow::Result<Read> {
+        let (bucket, object) = split_gs_url(gs_url)?;
+        let token = self.access_token().await?;
+        let mut url = format!(
+            "{}/storage/v1/b/{}/o/{}?alt=media",
+            self.storage_url,
+            percent(bucket),
+            percent(object)
         );
-    }
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_BODY_BYTES as u64)
-    {
-        bail!("{gs_url} is larger than {MAX_BODY_BYTES} bytes; refusing it");
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("reading the token file body")?
-    {
-        if body.len() + chunk.len() > MAX_BODY_BYTES {
+        if let Some(generation) = unless_generation {
+            url.push_str(&format!("&ifGenerationNotMatch={generation}"));
+        }
+        let mut response = self
+            .http
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .with_context(|| format!("fetching {gs_url}"))?;
+        let status = response.status();
+        // Only 304 proves the latest copy is still that generation. A 412 can
+        // carry other failed preconditions, so it is a fetch error.
+        if unless_generation.is_some() && status == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Read::Unchanged);
+        }
+        if !status.is_success() {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.forget_access_token().await;
+            }
+            // The first chunk is enough for the message; an error body is not
+            // worth reading up to MAX_BODY_BYTES.
+            let first = response.chunk().await.ok().flatten().unwrap_or_default();
+            bail!(
+                "fetching {gs_url} returned {status}: {}",
+                String::from_utf8_lossy(&first)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            );
+        }
+        let generation = generation_of(response.headers())
+            .with_context(|| format!("fetching {gs_url}: no usable x-goog-generation header"))?;
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_BODY_BYTES as u64)
+        {
             bail!("{gs_url} is larger than {MAX_BODY_BYTES} bytes; refusing it");
         }
-        body.extend_from_slice(&chunk);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("reading the token file body")?
+        {
+            if bytes.len() + chunk.len() > MAX_BODY_BYTES {
+                bail!("{gs_url} is larger than {MAX_BODY_BYTES} bytes; refusing it");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Read::Copy { bytes, generation })
     }
-    Ok(body)
+}
+
+/// The object generation of a media response. It names the bytes in the
+/// same response, so the two cannot come from different uploads.
+fn generation_of(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    headers
+        .get("x-goog-generation")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|g: &i64| *g > 0)
 }
 
 /// Percent-encode one path segment; object names contain `/`.
@@ -334,168 +463,135 @@ fn percent(segment: &str) -> String {
     out
 }
 
-/// Load the token file, project it, and merge it into `config`. `local`
-/// (`--registry-file`) reads a file instead of the bucket. Bucket reads are
-/// retried, so one transient error does not fail boot.
-pub async fn load_into(
-    config: &mut Table,
+/// Check a copy of the token file the way boot does and build what the
+/// server would run from it. Boot and the reload loop both call this, so
+/// they cannot disagree on what is valid.
+///
+/// `static_config` is the config table as parsed from disk, before the
+/// token rows are merged in.
+pub fn candidate(
+    static_config: &Table,
+    bytes: &[u8],
+) -> anyhow::Result<(Projection, Config, TokenRegistry)> {
+    let projection = project(&parse(bytes)?, chain_id_of(static_config)?)?;
+    let mut table = static_config.clone();
+    merge(&mut table, projection.clone())?;
+    let config = Config::from_table(table)?;
+    let registry = TokenRegistry::from_config(&config.tokens, &config.quote_token)?;
+    Ok((projection, config, registry))
+}
+
+/// How boot retries a failed bucket read.
+#[derive(Debug, Clone, Copy)]
+pub struct Retry {
+    pub attempts: u32,
+    /// Doubles after each failure.
+    pub first_backoff: Duration,
+}
+
+impl Retry {
+    /// Four reads, 4s/8s/16s apart: about half a minute, well inside the
+    /// Cloud Run startup timeout.
+    pub const BOOT: Self = Self {
+        attempts: 4,
+        first_backoff: Duration::from_secs(4),
+    };
+}
+
+/// Read the latest token file and build the token set the server starts
+/// with. A read is retried per `retry`; a copy that fails validation is
+/// not, and nothing falls back to an older copy.
+pub async fn boot(
+    static_config: &Table,
     source: &RegistrySource,
-    local: Option<&std::path::Path>,
-) -> anyhow::Result<Projection> {
-    let bytes = match local {
-        Some(path) => std::fs::read(path)
-            .with_context(|| format!("reading the token file at {}", path.display()))?,
-        None => {
-            let http = http_client();
-            let mut attempt = 1;
-            loop {
-                match fetch(&http, &source.url, source.generation).await {
-                    Ok(bytes) => break bytes,
-                    Err(e) if attempt < 4 => {
-                        tracing::warn!(attempt, error = %format!("{e:#}"), "token file: boot read failed; retrying");
-                        tokio::time::sleep(Duration::from_secs(2 << attempt)).await;
-                        attempt += 1;
-                    }
-                    Err(e) => return Err(e),
-                }
+    bucket: &Bucket,
+    retry: Retry,
+) -> anyhow::Result<(Config, TokenSet)> {
+    let mut backoff = retry.first_backoff;
+    let mut attempt = 1;
+    let (bytes, generation) = loop {
+        match bucket.read(&source.url, None).await {
+            Ok(Read::Copy { bytes, generation }) => break (bytes, generation),
+            Ok(Read::Unchanged) => {
+                bail!("an unconditional read of {} was not modified", source.url)
+            }
+            Err(e) if attempt < retry.attempts => {
+                tracing::warn!(attempt, url = %source.url, error = %format!("{e:#}"), "token file: boot read failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+                attempt += 1;
+            }
+            Err(e) => {
+                tracing::error!(url = %source.url, error = %format!("{e:#}"), "no live token file reachable; refusing to start");
+                return Err(e.context(format!(
+                    "no live token file reachable at {} after {attempt} tries; refusing to start",
+                    source.url
+                )));
             }
         }
     };
-    merge_bytes(config, &bytes)
+    let (projection, config, registry) = candidate(static_config, &bytes).with_context(|| {
+        format!(
+            "the live token file {} (generation {generation}) fails validation; refusing to start",
+            source.url
+        )
+    })?;
+    let set = TokenSet {
+        registry,
+        symbols: config.symbols(),
+        projection: Some(projection),
+        generation: Some(generation),
+    };
+    Ok((config, set))
 }
 
-/// What changed between the running projection and a fresh one, in one
-/// line for the log.
-pub fn describe_change(live: &Projection, fresh: &Projection) -> String {
+/// What changed between the running projection and a fresh one.
+pub fn change(live: &Projection, fresh: &Projection) -> Change {
     let (a, b) = (live.rows(), fresh.rows());
     let syms = |s: &BTreeSet<(String, String)>| -> BTreeSet<String> {
         s.iter().map(|(sym, _)| sym.clone()).collect()
     };
     let (sa, sb) = (syms(&a), syms(&b));
-    let mut parts = Vec::new();
-    let added: Vec<_> = sb.difference(&sa).cloned().collect();
-    let removed: Vec<_> = sa.difference(&sb).cloned().collect();
-    if !added.is_empty() {
-        parts.push(format!("added [{}]", added.join(",")));
-    }
-    if !removed.is_empty() {
-        parts.push(format!("removed [{}]", removed.join(",")));
-    }
-    let moved: Vec<_> = sa
-        .intersection(&sb)
-        .filter(|s| a.iter().find(|(x, _)| x == *s) != b.iter().find(|(x, _)| x == *s))
-        .cloned()
-        .collect();
-    if !moved.is_empty() {
-        parts.push(format!("address changed [{}]", moved.join(",")));
-    }
-    if live.quote_token.to_lowercase() != fresh.quote_token.to_lowercase() {
-        parts.push("quote token changed".to_string());
-    }
-    if parts.is_empty() {
-        "no difference".to_string()
-    } else {
-        parts.join("; ")
+    Change {
+        added: sb.difference(&sa).cloned().collect(),
+        removed: sa.difference(&sb).cloned().collect(),
+        readdressed: sa
+            .intersection(&sb)
+            .filter(|s| a.iter().find(|(x, _)| x == *s) != b.iter().find(|(x, _)| x == *s))
+            .cloned()
+            .collect(),
+        quote_token_changed: !live.quote_token.eq_ignore_ascii_case(&fresh.quote_token),
     }
 }
 
-/// Check a fresh copy of the token file exactly the way boot would and
-/// compare it with what this instance runs. `Err`: boot would refuse it.
-/// `Ok(None)`: the same rows. `Ok(Some(change))`: a release would change
-/// them, described in one line.
-///
-/// `static_config` is the config table as parsed from disk, before the
-/// token rows were merged in.
-pub fn assess(
-    static_config: &Table,
-    live: &Projection,
-    bytes: &[u8],
-) -> anyhow::Result<Option<String>> {
-    let fresh = project(&parse(bytes)?, live.chain_id)?;
-    let mut candidate = static_config.clone();
-    merge(&mut candidate, fresh.clone())?;
-    Config::from_table(candidate)?;
-    Ok((!fresh.same_as(live)).then(|| describe_change(live, &fresh)))
-}
-
-fn set_gauge(name: &'static str, on: bool) {
-    metrics::gauge!(name).set(if on { 1.0 } else { 0.0 });
-}
-
-/// Re-read the token file on an interval and say whether this instance is
-/// behind it, and whether boot would accept it. Reports only; never applies.
-///
-/// Each fresh copy goes through [`assess`] against `static_config`, the
-/// config table as parsed from disk.
-pub fn spawn_refresh(static_config: Table, live: Projection, source: RegistrySource) {
-    tokio::spawn(async move {
-        let http = http_client();
-        let mut ticker = tokio::time::interval(Duration::from_secs(source.refresh_secs.max(5)));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await; // first tick is immediate; boot just loaded it.
-                             // Boot loaded what it runs, so nothing is pending or invalid until a
-                             // refresh says otherwise; without this the gauges are absent, not 0.
-        set_gauge("oracle_registry_pending_restart", false);
-        set_gauge("oracle_registry_invalid", false);
-        set_gauge("oracle_registry_pinned_unreadable", false);
-        let mut pending: Option<String> = None;
-        let mut pinned_failures = 0u32;
-        loop {
-            ticker.tick().await;
-
-            // Boot reads only the pinned generation and has no fallback, so
-            // check it is still there. Three misses in a row, so one
-            // transient error does not raise the gauge.
-            if let Some(generation) = source.generation {
-                match fetch(&http, &source.url, Some(generation)).await {
-                    Ok(_) => pinned_failures = 0,
-                    Err(e) => {
-                        pinned_failures += 1;
-                        metrics::counter!("oracle_registry_fetch_errors_total").increment(1);
-                        tracing::warn!(url = %source.url, generation, failures = pinned_failures, error = %format!("{e:#}"), "token file: the pinned generation could not be read; boot needs it");
-                    }
-                }
-                set_gauge("oracle_registry_pinned_unreadable", pinned_failures >= 3);
-            }
-
-            let bytes = match fetch(&http, &source.url, None).await {
-                Ok(b) => b,
-                Err(e) => {
-                    metrics::counter!("oracle_registry_fetch_errors_total").increment(1);
-                    tracing::warn!(url = %source.url, error = %format!("{e:#}"), "token file: fetch failed; still running what boot loaded");
-                    continue;
-                }
-            };
-
-            let change = match assess(&static_config, &live, &bytes) {
-                Ok(change) => {
-                    set_gauge("oracle_registry_invalid", false);
-                    change
-                }
-                Err(e) => {
-                    set_gauge("oracle_registry_invalid", true);
-                    tracing::error!(url = %source.url, error = %format!("{e:#}"), "token file: the bucket copy would be REFUSED at boot; fix it before the next restart");
-                    continue;
-                }
-            };
-
-            match change {
-                None => {
-                    if pending.take().is_some() {
-                        tracing::info!("token file: bucket copy matches this instance again");
-                    }
-                    set_gauge("oracle_registry_pending_restart", false);
-                }
-                Some(change) => {
-                    if pending.as_deref() != Some(&change) {
-                        tracing::warn!(change = %change, "token file: bucket copy differs from what this instance runs; a release picks it up");
-                        pending = Some(change);
-                    }
-                    set_gauge("oracle_registry_pending_restart", true);
-                }
-            }
+impl std::fmt::Display for Change {
+    /// One line for the log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        if !self.added.is_empty() {
+            parts.push(format!("added [{}]", self.added.join(",")));
         }
-    });
+        if !self.removed.is_empty() {
+            parts.push(format!("removed [{}]", self.removed.join(",")));
+        }
+        if !self.readdressed.is_empty() {
+            parts.push(format!("address changed [{}]", self.readdressed.join(",")));
+        }
+        if self.quote_token_changed {
+            parts.push("quote token changed".to_string());
+        }
+        if parts.is_empty() {
+            f.write_str("no difference")
+        } else {
+            f.write_str(&parts.join("; "))
+        }
+    }
+}
+
+/// What changed between the running projection and a fresh one, in one
+/// line for the log.
+pub fn describe_change(live: &Projection, fresh: &Projection) -> String {
+    change(live, fresh).to_string()
 }
 
 /// Load a deployed config for a test, taking the token rows from the
@@ -595,7 +691,12 @@ mod tests {
                 source.url,
                 format!("gs://t0-artifacts-tokens/{env}/tokens.toml")
             );
-            assert_eq!(source.generation.is_some(), env == "production", "{plane}");
+            assert!(
+                table["registry"].get("generation").is_none()
+                    && table["registry"].get("refresh_secs").is_none(),
+                "{plane}: follows the latest copy at the default interval"
+            );
+            assert_eq!(source.refresh_secs, 10, "{plane}");
             let config = load_deployed(Path::new(&path)).expect("merged config must validate");
             assert_eq!(config.chain_id, chain_id, "{plane}");
             assert_eq!(config.tokens.len(), count, "{plane}");
@@ -768,43 +869,215 @@ mod tests {
         assert_eq!(describe_change(&p, &p), "no difference");
     }
 
-    /// The refresh verdict on the production Base plane: an unchanged
-    /// copy, one slot switched off, and a placeholder address.
     #[test]
-    fn assess_gives_the_refresh_verdict() {
-        let static_config = Config::parse_table(Path::new(&deployed("production"))).unwrap();
-        let bytes = fixture("tokens-production.toml");
-        let live = project(&parse(bytes.as_bytes()).unwrap(), 8453).unwrap();
+    fn a_pinned_generation_is_refused() {
+        let table: Table =
+            toml::from_str("[registry]\nurl = \"gs://b/o\"\ngeneration = 1790782803062872")
+                .unwrap();
+        let err = source_of(&table).unwrap_err().to_string();
+        assert!(err.contains("generation is no longer supported"), "{err}");
+    }
+
+    /// One queued response from the stub bucket.
+    struct Reply {
+        status: u16,
+        generation: Option<&'static str>,
+        body: Vec<u8>,
+    }
+
+    fn copy(generation: &'static str, body: &[u8]) -> Reply {
+        Reply {
+            status: 200,
+            generation: Some(generation),
+            body: body.to_vec(),
+        }
+    }
+
+    fn status(status: u16) -> Reply {
+        Reply {
+            status,
+            generation: None,
+            body: b"nope".to_vec(),
+        }
+    }
+
+    #[derive(Default)]
+    struct Stub {
+        replies: std::sync::Mutex<std::collections::VecDeque<Reply>>,
+        queries: std::sync::Mutex<Vec<String>>,
+        token_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A local stand-in for Cloud Storage and the metadata server. Each
+    /// object read takes the next queued reply; an empty queue is a 503.
+    async fn stub(replies: Vec<Reply>) -> (String, std::sync::Arc<Stub>) {
+        use axum::extract::{RawQuery, State};
+        use axum::response::IntoResponse;
+        let stub = std::sync::Arc::new(Stub {
+            replies: std::sync::Mutex::new(replies.into()),
+            ..Default::default()
+        });
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::get(|State(stub): State<std::sync::Arc<Stub>>| async move {
+                    stub.token_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"access_token": "t", "expires_in": 3600}))
+                }),
+            )
+            .fallback(
+                |State(stub): State<std::sync::Arc<Stub>>, RawQuery(q): RawQuery| async move {
+                    stub.queries.lock().unwrap().push(q.unwrap_or_default());
+                    let reply = stub
+                        .replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(status(503));
+                    let mut response = (
+                        axum::http::StatusCode::from_u16(reply.status).unwrap(),
+                        reply.body,
+                    )
+                        .into_response();
+                    if let Some(g) = reply.generation {
+                        response
+                            .headers_mut()
+                            .insert("x-goog-generation", g.parse().unwrap());
+                    }
+                    response
+                },
+            )
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, stub)
+    }
+
+    const URL: &str = "gs://t0-artifacts-tokens/production/tokens.toml";
+
+    #[tokio::test]
+    async fn a_read_carries_its_generation_and_only_304_is_unchanged() {
+        let (url, stub) = stub(vec![
+            copy("1790782803062872", b"body"),
+            status(304),
+            status(412),
+            Reply {
+                status: 200,
+                generation: None,
+                body: b"body".to_vec(),
+            },
+            copy("not-a-number", b"body"),
+        ])
+        .await;
+        let bucket = Bucket::at(&url, Some(&format!("{url}/token")));
 
         assert_eq!(
-            assess(&static_config, &live, bytes.as_bytes()).unwrap(),
-            None
+            bucket.read(URL, None).await.unwrap(),
+            Read::Copy {
+                bytes: b"body".to_vec(),
+                generation: 1790782803062872
+            }
         );
-
-        let mut file = parse(bytes.as_bytes()).unwrap();
-        let coin = file["chains"]["base"]["assets"]["equities"]["COIN"]
-            .as_table_mut()
-            .unwrap();
-        coin.insert("pricing".into(), Value::String("disabled".into()));
-        let disabled = toml::to_string(&file).unwrap();
+        assert_eq!(bucket.read(URL, Some(7)).await.unwrap(), Read::Unchanged);
+        let err = format!("{:#}", bucket.read(URL, Some(7)).await.unwrap_err());
+        assert!(err.contains("412"), "{err}");
+        for _ in 0..2 {
+            let err = format!("{:#}", bucket.read(URL, None).await.unwrap_err());
+            assert!(err.contains("x-goog-generation"), "{err}");
+        }
+        let queries = stub.queries.lock().unwrap().clone();
+        assert_eq!(queries[0], "alt=media");
+        assert_eq!(queries[1], "alt=media&ifGenerationNotMatch=7");
         assert_eq!(
-            assess(&static_config, &live, disabled.as_bytes()).unwrap(),
-            Some("removed [wtCOIN]".to_string())
+            stub.token_reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the access token is cached"
         );
+    }
 
-        let mut file = parse(bytes.as_bytes()).unwrap();
-        let coin = file["chains"]["base"]["assets"]["equities"]["COIN"]
-            .as_table_mut()
-            .unwrap();
-        coin.insert(
-            "tokenized_equity_derivative".into(),
-            Value::String("0x0000000000000000000000000000000000000001".into()),
-        );
-        let placeholder = toml::to_string(&file).unwrap();
+    const FAST: Retry = Retry {
+        attempts: 4,
+        first_backoff: Duration::from_millis(1),
+    };
+
+    fn production() -> (Table, RegistrySource) {
+        let table = Config::parse_table(Path::new(&deployed("production"))).unwrap();
+        let source = source_of(&table).unwrap().unwrap();
+        (table, source)
+    }
+
+    #[tokio::test]
+    async fn boot_refuses_to_start_without_a_live_copy() {
+        let (table, source) = production();
+        let (url, stub) = stub(vec![]).await;
         let err = format!(
             "{:#}",
-            assess(&static_config, &live, placeholder.as_bytes()).unwrap_err()
+            boot(&table, &source, &Bucket::at(&url, None), FAST)
+                .await
+                .unwrap_err()
         );
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(err.contains("503"), "{err}");
+        assert_eq!(
+            stub.queries.lock().unwrap().len(),
+            4,
+            "retried, then gave up"
+        );
+
+        // Nothing listening at all.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let err = format!(
+            "{:#}",
+            boot(&table, &source, &Bucket::at(&closed, None), FAST)
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("no live token file reachable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn boot_refuses_an_invalid_live_copy() {
+        let (table, source) = production();
+        let mut file = parse(fixture("tokens-production.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["COIN"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "tokenized_equity_derivative".into(),
+                Value::String("0x0000000000000000000000000000000000000001".into()),
+            );
+        let bad = toml::to_string(&file).unwrap();
+        let (url, stub) = stub(vec![copy("9", bad.as_bytes())]).await;
+        let err = format!(
+            "{:#}",
+            boot(&table, &source, &Bucket::at(&url, None), FAST)
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("generation 9) fails validation"), "{err}");
         assert!(err.contains("Placeholder address"), "{err}");
+        assert_eq!(stub.queries.lock().unwrap().len(), 1, "not retried");
+    }
+
+    #[tokio::test]
+    async fn boot_applies_the_latest_generation() {
+        let (table, source) = production();
+        let (url, _stub) = stub(vec![
+            status(500),
+            copy("7", fixture("tokens-production.toml").as_bytes()),
+        ])
+        .await;
+        let (config, set) = boot(&table, &source, &Bucket::at(&url, None), FAST)
+            .await
+            .unwrap();
+        assert_eq!(set.generation, Some(7));
+        assert_eq!(config.tokens.len(), 48);
+        assert_eq!(set.symbols, config.symbols());
+        assert!(set.projection.is_some());
     }
 }

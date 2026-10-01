@@ -24,13 +24,12 @@ consumer = "oracle"
 # Tokens come from T0's token file in the bucket (st0x.registry
 # t0/production.toml): every slot on this chain priced for raindex, as
 # `wt<SYM>` at its tokenized_equity_derivative (src/token_file.rs).
-# Boot reads the pinned `generation`, so every instance signs for the same
-# tokens and a change ships only with a gated release that bumps it.
-# The bucket keeps old generations: it is versioned with 30-day soft
-# delete, and a noncurrent version is deleted only when it is over 365
-# days old and has 10 newer versions, so this pin stays readable.
-# Running instances report a newer copy on oracle_registry_pending_restart.
+# The oracle always runs the LATEST copy; there is no pin. Boot reads it
+# first and refuses to start if it cannot read it or it fails validation.
+# Running instances check every 10s and apply a valid new copy within
+# seconds, with no release. A copy that fails validation is refused: they
+# keep their current tokens and raise oracle_registry_invalid. The gate on
+# a production token change is therefore the tokens-production-publish PAM
+# grant that uploads the file: an approved publish goes live.
 [registry]
 url = "gs://t0-artifacts-tokens/production/tokens.toml"
-generation = 1790782803062872
-refresh_secs = 60
