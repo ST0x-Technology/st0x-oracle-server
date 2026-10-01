@@ -14,15 +14,15 @@
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::HeaderValue;
 use st0x_pricing_types::{
-    ClientFrame, ErrorCode, PongFrame, Quote, ServerFrame, SubscribeFrame, Symbol,
+    ClientFrame, ErrorCode, PongFrame, Quote, ServerFrame, SubscribeFrame, Symbol, UnsubscribeFrame,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
@@ -48,7 +48,10 @@ pub struct LiveClientConfig {
     pub ws_url: String,
     pub api_key: String,
     pub consumer: String,
-    pub assets: Vec<Symbol>,
+    /// The symbols to subscribe to. A session sends the difference as
+    /// `Subscribe` / `Unsubscribe` when the value changes, and a price frame
+    /// for a symbol not in the current value is dropped.
+    pub assets: watch::Receiver<Vec<Symbol>>,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
     /// When true, authenticate the WS handshake with a Google ID token minted
@@ -72,6 +75,9 @@ impl LiveClientConfig {
         assets: Vec<Symbol>,
         chain_id: u64,
     ) -> Self {
+        // A fixed list: the sender is dropped, so the session never sees a
+        // change. `with_assets` takes a live one.
+        let (_, assets) = watch::channel(assets);
         Self {
             ws_url: ws_url.into(),
             api_key: api_key.into(),
@@ -82,6 +88,13 @@ impl LiveClientConfig {
             iam_auth: false,
             chain_id,
         }
+    }
+
+    /// Follow a symbol list that can change while the client runs.
+    #[must_use]
+    pub fn with_assets(mut self, assets: watch::Receiver<Vec<Symbol>>) -> Self {
+        self.assets = assets;
+        self
     }
 
     /// Authenticate with a Cloud Run IAM ID token instead of the API key.
@@ -226,6 +239,19 @@ impl Deref for QuoteSnapshot {
 
 type QuoteCache = Arc<RwLock<HashMap<(u64, Symbol), CachedQuote>>>;
 
+/// Remove and revoke every cached quote for `symbols`, on every chain.
+fn evict(cache: &mut HashMap<(u64, Symbol), CachedQuote>, symbols: &HashSet<&str>) -> usize {
+    let before = cache.len();
+    cache.retain(|(_, symbol), entry| {
+        let keep = !symbols.contains(symbol.as_str());
+        if !keep {
+            entry.revoke();
+        }
+        keep
+    });
+    before - cache.len()
+}
+
 fn insert_quote(cache: &mut HashMap<(u64, Symbol), CachedQuote>, quote: Quote) {
     let key = (quote.chain_id, quote.asset.clone());
     let generation = cache
@@ -252,6 +278,21 @@ impl LiveClient {
         let task_cache = cache.clone();
         tokio::spawn(async move { run_loop(cfg, task_cache).await });
         Self { cache, chain_id }
+    }
+
+    /// Drop and revoke every cached quote for `symbols`, on every chain.
+    /// A request that already snapshotted one of them fails its final
+    /// liveness check instead of signing it.
+    ///
+    /// Change the subscribed list first: a frame is checked against that
+    /// list under the same write lock this takes, so once the list no
+    /// longer has a symbol, no frame for it lands after this returns.
+    pub async fn forget(&self, symbols: &[String]) -> usize {
+        if symbols.is_empty() {
+            return 0;
+        }
+        let symbols: HashSet<&str> = symbols.iter().map(String::as_str).collect();
+        evict(&mut *self.cache.write().await, &symbols)
     }
 
     /// Test-only constructor that builds a `LiveClient` with a
@@ -334,13 +375,21 @@ impl LiveClient {
 
     #[cfg(test)]
     pub(crate) async fn apply_test_frame(&self, frame: ServerFrame) {
-        apply_server_frame(&self.cache, frame).await;
+        apply_server_frame(&self.cache, None, frame).await;
     }
 }
 
 async fn run_loop(cfg: LiveClientConfig, cache: QuoteCache) {
     let mut backoff = cfg.initial_backoff;
+    let mut assets = cfg.assets.clone();
     loop {
+        // Pricing rejects empty Subscribe frames. Stay disconnected until
+        // there is something to request, including after the last removal.
+        while assets.borrow().is_empty() {
+            if assets.changed().await.is_err() {
+                return;
+            }
+        }
         match connect_and_run(&cfg, &cache).await {
             Ok(()) => {
                 tracing::info!("Pricing WS session ended cleanly; reconnecting");
@@ -462,7 +511,8 @@ fn note_deadline_validity(chain_id: u64, asset: &str, valid: bool) {
 ///   `chain_id` — the rates, expiry, source_ts and NAV ratio of a cached
 ///   observation always come from the same frame, so a signed context can
 ///   never pair a rate from one frame with a NAV ratio from another, nor a
-///   rate from one chain with a request on another.
+///   rate from one chain with a request on another. A frame for a symbol
+///   not in `assets` (removed from the token set) is dropped.
 /// - `Halt` fails closed: `halted = true` evicts the cached quote so
 ///   every subsequent request for the asset 503s instead of serving a
 ///   price the producer has disowned (the wrapped vault NAV can step on
@@ -470,7 +520,11 @@ fn note_deadline_validity(chain_id: u64, asset: &str, valid: bool) {
 ///   (`halted = false`) needs no action — the next price frame
 ///   repopulates the cache. Both are scoped to the frame's chain: a halt
 ///   elsewhere must not evict the quote this deployment serves.
-async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<ClientFrame> {
+async fn apply_server_frame(
+    cache: &QuoteCache,
+    assets: Option<&watch::Receiver<Vec<Symbol>>>,
+    frame: ServerFrame,
+) -> Option<ClientFrame> {
     match frame {
         ServerFrame::Price(p) => {
             note_deadline_validity(
@@ -494,6 +548,13 @@ async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<Cl
                 underlying_rate_quote_to_base: p.underlying_rate_quote_to_base,
             };
             let mut guard = cache.write().await;
+            // Checked under the write lock `LiveClient::forget` takes: a frame
+            // that passed against the old list is in the cache before
+            // `forget` runs, and `forget` removes it.
+            if assets.is_some_and(|assets| !assets.borrow().contains(&q.asset)) {
+                tracing::debug!(asset = %q.asset, "Price frame for a symbol no longer subscribed; dropped");
+                return None;
+            }
             insert_quote(&mut guard, q);
             None
         }
@@ -510,14 +571,7 @@ async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<Cl
                     // quote could keep serving the observation pricing just
                     // disowned. Fail closed across chains for now. Once the wire
                     // and producer carry chain_id, narrow this to one cache key.
-                    let mut guard = cache.write().await;
-                    guard.retain(|(_, symbol), entry| {
-                        let keep = symbol != &asset;
-                        if !keep {
-                            entry.revoke();
-                        }
-                        keep
-                    });
+                    evict(&mut *cache.write().await, &HashSet::from([asset.as_str()]));
                     tracing::warn!(%asset, "Stale pricing source; quote evicted on every chain");
                 } else {
                     tracing::warn!("Stale-source frame omitted asset; no quotes evicted");
@@ -543,6 +597,9 @@ async fn apply_server_frame(cache: &QuoteCache, frame: ServerFrame) -> Option<Cl
 }
 
 async fn connect_and_run(cfg: &LiveClientConfig, cache: &QuoteCache) -> Result<(), ClientError> {
+    if cfg.assets.borrow().is_empty() {
+        return Ok(());
+    }
     let mut req = cfg
         .ws_url
         .as_str()
@@ -564,60 +621,137 @@ async fn connect_and_run(cfg: &LiveClientConfig, cache: &QuoteCache) -> Result<(
         http::header::AUTHORIZATION,
         HeaderValue::from_str(&bearer).map_err(|e| ClientError::Header(format!("{e}")))?,
     );
-    let (mut socket, _resp) = tokio_tungstenite::connect_async(req)
+    let (socket, _resp) = tokio_tungstenite::connect_async(req)
         .await
         .map_err(|e| ClientError::WebSocket(format!("{e}")))?;
+    run_session(cfg, cache, socket).await
+}
 
-    let sub = ClientFrame::Subscribe(SubscribeFrame {
-        consumer: cfg.consumer.clone(),
-        assets: cfg.assets.clone(),
-    });
+async fn send_frame<S>(socket: &mut S, frame: &ClientFrame) -> Result<(), ClientError>
+where
+    S: futures_util::Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
     socket
-        .send(WsMessage::Binary(encode_cbor(&sub)?))
+        .send(WsMessage::Binary(encode_cbor(frame)?))
         .await
-        .map_err(|e| ClientError::WebSocket(format!("{e}")))?;
+        .map_err(|e| ClientError::WebSocket(format!("{e}")))
+}
 
-    // Bound every read. The pricing server heartbeats every 15s
-    // (ServerFrame::Ping) and itself drops clients that stop ponging, so a
-    // healthy wire always carries a frame at least every 15s. Without a
+/// One connected session: subscribe to the current list, then read frames
+/// and follow changes to the list until the socket fails.
+async fn run_session<S>(
+    cfg: &LiveClientConfig,
+    cache: &QuoteCache,
+    mut socket: S,
+) -> Result<(), ClientError>
+where
+    S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+        + futures_util::Sink<WsMessage>
+        + Unpin,
+    <S as futures_util::Sink<WsMessage>>::Error: std::fmt::Display,
+{
+    let mut assets = cfg.assets.clone();
+    let mut sent: BTreeSet<Symbol> = assets.borrow_and_update().iter().cloned().collect();
+    // The watch may become empty while authentication or the handshake
+    // awaits. Return to run_loop's wait rather than sending an invalid frame.
+    if sent.is_empty() {
+        return Ok(());
+    }
+    send_frame(
+        &mut socket,
+        &ClientFrame::Subscribe(SubscribeFrame {
+            consumer: cfg.consumer.clone(),
+            assets: sent.iter().cloned().collect(),
+        }),
+    )
+    .await?;
+    // A fixed list (the sender is gone) never changes; stop polling it.
+    let mut watching = true;
+
+    // Bound the silence between frames. The pricing server heartbeats every
+    // 15s (ServerFrame::Ping) and itself drops clients that stop ponging, so
+    // a healthy wire always carries a frame at least every 15s. Without a
     // deadline, a half-open TCP path (LB idle drop, NAT timeout — the close
-    // never reaches us) leaves `socket.next()` blocked forever: no error, no
+    // never reaches us) leaves the read blocked forever: no error, no
     // reconnect, and the price cache silently freezes. That is exactly how
     // production served 14-hour-old marks on 2026-07-20 (source_ts pinned at
     // 09:21 UTC with zero session-error log lines). Four missed heartbeats
     // means the session is dead — surface it as an error so `run_loop`
-    // reconnects with backoff.
+    // reconnects with backoff. Only an inbound frame moves the deadline; a
+    // token-set change does not.
+    let deadline = tokio::time::sleep(READ_DEADLINE);
+    tokio::pin!(deadline);
+
     loop {
-        let msg = match tokio::time::timeout(READ_DEADLINE, socket.next()).await {
-            Ok(Some(m)) => m,
-            Ok(None) => break,
-            Err(_) => {
+        tokio::select! {
+            () = &mut deadline => {
                 return Err(ClientError::WebSocket(format!(
                     "no frame for {READ_DEADLINE:?} (server heartbeats every 15s); \
                      presuming half-open connection"
-                )))
+                )));
             }
-        };
-        match msg {
-            Ok(WsMessage::Binary(b)) => {
-                let frame = match decode_server_frame(&b[..]) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Bad pricing WS frame; ignoring");
-                        continue;
-                    }
-                };
-                if let Some(reply) = apply_server_frame(cache, frame).await {
-                    if let Ok(buf) = encode_cbor(&reply) {
-                        let _ = socket.send(WsMessage::Binary(buf)).await;
-                    }
+            changed = assets.changed(), if watching => {
+                if changed.is_err() {
+                    watching = false;
+                    continue;
+                }
+                let next: BTreeSet<Symbol> = assets.borrow_and_update().iter().cloned().collect();
+                let added: Vec<Symbol> = next.difference(&sent).cloned().collect();
+                let removed: Vec<Symbol> = sent.difference(&next).cloned().collect();
+                if !added.is_empty() {
+                    send_frame(
+                        &mut socket,
+                        &ClientFrame::Subscribe(SubscribeFrame {
+                            consumer: cfg.consumer.clone(),
+                            assets: added.clone(),
+                        }),
+                    )
+                    .await?;
+                }
+                if !removed.is_empty() {
+                    send_frame(
+                        &mut socket,
+                        &ClientFrame::Unsubscribe(UnsubscribeFrame {
+                            assets: removed.clone(),
+                        }),
+                    )
+                    .await?;
+                }
+                if !added.is_empty() || !removed.is_empty() {
+                    tracing::info!(?added, ?removed, "Pricing subscription follows the token set");
+                }
+                sent = next;
+                if sent.is_empty() {
+                    // run_loop waits disconnected until a token is added.
+                    return Ok(());
                 }
             }
-            Ok(WsMessage::Ping(payload)) => {
-                let _ = socket.send(WsMessage::Pong(payload)).await;
+            msg = socket.next() => {
+                let Some(msg) = msg else { break };
+                deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + READ_DEADLINE);
+                match msg {
+                    Ok(WsMessage::Binary(b)) => {
+                        let frame = match decode_server_frame(&b[..]) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Bad pricing WS frame; ignoring");
+                                continue;
+                            }
+                        };
+                        if let Some(reply) = apply_server_frame(cache, Some(&assets), frame).await {
+                            let _ = send_frame(&mut socket, &reply).await;
+                        }
+                    }
+                    Ok(WsMessage::Ping(payload)) => {
+                        let _ = socket.send(WsMessage::Pong(payload)).await;
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(ClientError::WebSocket(format!("{e}"))),
+                }
             }
-            Ok(_) => {}
-            Err(e) => return Err(ClientError::WebSocket(format!("{e}"))),
         }
     }
     Ok(())
@@ -697,7 +831,7 @@ mod tests {
         }
 
         let reply =
-            apply_server_frame(&cache, price_frame("COIN", WireU256::from_bytes(nav))).await;
+            apply_server_frame(&cache, None, price_frame("COIN", WireU256::from_bytes(nav))).await;
         assert!(reply.is_none());
 
         let q = cached(&cache, CONFIGURED, "COIN").await.unwrap();
@@ -723,10 +857,10 @@ mod tests {
     #[tokio::test]
     async fn halt_evicts_cached_quote_and_resume_does_not_restore_it() {
         let cache = Arc::new(RwLock::new(HashMap::new()));
-        apply_server_frame(&cache, price_frame("COIN", WireU256::ZERO)).await;
-        apply_server_frame(&cache, price_frame("TSLA", WireU256::ZERO)).await;
+        apply_server_frame(&cache, None, price_frame("COIN", WireU256::ZERO)).await;
+        apply_server_frame(&cache, None, price_frame("TSLA", WireU256::ZERO)).await;
 
-        apply_server_frame(&cache, halt_frame("COIN", true)).await;
+        apply_server_frame(&cache, None, halt_frame("COIN", true)).await;
         assert!(
             cached(&cache, CONFIGURED, "COIN").await.is_none(),
             "halted asset must be evicted"
@@ -736,13 +870,13 @@ mod tests {
             "halt must only evict the named asset"
         );
 
-        apply_server_frame(&cache, halt_frame("COIN", false)).await;
+        apply_server_frame(&cache, None, halt_frame("COIN", false)).await;
         assert!(
             cached(&cache, CONFIGURED, "COIN").await.is_none(),
             "resume must not resurrect the pre-halt quote"
         );
 
-        apply_server_frame(&cache, price_frame("COIN", WireU256::ZERO)).await;
+        apply_server_frame(&cache, None, price_frame("COIN", WireU256::ZERO)).await;
         assert!(
             cached(&cache, CONFIGURED, "COIN").await.is_some(),
             "next price frame repopulates the cache"
@@ -768,11 +902,13 @@ mod tests {
 
         apply_server_frame(
             &cache,
+            None,
             price_frame_on("COIN", CONFIGURED, WireU256::from_bytes(base_nav)),
         )
         .await;
         apply_server_frame(
             &cache,
+            None,
             price_frame_on("COIN", 1, WireU256::from_bytes(other_nav)),
         )
         .await;
@@ -803,17 +939,19 @@ mod tests {
 
         apply_server_frame(
             &cache,
+            None,
             price_frame_on("COIN", CONFIGURED, WireU256::from_bytes(base_nav)),
         )
         .await;
         // Arrives last and would win under a symbol-only key.
         apply_server_frame(
             &cache,
+            None,
             price_frame_on("COIN", 1, WireU256::from_bytes(other_nav)),
         )
         .await;
         // Only ever seen on another chain.
-        apply_server_frame(&cache, price_frame_on("TSLA", 1, WireU256::ZERO)).await;
+        apply_server_frame(&cache, None, price_frame_on("TSLA", 1, WireU256::ZERO)).await;
 
         let client = LiveClient {
             cache,
@@ -843,10 +981,15 @@ mod tests {
     #[tokio::test]
     async fn halt_on_another_chain_does_not_evict_our_quote() {
         let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
-        apply_server_frame(&cache, price_frame_on("COIN", CONFIGURED, WireU256::ZERO)).await;
-        apply_server_frame(&cache, price_frame_on("COIN", 1, WireU256::ZERO)).await;
+        apply_server_frame(
+            &cache,
+            None,
+            price_frame_on("COIN", CONFIGURED, WireU256::ZERO),
+        )
+        .await;
+        apply_server_frame(&cache, None, price_frame_on("COIN", 1, WireU256::ZERO)).await;
 
-        apply_server_frame(&cache, halt_frame_on("COIN", 1, true)).await;
+        apply_server_frame(&cache, None, halt_frame_on("COIN", 1, true)).await;
 
         assert!(
             cached(&cache, 1, "COIN").await.is_none(),
@@ -861,9 +1004,19 @@ mod tests {
     #[tokio::test]
     async fn stale_source_evicts_named_symbol_on_every_chain_and_price_repopulates() {
         let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
-        apply_server_frame(&cache, price_frame_on("COIN", CONFIGURED, WireU256::ZERO)).await;
-        apply_server_frame(&cache, price_frame_on("COIN", 1, WireU256::ZERO)).await;
-        apply_server_frame(&cache, price_frame_on("TSLA", CONFIGURED, WireU256::ZERO)).await;
+        apply_server_frame(
+            &cache,
+            None,
+            price_frame_on("COIN", CONFIGURED, WireU256::ZERO),
+        )
+        .await;
+        apply_server_frame(&cache, None, price_frame_on("COIN", 1, WireU256::ZERO)).await;
+        apply_server_frame(
+            &cache,
+            None,
+            price_frame_on("TSLA", CONFIGURED, WireU256::ZERO),
+        )
+        .await;
         let client = LiveClient {
             cache: Arc::clone(&cache),
             chain_id: CONFIGURED,
@@ -874,7 +1027,12 @@ mod tests {
             .remove("COIN")
             .unwrap();
 
-        apply_server_frame(&cache, error_frame(ErrorCode::StaleSource, Some("COIN"))).await;
+        apply_server_frame(
+            &cache,
+            None,
+            error_frame(ErrorCode::StaleSource, Some("COIN")),
+        )
+        .await;
 
         assert!(cached(&cache, CONFIGURED, "COIN").await.is_none());
         assert!(
@@ -884,7 +1042,12 @@ mod tests {
         assert!(cached(&cache, CONFIGURED, "TSLA").await.is_some());
         assert!(!in_flight.is_live(), "eviction revokes owned snapshots");
 
-        apply_server_frame(&cache, price_frame_on("COIN", CONFIGURED, WireU256::ZERO)).await;
+        apply_server_frame(
+            &cache,
+            None,
+            price_frame_on("COIN", CONFIGURED, WireU256::ZERO),
+        )
+        .await;
         assert!(cached(&cache, CONFIGURED, "COIN").await.is_some());
         assert!(
             !in_flight.is_live(),
@@ -901,18 +1064,222 @@ mod tests {
             ErrorCode::Internal,
         ] {
             let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
-            apply_server_frame(&cache, price_frame("COIN", WireU256::ZERO)).await;
+            apply_server_frame(&cache, None, price_frame("COIN", WireU256::ZERO)).await;
             let asset = if code == ErrorCode::StaleSource {
                 None
             } else {
                 Some("COIN")
             };
-            apply_server_frame(&cache, error_frame(code, asset)).await;
+            apply_server_frame(&cache, None, error_frame(code, asset)).await;
             assert!(
                 cached(&cache, CONFIGURED, "COIN").await.is_some(),
                 "{code:?} must not evict this quote"
             );
         }
+    }
+
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    use tokio_tungstenite::WebSocketStream;
+
+    type Duplex = WebSocketStream<tokio::io::DuplexStream>;
+
+    /// A connected client and server socket over an in-memory pipe.
+    async fn socket_pair() -> (Duplex, Duplex) {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        (
+            WebSocketStream::from_raw_socket(a, Role::Client, None).await,
+            WebSocketStream::from_raw_socket(b, Role::Server, None).await,
+        )
+    }
+
+    fn session_config(assets: watch::Receiver<Vec<Symbol>>) -> LiveClientConfig {
+        LiveClientConfig::new("ws://unused", "k", "oracle", vec![], CONFIGURED).with_assets(assets)
+    }
+
+    async fn next_client_frame(server: &mut Duplex) -> ClientFrame {
+        loop {
+            match server.next().await.expect("socket open").expect("frame") {
+                WsMessage::Binary(b) => return ciborium::from_reader(&b[..]).unwrap(),
+                _ => continue,
+            }
+        }
+    }
+
+    fn symbols(list: &[&str]) -> Vec<Symbol> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn empty_assets_wait_to_connect_and_reconnect_until_a_token_is_added() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = watch::channel(Vec::new());
+        let cfg = LiveClientConfig::new(
+            format!("ws://{}", listener.local_addr().unwrap()),
+            "k",
+            "oracle",
+            vec![],
+            CONFIGURED,
+        )
+        .with_assets(rx);
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        let client = tokio::spawn(run_loop(cfg, cache));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "empty startup must not connect"
+        );
+        tx.send(symbols(&["A"])).unwrap();
+        let (tcp, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut server = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let message = server.next().await.unwrap().unwrap().into_data();
+        let frame: ClientFrame = ciborium::from_reader(&message[..]).unwrap();
+        assert!(matches!(frame, ClientFrame::Subscribe(f) if f.assets == symbols(&["A"])));
+        tx.send(Vec::new()).unwrap();
+        let message = server.next().await.unwrap().unwrap().into_data();
+        let frame: ClientFrame = ciborium::from_reader(&message[..]).unwrap();
+        assert!(matches!(frame, ClientFrame::Unsubscribe(f) if f.assets == symbols(&["A"])));
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_secs(1), server.next())
+                    .await
+                    .unwrap(),
+                Some(Ok(_))
+            ),
+            "the client disconnects after its last Unsubscribe"
+        );
+        drop(server);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "removing the final token must suspend reconnection"
+        );
+        tx.send(symbols(&["B"])).unwrap();
+        let (tcp, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut server = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let message = server.next().await.unwrap().unwrap().into_data();
+        let frame: ClientFrame = ciborium::from_reader(&message[..]).unwrap();
+        assert!(matches!(frame, ClientFrame::Subscribe(f) if f.assets == symbols(&["B"])));
+        tx.send(Vec::new()).unwrap();
+        let message = server.next().await.unwrap().unwrap().into_data();
+        let frame: ClientFrame = ciborium::from_reader(&message[..]).unwrap();
+        assert!(matches!(frame, ClientFrame::Unsubscribe(f) if f.assets == symbols(&["B"])));
+        drop(tx);
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_secs(1), server.next())
+                    .await
+                    .unwrap(),
+                Some(Ok(_))
+            ),
+            "the client disconnects after its last Unsubscribe"
+        );
+        drop(server);
+        tokio::time::timeout(Duration::from_secs(1), client)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_set_emptied_during_handshake_sends_no_empty_subscribe() {
+        let (tx, rx) = watch::channel(symbols(&["A"]));
+        let cfg = session_config(rx);
+        let (client, mut server) = socket_pair().await;
+        tx.send(Vec::new()).unwrap();
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        run_session(&cfg, &cache, client).await.unwrap();
+        assert!(
+            server.next().await.unwrap().is_err(),
+            "the socket closes without a Subscribe"
+        );
+    }
+
+    /// A token set change reaches pricing as the difference, on the same
+    /// session: new symbols are subscribed, removed ones unsubscribed.
+    #[tokio::test]
+    async fn a_token_change_sends_subscribe_and_unsubscribe_deltas() {
+        let (tx, rx) = watch::channel(symbols(&["A", "B"]));
+        let (client, mut server) = socket_pair().await;
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        let session = tokio::spawn({
+            let cache = cache.clone();
+            async move { run_session(&session_config(rx), &cache, client).await }
+        });
+
+        match next_client_frame(&mut server).await {
+            ClientFrame::Subscribe(f) => assert_eq!(f.assets, symbols(&["A", "B"])),
+            other => panic!("{other:?}"),
+        }
+
+        tx.send(symbols(&["B", "C"])).unwrap();
+        match next_client_frame(&mut server).await {
+            ClientFrame::Subscribe(f) => assert_eq!(f.assets, symbols(&["C"])),
+            other => panic!("{other:?}"),
+        }
+        match next_client_frame(&mut server).await {
+            ClientFrame::Unsubscribe(f) => assert_eq!(f.assets, symbols(&["A"])),
+            other => panic!("{other:?}"),
+        }
+        assert!(!session.is_finished(), "the session stays up");
+        session.abort();
+    }
+
+    /// Only an inbound frame moves the read deadline. Token changes keep
+    /// the session busy sending, but a silent pricing link still fails at
+    /// READ_DEADLINE and the client reconnects.
+    #[tokio::test(start_paused = true)]
+    async fn the_read_deadline_is_not_extended_by_token_changes() {
+        let (tx, rx) = watch::channel(symbols(&["A"]));
+        let (client, _server) = socket_pair().await;
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        let started = tokio::time::Instant::now();
+        let session = tokio::spawn({
+            let cache = cache.clone();
+            async move { run_session(&session_config(rx), &cache, client).await }
+        });
+        for (at, list) in [(20, ["A", "B"]), (50, ["B", "C"])] {
+            tokio::time::sleep_until(started + Duration::from_secs(at)).await;
+            tx.send(symbols(&list)).unwrap();
+        }
+        let err = session.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("half-open"), "{err}");
+        assert_eq!(started.elapsed(), READ_DEADLINE);
+    }
+
+    /// Once a symbol leaves the subscribed list, a frame for it that is
+    /// still in flight does not repopulate the cache.
+    #[tokio::test]
+    async fn a_frame_for_a_forgotten_symbol_is_dropped() {
+        let (tx, rx) = watch::channel(symbols(&["COIN", "TSLA"]));
+        let cache: QuoteCache = Arc::new(RwLock::new(HashMap::new()));
+        apply_server_frame(&cache, Some(&rx), price_frame("COIN", WireU256::ZERO)).await;
+        assert!(cached(&cache, CONFIGURED, "COIN").await.is_some());
+
+        tx.send(symbols(&["TSLA"])).unwrap();
+        let client = LiveClient {
+            cache: Arc::clone(&cache),
+            chain_id: CONFIGURED,
+        };
+        let in_flight = client
+            .snapshot_many(&["COIN"])
+            .await
+            .remove("COIN")
+            .unwrap();
+        assert_eq!(client.forget(&["COIN".to_string()]).await, 1);
+        assert!(!in_flight.is_live(), "forget revokes owned snapshots");
+
+        apply_server_frame(&cache, Some(&rx), price_frame("COIN", WireU256::ZERO)).await;
+        apply_server_frame(&cache, Some(&rx), price_frame("TSLA", WireU256::ZERO)).await;
+        assert!(cached(&cache, CONFIGURED, "COIN").await.is_none());
+        assert!(cached(&cache, CONFIGURED, "TSLA").await.is_some());
     }
 
     proptest! {

@@ -10,6 +10,7 @@ use st0x_oracle_server::oracle::{BatchItemResponse, OracleResponse};
 use st0x_oracle_server::pricing_client::LiveClient;
 use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
+use st0x_oracle_server::tokens::{TokenSet, Tokens};
 use st0x_oracle_server::{create_app, AppState, ErrorResponse, EvaluableV4, OrderV4, IOV2};
 use st0x_pricing_types::{Quote, WireAddress, WireFloat, WireU256};
 use std::str::FromStr;
@@ -343,12 +344,12 @@ async fn expired_refusal_is_exposed_with_stable_metric_labels() {
 #[tokio::test]
 async fn missing_quotes_return_stable_no_live_quote_reason() {
     for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
-        let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![]).await;
+        let app = test_app_with_quotes(&[(WCOIN, "MISSING_ONLY")], vec![]).await;
         let (status, json) =
             post_status_and_json(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
         assert_eq!(status, 503, "{endpoint}");
         assert_eq!(json["error"], "no_live_quote", "{endpoint}");
-        assert!(json["detail"].as_str().unwrap().contains("COIN"));
+        assert!(json["detail"].as_str().unwrap().contains("MISSING_ONLY"));
 
         let response = app
             .oneshot(
@@ -369,7 +370,7 @@ async fn missing_quotes_return_stable_no_live_quote_reason() {
                     && line.contains(&format!("endpoint=\"{endpoint_label}\""))
                     && line.contains("phase=\"admission\"")
                     && line.contains("reason=\"no_live_quote\"")
-                    && line.contains("symbol=\"COIN\"")
+                    && line.contains("symbol=\"MISSING_ONLY\"")
             })
             .expect("no-live-quote refusal metric");
         assert_eq!(refusal.split_whitespace().last(), Some("1"));
@@ -430,6 +431,78 @@ async fn a_quote_for_another_address_is_refused() {
     let app = test_app_with_quotes(&[(WCOIN, SYMBOL)], vec![quote]).await;
     let (status, _) = post_status_and_json(app, "/context/v7", encode_single(USDC, WCOIN)).await;
     assert_eq!(status, 200, "the same quote for the resolved address signs");
+}
+
+async fn get_json(app: axum::Router, uri: &str) -> serde_json::Value {
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Replacing the running token set takes effect on the next request: a
+/// removed token is unknown and leaves /status, and a re-added one signs
+/// again once it has a quote.
+#[tokio::test]
+async fn a_replaced_token_set_applies_to_the_next_request() {
+    let with_coin = || {
+        TokenSet::new(
+            TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap(),
+            vec!["COIN".to_string()],
+        )
+    };
+    let tokens = Tokens::new(with_coin());
+    let pricing = LiveClient::with_seeded(
+        vec![fake_quote("COIN", WCOIN, "0.01", "100")],
+        TEST_CHAIN_ID,
+    )
+    .await;
+    let app = create_app(AppState::with_tokens(
+        Signer::new(TEST_KEY).unwrap(),
+        tokens.clone(),
+        TEST_CHAIN_ID,
+        pricing.clone(),
+        fixed_close_market_hours().await,
+        MetricsHandle::install().unwrap(),
+    ));
+    let sign = || post_status_and_json(app.clone(), "/context/v7", encode_single(USDC, WCOIN));
+
+    assert_eq!(sign().await.0, 200);
+
+    tokens.replace(TokenSet::new(
+        TokenRegistry::new(vec![], USDC).unwrap(),
+        vec![],
+    ));
+    pricing.forget(&["COIN".to_string()]).await;
+    let (status, json) = sign().await;
+    assert_eq!(status, 400, "{json}");
+    assert!(
+        json["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tStock token"),
+        "{json}"
+    );
+    let status_body = get_json(app.clone(), "/status").await;
+    assert_eq!(status_body["configured_symbols"], serde_json::json!([]));
+
+    tokens.replace(with_coin());
+    let (status, json) = sign().await;
+    assert_eq!(status, 503, "no quote until pricing sends one: {json}");
+    pricing.seed(fake_quote("COIN", WCOIN, "0.01", "100")).await;
+    assert_eq!(sign().await.0, 200);
+    let status_body = get_json(app, "/status").await;
+    assert_eq!(
+        status_body["configured_symbols"],
+        serde_json::json!(["COIN"])
+    );
 }
 
 #[tokio::test]
