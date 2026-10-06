@@ -1,0 +1,36 @@
+name: observability
+
+# This repo's Grafana alert rules (observability/alerting/oracle.rules.yml;
+# no dashboards yet): checked in a throwaway Grafana on every PR, shipped to
+# the T0 observability box's config bucket on main. The flow lives in
+# ST0x-Technology/.github; this is the caller.
+
+on:
+  pull_request:
+    paths:
+      - "observability/**"
+      - ".github/workflows/observability.yml"
+  push:
+    branches: [main]
+    paths:
+      - "observability/**"
+      - ".github/workflows/observability.yml"
+  workflow_dispatch:
+
+# Nothing by default; the one job below asks for exactly what it needs.
+permissions: {}
+
+jobs:
+  observability:
+    permissions:
+      contents: read # checkout of this repo's observability/ files
+      id-token: write # keyless GCP login as this repo's oracle-obs-deploy identity
+    # Only main deploys share a group: a queued run in a shared group would
+    # replace a pending main deploy, which GitHub cancels.
+    concurrency:
+      group: observability-${{ github.ref == 'refs/heads/main' && 'deploy' || github.ref }}
+      cancel-in-progress: false
+    uses: ST0x-Technology/.github/.github/workflows/observability.yml@a1689d50bc42dbb1ffcae353b5d4512c70454c3e # observability @ .github main
+    with:
+      app: oracle
+      service: pricing

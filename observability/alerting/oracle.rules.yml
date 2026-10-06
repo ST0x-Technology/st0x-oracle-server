@@ -1,0 +1,641 @@
+# Alert rules for the oracle, file-provisioned into the T0 Grafana
+# (grafana.t0trade.com). Pushed to the observability config bucket by
+# .github/workflows/observability.yml on merge; the box picks them up within
+# a minute and restarts Grafana.
+#
+# Provisioned rules are read-only in the UI; change them here, via PR.
+# Datasource uids are fixed by the box: victoriametrics (PromQL over the
+# probes' gauges), cloudmon (Cloud Monitoring, the service's own metrics
+# and log-based metrics). Routing is by the `service` label; `severity:
+# critical` also pages PagerDuty in US extended hours.
+#
+# Removing a rule from this file does NOT remove it from Grafana: add its
+# uid to deleteRules below as well, or it keeps firing. deleteRules is for
+# retiring one of THIS file's rules for good. A rule that moves to another
+# file is never listed there: Grafana applies deleteRules by uid whatever
+# file provisions the rule, so it would be deleted after every restart.
+apiVersion: 1
+deleteRules: []
+groups:
+  - orgId: 1
+    name: oracle-quotes
+    folder: Alerts
+    interval: 1m
+    rules:
+      # The oracle signs what pricing serves — same upstream, so this pair is
+      # tight at all hours (observed 0.003 bps; the ±8 bps quote spread is
+      # removed by comparing the buy/sell MID). Divergence here means the
+      # oracle is signing prices that are not pricing's marks — a systemic
+      # failure between the two services, so it pages as ONE alert per env
+      # (with the count of diverging symbols), not one per symbol.
+      #
+      # ⚠️ THRESHOLD SYNC: the price board's row verdicts mirror this
+      # group's thresholds (WRONG == page level, WATCH == warning level or
+      # page/2) — the mapping table lives on the verdict block in the
+      # price-parity probe (T0Trade/t0.devops,
+      # terraform/modules/gcp-observability/price-parity/probe.py). Changing a
+      # threshold here without its twin there makes the board lie about what
+      # will page.
+      #
+      # PRODUCTION ONLY: of the first 180 firings of the combined rule, 174
+      # were staging (deploy skew routinely parks staging 50-350 bps off
+      # pricing for days), so this one means "production is mis-signing, act".
+      # No rule in this file watches staging.
+      # ---- SESSION GATE (added 2026-08-20) ----------------------------
+      # Every rule below that compares an oracle-signed price against a
+      # reference now carries:
+      #
+      #   unless on(env) (min_over_time(price_parity_market_session{...}[W]) < 2)
+      #
+      # WHY. The oracle keeps signing through closed sessions, but off a
+      # FROZEN last tick: at 00:16 UTC on 2026-08-19 every one of 90 sampled
+      # contexts carried publish_time 23:59:58 and an expiry already 16
+      # minutes in the past. The reference mark moves on, the measured gap
+      # grows, and these rules trip on an artifact. It fired at 00:15-00:18
+      # UTC and self-resolved by 00:23 EVERY trading night: 18 of the
+      # deviation rule's 25 firings, 10 of 10 for the inverted rule. Nothing
+      # was ever extractable: a context expired at signing time is rejected
+      # on-chain, so the "gives value away" wording never applied to it.
+      #
+      # W is the rule's `for:` window + 5m, so the session must have been
+      # live for the WHOLE evaluation window, not just at the instant of
+      # firing. That is also what clears the 08:1x cluster at the
+      # overnight_closed -> premarket boundary: those firings came from the
+      # 15m-`for:` rules, whose 20m window still reads the pre-08:00 closed
+      # samples at 08:16 (verified against 2026-08-19). The 10m-`for:`
+      # inverted rule opens its 15m window a few minutes earlier, which is
+      # correct and not a gap: by then its condition has had to hold for ten
+      # consecutive minutes of a genuinely live session, and that rule has
+      # never fired at an open boundary, only at 00:11-00:15.
+      #
+      # Sessions (price_parity_market_session, decoded from the oracle's own
+      # signed session tag, holiday-aware; see the price-parity probe):
+      #   0 weekend_closed  1 overnight_closed  2 premarket  3 rth  4 afterhours
+      # >= 2 means a live session. afterhours is deliberately NOT gated out:
+      # we quote and takers can fill, so a thin edge there is real signal.
+      #
+      # The gate FAILS OPEN by construction. `unless` removes left series
+      # only when the right side MATCHES; if price_parity_market_session is
+      # missing entirely, the right side is empty, nothing is removed and
+      # the rule alerts as before. Verified against live VictoriaMetrics at
+      # a timestamp predating the metric. A silent safety rule would be a
+      # worse outcome than the noise this removes, so do not "simplify"
+      # this to `and on(env) (... >= 2)`, which fails CLOSED.
+      # -----------------------------------------------------------------
+      - uid: s0xparityintc001
+        title: oracle-signs-wrong-price
+        condition: C
+        data:
+          # A: how many symbols are diverging (0 when healthy — the bool
+          # modifier keeps the series alive so recovery is a real 0, not
+          # a no-data transition).
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 1200, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: sum by (env) ((abs(price_parity_diff_bps{pair="oracle_vs_pricing", env="production"}) > bool 25) unless on(env) (min_over_time(price_parity_market_session{env="production"}[20m]) < 2))
+              instant: true
+              refId: A
+          # B: worst divergence, for the notification text only.
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 1200, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: max by (env) (abs(price_parity_diff_bps{pair="oracle_vs_pricing", env="production"}))
+              instant: true
+              refId: B
+          - refId: C
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          summary: >-
+            Oracle-signed price diverges from the pricing mark ({{ $values.A }} symbols, worst {{ printf "%.1f" $values.B.Value }} bps, {{ $labels.env }})
+          description: >-
+            {{ $values.A }} symbols' oracle-signed buy/sell mids have differed from the pricing service's Alpaca mark by more than 25 bps for 15 minutes (worst {{ printf "%.1f" $values.B.Value }} bps). Same upstream feeds both, so this should never happen — something between pricing and the oracle is shifting prices. Check the price board for which symbols.
+        labels: {service: pricing, severity: critical}
+      # Pricing serves a symbol the oracle never quotes — the asset is
+      # tradeable upstream but the oracle signs nothing for it, so it simply
+      # does not trade. Found the hard way on 2026-08-07: after pricing
+      # gained 11 new symbols, the staging oracle sat at exactly its old 28
+      # for 40+ minutes and only a human eye on the board caught it.
+      #
+      # Cause (worth knowing before you debug the oracle): pricing runs
+      # request_timeout_seconds = 3600, Cloud Run's ceiling, so a consumer's
+      # WS session can live a full hour. Deploying a new pricing revision
+      # DRAINS rather than cuts those streams, so the oracle keeps talking to
+      # the OLD revision — which never knew the new symbols. It re-sends its
+      # full symbol list on every connect, so this self-heals as soon as the
+      # session recycles; restarting the oracle just skips the wait.
+      #
+      # Hence `for: 75m`: longer than the 60m max session, so a normal
+      # pricing deploy never fires this. Firing means the gap OUTLIVED the
+      # window in which it should have healed itself.
+      #
+      # The `and on(...) coverage == 1` join is load-bearing: it restricts
+      # this to symbols we actually hold a canned order body for. Without it
+      # every body-less symbol would double-fire here and on
+      # price-parity-symbol-coverage-gap (st0x.pricing's rules), which is a
+      # different defect with a different fix.
+      #
+      # Deliberately PER SYMBOL, not `count by (env)`. The probe's own oracle
+      # calls time out occasionally, which drops a single symbol's quote for
+      # one run: measured over 11h of production, 13 different symbols each
+      # blipped for 1-4 scrapes. A count would then sit above zero almost
+      # continuously — different symbol each time — and sustain past any
+      # `for`, paging on nothing. Per symbol, a blip has to persist on THE
+      # SAME symbol for 75m, which a timeout never does. `* 0 + 1` just
+      # flattens the mark's price value to a 1 so the threshold reads as
+      # "this symbol is missing" rather than comparing a share price.
+      #
+      # The mark-basis-freshness gate (source_age < 900, the probe's own
+      # MARK_MAX_AGE) is the closed-session exemption the probe already
+      # applies to probe_success, mirrored here. Calibrated symbols have no
+      # Closed-session spread profile, so pricing streams them NO frames
+      # outside market hours; a Cloud Run instance recycle on a weekend
+      # then leaves the oracle legitimately quoteless on them until the
+      # next open (self-healing by design — see the probe's cold-start
+      # comment; a Sat 07:05 recycle paged all 28 on 2026-08-08). With the
+      # gate, a weekend recycle stays silent and a genuinely stuck oracle
+      # still pages within ~75m of the next open, when marks tick again.
+      # The dedicated stale-or-unavailable rule owns gaps for which at least
+      # two consecutive probe samples provide proof; this generic rule still
+      # owns long-lived quote gaps without that proof.
+      - uid: s0xparitynoqt001
+        title: oracle-not-quoting-a-served-symbol
+        condition: B
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 1800, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: >-
+                (
+
+                  (
+                    price_parity_price{source="pricing_mark", env="production"}
+                    unless on(symbol, env, chain) price_parity_price{source="oracle_mid", env="production"}
+                  )
+                  and on(symbol, env, chain) (price_parity_symbol_coverage{leg="oracle_body", env="production"} == 1)
+                  and on(symbol, env, chain) (price_parity_source_age_seconds{source="pricing", env="production"} < 900)
+                  unless on(symbol, env, chain) (
+                    (min_over_time(price_parity_oracle_quote_stale{env="production"}[60m]) == 1)
+                    and on(symbol, env, chain) (count_over_time(price_parity_oracle_quote_stale{env="production"}[60m]) >= 24)
+                  )
+                ) * 0 + 1
+              instant: true
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 75m
+        annotations:
+          summary: >-
+            Oracle is not quoting {{ $labels.symbol }}, which pricing serves on chain {{ $labels.chain }} ({{ $labels.env }})
+          description: >-
+            {{ $labels.symbol }} has a fresh pricing mark (its market is ticking) and a canned order body, but the oracle has signed no quote for it for over an hour — that asset cannot trade. Most likely the oracle's pricing WS session is still attached to a drained older pricing revision that predates the symbols; it re-subscribes with its full list on every connect, so restarting the oracle fixes it immediately. Confirm on the price board: rows with a Mark but no Buy/Sell. If a restart does not fix it, check the oracle knows the token at all — an unknown token returns 400 from /context/v1, whereas a known token with no live quote returns 503.
+        labels: {service: pricing, severity: warning}
+      # The probe boolean proves stale/unavailable quotes. The pricing-age arm
+      # keeps the old per-symbol RTH protection when every oracle request is
+      # refused before a session context can be decoded. Production remains
+      # fail-closed to RTH while the deployed oracle re-signs pre-close frames
+      # in premarket and would page every withheld symbol. The timestamp-span
+      # checks require at least six minutes of RTH telemetry, not merely one
+      # sample in the range. The eight-minute range keeps that proof present
+      # through the one-minute hold at the probe's two-minute cadence.
+      - uid: s0xparitystal001
+        title: oracle-quote-stale-or-unavailable
+        condition: B
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 1200, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: >-
+                max by (symbol, env, chain) (
+
+                  (
+                    (
+                      min_over_time(price_parity_oracle_quote_stale{env="production"}[5m])
+                      and on(symbol, env, chain) (count_over_time(price_parity_oracle_quote_stale{env="production"}[5m]) >= 2)
+                    )
+                    and on(env) (min_over_time(price_parity_market_session{env="production"}[8m]) == 3)
+                    and on(env) (max_over_time(price_parity_market_session{env="production"}[8m]) == 3)
+                    and on(env) (
+                      max_over_time(timestamp(price_parity_market_session{env="production"})[8m:])
+                      - min_over_time(timestamp(price_parity_market_session{env="production"})[8m:]) >= 360
+                    )
+                  )
+                  or
+                  (
+                    price_parity_source_age_seconds{env="production", source="pricing"} > 900
+                    and on(env) (min_over_time(price_parity_market_session{env="production"}[8m]) == 3)
+                    and on(env) (max_over_time(price_parity_market_session{env="production"}[8m]) == 3)
+                    and on(env) (
+                      max_over_time(timestamp(price_parity_market_session{env="production"})[8m:])
+                      - min_over_time(timestamp(price_parity_market_session{env="production"})[8m:]) >= 360
+                    )
+                  )
+                )
+              instant: true
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: >-
+            Production has no fresh live oracle quote for {{ $labels.symbol }} on chain {{ $labels.chain }}
+          description: >-
+            During regular trading hours, either two probe samples prove a stale or unavailable quote, or the symbol's pricing mark has stopped advancing for more than 15 minutes. After a one-minute hold, {{ $labels.symbol }} is treated as untradeable. This is not an inverted edge. Inspect the price board and oracle/pricing-WS logs. If t0-pricing reports "Broker has no position for upstream symbol", restore the Alpaca position. Otherwise resubscribe the pricing stream, or roll the oracle if it does not recover.
+        labels: {service: pricing, severity: critical}
+      - uid: s0xparityprof001
+        title: oracle-spread-off-profile
+        condition: B
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: >-
+                max by (symbol) (
+
+                  abs(price_parity_oracle_spread_bps{env="production"} / on(symbol) group_left() price_parity_spread_config_bps{env="production"} - 1)
+                  and on(symbol, env) (abs(price_parity_oracle_spread_bps{env="production"} - on(symbol) group_left() price_parity_spread_config_bps{env="production"}) >= 3)
+                  unless on(symbol, env) (price_parity_source_age_seconds{env="production", source="oracle"} >= 900)
+                  unless on(env) (min_over_time(price_parity_market_session{env="production"}[20m]) < 2)
+                )
+              instant: true
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0.2], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          summary: Production oracle is signing a {{ $labels.symbol }} spread that disagrees with the quant profile
+          description: >-
+            For 15 minutes {{ $labels.symbol }}'s freshly signed buy-sell spread has deviated from the spread the pricing profile artifact intends for it (deviation {{ $values.A }}, fires above 0.2 = 20% and at least 3 bps apart). Only quotes signed in the last 15 minutes count, so this is not a stale-quote artifact: either a runtime spread bug, or a profile deploy that did not reach the oracle's quote path. Compare price_parity_oracle_spread_bps against price_parity_spread_config_bps for {{ $labels.symbol }}, then check the pricing deploy.
+        labels: {service: pricing, severity: warning}
+      # The P&L safety line: the oracle should always buy BELOW the mark and
+      # sell ABOVE it. The spread is dynamic, so edge WIDTH is not a health
+      # signal — a wide quote is conservative. Only the sign matters here: a
+      # negative edge means signed quotes are giving value away — takers can
+      # buy from us under fair or sell to us over fair.
+      #
+      # Production only: the old env-blind min() meant every staging
+      # inversion fired a critical indistinguishable from production losing
+      # money (61 firings, almost all staging).
+      - uid: s0xparityedgc001
+        title: oracle-quote-edge-inverted
+        condition: B
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 1200, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: min by (symbol, side) (last_over_time(price_parity_edge_bps{env="production"}[20m]) unless on(env) (min_over_time(price_parity_market_session{env="production"}[15m]) < 2))
+              instant: true
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [-1], type: lt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        keepFiringFor: 10m
+        annotations:
+          summary: Production oracle {{ $labels.symbol }} {{ $labels.side }} quote is inverted — signing prices that give value away
+          description: >-
+            For 10 minutes {{ $labels.symbol }}'s signed {{ $labels.side }} quote has a negative edge ({{ $values.A }} bps): the oracle is buying above the Alpaca mark or selling below it. Takers can extract value on every trade. Check the pricing spread configuration for {{ $labels.symbol }}.
+        labels: {service: pricing, severity: critical}
+      # The same inversion, caught in one minute instead of ten. The slow rule
+      # above is the sensitive one: -1 bps is "we are giving value away at all",
+      # and ten minutes is the right patience for a threshold that close to
+      # zero. That patience is what cost us on 2026-09-11: the condition was
+      # true from 14:07Z, six minutes before the first drained trade, but the
+      # producer was mislabelling frames so the edge flapped, the timer reset
+      # nineteen times, and the page did not land until 15:51Z with roughly
+      # $41k already gone.
+      #
+      # An edge past -10 bps is a different claim. No spread configuration
+      # produces it and no market move explains it; it means the quote is
+      # wrong, and waiting is strictly worse than paging. Replayed over
+      # 2026-09-08, 09-09, 09-10 and 09-11 up to the incident it fires zero
+      # times; replayed over the incident it fires at 14:10Z, which is 2m55s
+      # BEFORE the first drained trade.
+      #
+      # Deliberately NOT keepFiringFor: this one is meant to be loud and
+      # immediate, and the slow twin carries the sustained state.
+      - uid: s0xparityedgc003
+        title: oracle-quote-edge-inverted-fast
+        condition: B
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 1200, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: min by (symbol, side) (last_over_time(price_parity_edge_bps{env="production"}[20m]) unless on(env) (min_over_time(price_parity_market_session{env="production"}[15m]) < 2))
+              instant: true
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [-10], type: lt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: Production oracle {{ $labels.symbol }} {{ $labels.side }} quote is badly inverted at {{ $values.A }} bps. Stop trading.
+          description: >-
+            {{ $labels.symbol }}'s signed {{ $labels.side }} quote is past -10 bps ({{ $values.A }} bps). No spread configuration produces that and no market move explains it: the quote is wrong and takers extract on every fill. Halt the affected orders first and diagnose second. On 2026-09-11 this shape ran for three hours and cost about $178k on SGOV alone.
+        labels: {service: pricing, severity: critical}
+      - uid: s0xparityedgt002
+        title: oracle-quote-edge-thin
+        condition: B
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: {from: 1200, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: min by (symbol, side) ((price_parity_edge_bps{env="production"} / on(symbol) group_left() (price_parity_oracle_spread_bps{env="production"} / 2)) unless on(env) (min_over_time(price_parity_market_session{env="production"}[20m]) < 2))
+              instant: true
+              refId: A
+          - refId: B
+            queryType: ""
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0.5], type: lt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          summary: Production {{ $labels.symbol }} {{ $labels.side }} edge has collapsed to a sliver
+          description: >-
+            For 15 minutes {{ $labels.symbol }}'s {{ $labels.side }} edge has held under HALF the edge its own quoted spread should give it (ratio {{ $values.A }}; healthy = 1.0, fires below 0.5). Not yet loss-making, but mark drift has consumed most of the cushion — the next move signs a negative edge. Check the pricing spread logic for {{ $labels.symbol }}.
+        labels: {service: pricing, severity: warning}
+  # Oracle metrics arrive through GMP. Keep the native Cloud Monitoring
+  # builder: Grafana alerting cannot evaluate PromQL through the Cloud
+  # Monitoring datasource (the bebop-maker group in st0x.bebop has details).
+  # VictoriaMetrics supplies an unlabelled evaluation clock for timestamp
+  # age; Grafana math joins that scalar to each oracle instance.
+  - orgId: 1
+    name: oracle-registry
+    folder: Alerts
+    interval: 1m
+    rules:
+      - uid: t0oraclereginv1
+        title: oracle-registry-invalid-production
+        condition: F
+        data:
+          - refId: A
+            queryType: timeSeriesList
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: cloudmon
+            model:
+              datasource: {type: stackdriver, uid: cloudmon}
+              queryType: timeSeriesList
+              refId: A
+              instant: true
+              intervalMs: 60000
+              timeSeriesList:
+                projectName: t0-oracle
+                filters:
+                  - "metric.type"
+                  - "="
+                  - "prometheus.googleapis.com/oracle_registry_invalid/gauge"
+                alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MAX
+                crossSeriesReducer: REDUCE_NONE
+                preprocessor: none
+                groupBys: []
+                view: FULL
+          - refId: B
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: reduce
+              reducer: last
+              expression: A
+              refId: B
+          - refId: F
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0.5], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: threshold
+              expression: B
+              refId: F
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: Production oracle {{ index $labels "resource.label.job" }} instance {{ index $labels "resource.label.instance" }} rejected the latest token registry
+          description: >-
+            The latest bucket copy has failed validation for five minutes. This instance keeps its previous token set. Check the oracle validation error and repair the token file through the registry publish approval. Compare oracle_registry_generation across instances after the fix.
+        labels: {service: pricing, env: production, severity: warning}
+      # Enable after the new gauge descriptor and fresh production samples
+      # exist. A missing descriptor is a query error, not no-data.
+      # The 90s lookback drops retired instances before their final check
+      # ages past 120s; ingestion delays beyond 90s yield no-data instead.
+      - uid: t0oracleregchk1
+        title: oracle-registry-check-stale-production
+        isPaused: true
+        condition: F
+        data:
+          - refId: A
+            queryType: timeSeriesList
+            relativeTimeRange: {from: 90, to: 0}
+            datasourceUid: cloudmon
+            model:
+              datasource: {type: stackdriver, uid: cloudmon}
+              queryType: timeSeriesList
+              refId: A
+              instant: true
+              intervalMs: 60000
+              timeSeriesList:
+                projectName: t0-oracle
+                filters:
+                  - "metric.type"
+                  - "="
+                  - "prometheus.googleapis.com/oracle_registry_last_check_timestamp_seconds/gauge"
+                alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MAX
+                crossSeriesReducer: REDUCE_NONE
+                preprocessor: none
+                groupBys: []
+                view: FULL
+          - refId: B
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: reduce
+              reducer: last
+              expression: A
+              refId: B
+          - refId: C
+            queryType: ""
+            relativeTimeRange: {from: 60, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              datasource: {type: prometheus, uid: victoriametrics}
+              expr: time()
+              instant: true
+              refId: C
+          - refId: D
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: reduce
+              reducer: last
+              expression: C
+              refId: D
+          - refId: E
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: math
+              expression: $D - $B
+              refId: E
+          - refId: F
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [120], type: gt}
+                  operator: {type: and}
+                  query: {params: [E]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: threshold
+              expression: E
+              refId: F
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        annotations:
+          summary: Production oracle {{ index $labels "resource.label.job" }} instance {{ index $labels "resource.label.instance" }} has not checked the registry successfully for over two minutes
+          description: >-
+            The last successful registry fetch is more than 120 seconds old. This instance keeps quoting its current token set but cannot adopt new registry changes. Check GCS access, metadata credentials and oracle_registry_fetch_errors_total. Confirm the timestamp advances after recovery.
+        labels: {service: pricing, env: production, severity: warning}
