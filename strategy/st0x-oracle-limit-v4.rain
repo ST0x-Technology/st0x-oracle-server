@@ -163,8 +163,7 @@ oracle-output-token: signed-context<0 7>(),
 
 /* Chain-time bounds: block.timestamp must fall inside the session
  * window the oracle stamped. If block.timestamp is past
- * `oracle-session-end` the session is over (or the oracle's cached
- * calendar is stale) and we revert. */
+ * `oracle-session-end` the session is over and we revert. */
 :ensure(
   greater-than-or-equal-to(now() oracle-session-start)
   "Before session start"

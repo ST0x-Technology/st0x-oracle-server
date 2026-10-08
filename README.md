@@ -30,20 +30,16 @@ before updating a consumer.
 ### Signature cache
 
 The price, publish time and quote expiry the oracle signs come from the pricing
-frame; the token addresses from the requested pair; the session window from the
-market-hours cache, which changes only at session boundaries. Two requests for
-one pair inside one price frame therefore sign byte-identical data, and the
-server keeps a content-addressed cache (`keccak256` of the packed context to
-signature) so the second request reuses the first signature instead of paying
-for another KMS operation. Concurrent requests for bytes already being signed
-wait on that one sign; it runs on its own task, so a client hanging up cannot
-abort it, and a failure fails all waiters at once. Entries live while used (idle
-TTL 2 minutes, swept every 256 inserts, 16k hard cap). Consumers see nothing
-different: same bytes, a valid signature, the same expiry.
-
-One caveat: if the market-hours calendar failed to load (the server starts
-anyway and retries hourly) the session window is `now`, the bytes change every
-second and the cache stops helping until the calendar loads.
+frame, and so does the session window: the session the quote was priced in, on
+the asset's own exchange. The token addresses come from the requested pair. Two
+requests for one pair inside one price frame therefore sign byte-identical data,
+and the server keeps a content-addressed cache (`keccak256` of the packed
+context to signature) so the second request reuses the first signature instead
+of paying for another KMS operation. Concurrent requests for bytes already being
+signed wait on that one sign; it runs on its own task, so a client hanging up
+cannot abort it, and a failure fails all waiters at once. Entries live while
+used (idle TTL 2 minutes, swept every 256 inserts, 16k hard cap). Consumers see
+nothing different: same bytes, a valid signature, the same expiry.
 
 `oracle_signature_cache_hits_total` / `_misses_total` and
 `oracle_signature_cache_entries` on `/metrics` show the effect; the KMS bill
@@ -82,18 +78,14 @@ nix develop
 
 # Run with secrets in env + config.toml on disk
 SIGNER_PRIVATE_KEY=0x... \
-ALPACA_API_KEY_ID=... \
-ALPACA_API_SECRET_KEY=... \
 cargo run -- --config config.toml
 ```
 
 ### Environment variables (secrets only)
 
-| Variable                | Description                         |
-| ----------------------- | ----------------------------------- |
-| `SIGNER_PRIVATE_KEY`    | Hex private key for EIP-191 signing |
-| `ALPACA_API_KEY_ID`     | Alpaca read-only API key            |
-| `ALPACA_API_SECRET_KEY` | Alpaca API secret                   |
+| Variable             | Description                         |
+| -------------------- | ----------------------------------- |
+| `SIGNER_PRIVATE_KEY` | Hex private key for EIP-191 signing |
 
 ### config.toml
 
@@ -262,8 +254,9 @@ and region as the Base production service.
    the current released digest. Its runtime env must mirror the Base production
    service: `SIGNER_KMS_KEY` (see RAI-1991 above — same key or a
    Robinhood-specific one, a decision, not a default), `PRICING_WS_URL`,
-   `PRICING_API_KEY` or `PRICING_IAM_AUTH=true`, `ALPACA_API_KEY_ID`,
-   `ALPACA_API_SECRET_KEY`.
+   `PRICING_API_KEY` or `PRICING_IAM_AUTH=true`. Images that still read the
+   Alpaca calendar, a rollback image included, also require `ALPACA_API_KEY_ID`
+   and `ALPACA_API_SECRET_KEY` and exit at argument parsing without them.
 2. **`CONFIG_PATH=/config/st0x-oracle-server.toml` on that service.** The image
    carries no baked config or default `CONFIG_PATH`. The service must mount its
    chain-specific config and set this path; a missing config fails boot.
@@ -329,15 +322,16 @@ matching the request:
 ```
 
 If the requested symbol has no usable pricing quote, executable schemas return
-HTTP 503 with one of two stable machine-readable `error` values: `no_live_quote`
-when the cache has no live entry, or `expired_quote` when the cached quote has
-reached its exclusive expiry deadline. `detail` is for humans; clients must
-match `error` exactly. Without the `allowFailure` flag (see below) a batch fails
-as one request and never returns a partial response array. Schemas v5, v6, and
-v7 encode the earlier of the pricing frame's freshness expiry and execution
-deadline in slot 8. The on-chain check is exclusive, so the server floors the
-bound and refuses the final partial second. Schemas v1 and v4 return
-`legacy_schema` because they cannot carry that bound.
+HTTP 503 with a stable machine-readable `error` value: `no_live_quote` when the
+cache has no live entry, `expired_quote` when the cached quote has reached its
+exclusive expiry deadline, `missing_session` when the quote carries no market
+session, or `invalid_session` when its session does not hold together. `detail`
+is for humans; clients must match `error` exactly. Without the `allowFailure`
+flag (see below) a batch fails as one request and never returns a partial
+response array. Schemas v5, v6, and v7 encode the earlier of the pricing frame's
+freshness expiry and execution deadline in slot 8. The on-chain check is
+exclusive, so the server floors the bound and refuses the final partial second.
+Schemas v1 and v4 return `legacy_schema` because they cannot carry that bound.
 
 ### Per-item results for batches: `allowFailure`
 
@@ -367,10 +361,10 @@ context or an error, in request order:
 ```
 
 The `error` codes are the same as the HTTP error bodies: `bad_request`,
-`no_live_quote`, `expired_quote`, `legacy_schema`, and `internal_error`. The
-expiry check at the end of a batch also applies per item: a slot that expired
-while the batch signed is an error item, and the other slots are still
-delivered.
+`no_live_quote`, `expired_quote`, `missing_session`, `invalid_session`,
+`legacy_schema`, and `internal_error`. The expiry check at the end of a batch
+also applies per item: a slot that expired while the batch signed is an error
+item, and the other slots are still delivered.
 
 Rules:
 
@@ -408,13 +402,21 @@ Schema v7 context layout (`POST /context/v7`):
 - `context[1]`: price of the vault's **underlying** asset, for this request's
   direction
 - `context[2]`: publish_time (Unix seconds; the pricing frame's own `source_ts`)
-- `context[3]`: session tag
+- `context[3]`: session tag: `rth`, `premarket`, `afterhours` or `closed`
 - `context[4]`: session start (Unix seconds)
 - `context[5]`: session end (Unix seconds)
 - `context[6]`: input token address
 - `context[7]`: output token address
 - `context[8]`: exclusive freshness and execution bound (Unix seconds)
 - `context[9]`: chain id this deployment signs for
+
+Slots 3-5 are the session the pricing quote was priced in, on the asset's
+listing exchange: US listings use `premarket`, `rth` and `afterhours`; EU
+listings only `rth` (continuous trading). Outside them the tag is `closed`, from
+the previous close to the next open. A `closed` bound that pricing cannot know
+equals the quote's `source_ts` (slot 2), so slot 5 is not always the next open.
+A quote without a session is refused with `missing_session`, and one whose
+session does not contain its `source_ts` with `invalid_session`.
 
 No slot carries a NAV ratio: v7 signs the underlying price and the strategy
 derives the vault price on-chain from the live `erc4626-convert-to-assets`
