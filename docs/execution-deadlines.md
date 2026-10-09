@@ -1,9 +1,11 @@
 # Execution deadlines
 
 Deploy pricing metadata before this consumer. Quotes without a positive
-`execution_deadline_unix_ms` fail closed. The v5/v6/v7 signed expiry is the
-earlier of the model freshness expiry and the execution deadline, floored to
-seconds. Settlement must assert `block-timestamp() < signed-context<0 8>`.
+`execution_deadline_unix_ms` fail closed, and so do quotes without a `session`
+or whose session does not contain their `source_ts` (`missing_session`,
+`invalid_session`). The v5/v6/v7 signed expiry is the earlier of the model
+freshness expiry and the execution deadline, floored to seconds. Settlement must
+assert `block-timestamp() < signed-context<0 8>`.
 
 The calendar belongs to pricing: this consumer does not interpret weekdays or
 session names. Daily gaps, weekends, holidays, and future continuous 24/5

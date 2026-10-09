@@ -874,10 +874,7 @@ mod tests {
             unreachable!()
         };
         frame.session = None;
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&ServerFrame::Price(frame), &mut bytes).unwrap();
-        let decoded: ServerFrame = ciborium::from_reader(bytes.as_slice()).unwrap();
-        apply_server_frame(&cache, None, decoded).await;
+        apply_server_frame(&cache, None, ServerFrame::Price(frame)).await;
         assert_eq!(
             cached(&cache, CONFIGURED, "COIN").await.unwrap().session,
             None

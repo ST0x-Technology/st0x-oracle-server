@@ -22,10 +22,13 @@ costs.
 
 Missing or elapsed execution deadlines fail with HTTP 503 for single requests
 and strict batches. An `allowFailure=true` batch returns HTTP 200 with an
-`expired_quote` item. Strategies must enforce `block.timestamp < context[8]` at
-settlement. `/context/v1` and `/context/v4` remain registered only to refuse new
-signatures. See [execution deadlines and migration](docs/execution-deadlines.md)
-before updating a consumer.
+`expired_quote` item. A quote without a session, or whose session does not
+contain its `source_ts`, fails the same way with `missing_session` or
+`invalid_session`, and the `oracle-refuses-quote-session-production` alert pages
+on either. Strategies must enforce `block.timestamp < context[8]` at settlement.
+`/context/v1` and `/context/v4` remain registered only to refuse new signatures.
+See [execution deadlines and migration](docs/execution-deadlines.md) before
+updating a consumer.
 
 ### Signature cache
 
