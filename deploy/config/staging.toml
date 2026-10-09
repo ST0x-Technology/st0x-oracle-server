@@ -18,7 +18,7 @@ port = 3000
 ws_url = "ws://st0x-pricing:8080/ws"
 consumer = "oracle"
 
-# Tokens come from T0's token file in the bucket (st0x.registry
+# Tokens come from T0's token file in the bucket (T0Trade/t0.tokens
 # t0/staging.toml): every slot on this chain priced for raindex, as
 # `wt<SYM>` at its tokenized_equity_derivative (src/token_file.rs).
 # The oracle always runs the latest copy: boot reads it first and refuses

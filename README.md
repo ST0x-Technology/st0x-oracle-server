@@ -122,7 +122,8 @@ a config for a chain whose tokens are still deploying fails to load rather than
 booting a registry that resolves nothing.
 
 The deployed configs carry no `[[tokens]]`. A `[registry]` section names T0's
-token file in the bucket (`st0x.registry` `t0/<env>.toml`), and boot takes every
+token file in the bucket (`t0/<env>.toml` in the private `T0Trade/t0.tokens`
+repository, uploaded by its `publish-t0-tokens` workflow), and boot takes every
 slot on the config's chain with `pricing = "enabled"` and `raindex` in its
 `venues`. The server reads the latest bucket copy before it starts and refuses
 to start if the copy is unreachable or invalid. Check a config in full with
@@ -141,8 +142,10 @@ current access token.
 Production token publication is gated by the `tokens-production-publish` PAM
 grant. Its approval now authorizes a live oracle change. Pricing must also
 publish the new assets: an addition returns 503 until a live quote arrives, and
-a quote for a different token address is refused. Pricing hot reload is tracked
-separately in RAI-2784.
+a quote for a different token address is refused. Pricing also follows the
+latest bucket copy every 10 seconds (st0x.pricing v1.12.0), so an asset added to
+the token file becomes servable once pricing publishes a quote for it, with no
+release of either service.
 
 `/status` exposes the running `registry_generation`. `/metrics` exposes
 `oracle_registry_generation`, `oracle_registry_invalid`,
@@ -154,8 +157,8 @@ five minutes or no successful check for two minutes.
 Release the new binary and pin-free config together from a version tag. Avoid a
 config-only production release before that rollout, or after rolling back to an
 older binary. A rollback tag carries its previous binary and config; reverting a
-valid but unwanted token change in st0x.registry and publishing it restores the
-live set within a poll interval.
+valid but unwanted token change in t0.tokens and publishing it restores the live
+set within a poll interval.
 
 ### Chains
 

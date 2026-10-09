@@ -80,7 +80,7 @@ quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 ws_url = "ws://st0x-pricing:8080/ws"
 consumer = "oracle"
 
-# Tokens come from T0's token file in the bucket (st0x.registry
+# Tokens come from T0's token file in the bucket (T0Trade/t0.tokens
 # t0/production.toml): every slot on this chain priced for raindex, as
 # `wt<SYM>` at its tokenized_equity_derivative (src/token_file.rs).
 # The oracle always runs the LATEST copy; there is no pin. Boot reads it

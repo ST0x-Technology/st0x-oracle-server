@@ -1,7 +1,7 @@
 //! T0's per-token config, read from the bucket.
 //!
-//! One file, `t0/<env>.toml` in st0x.registry, holds every token's config
-//! for every T0 service; its CI uploads it to
+//! One file, `t0/<env>.toml` in T0Trade/t0.tokens, holds every token's
+//! config for every T0 service; its CI uploads it to
 //! `gs://t0-artifacts-tokens/<env>/tokens.toml`. The oracle takes from it
 //! the `[[tokens]]` rows of the chain it serves: every slot with
 //! `pricing = "enabled"` whose `venues` list `raindex`. Pricing publishes
