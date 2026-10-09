@@ -49,7 +49,7 @@ base64 = "0.22"
 # st0x-pricing-types crate; the consumer-side glue is ~150 lines of
 # auto-reconnecting WS plumbing in src/pricing_client.rs. Same
 # crates + versions as st0x.bebop / st0x.pricing, pinned to an immutable revision.
-st0x-pricing-types = { git = "https://github.com/ST0x-Technology/st0x.pricing-types", rev = "13e0dfa7aec11bb790eb493bdb19d1ea3e5de590" }
+st0x-pricing-types = { git = "https://github.com/ST0x-Technology/st0x.pricing-types", rev = "436de6c8c7f57928d81524a7190d25eec48a3448" }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 ciborium = "0.2"
 futures-util = "0.3"
