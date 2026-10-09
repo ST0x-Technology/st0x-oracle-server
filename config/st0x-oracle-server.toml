@@ -1,8 +1,7 @@
 # st0x-oracle-server config for local runs, against the staging token file.
-# Secrets (SIGNER_PRIVATE_KEY, PRICING_API_KEY, ALPACA_API_KEY_ID,
-# ALPACA_API_SECRET_KEY) are supplied via environment variables; only
-# non-secret operational settings live here. The deployed configs are in
-# deploy/config/.
+# Secrets (SIGNER_PRIVATE_KEY, PRICING_API_KEY) are supplied via environment
+# variables; only non-secret operational settings live here. The deployed
+# configs are in deploy/config/.
 #
 #   GCS_ACCESS_TOKEN=$(gcloud auth print-access-token) \
 #     cargo run -- --config config/st0x-oracle-server.toml

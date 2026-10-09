@@ -234,11 +234,8 @@ impl From<Result<OracleResponse, crate::AppError>> for BatchItemResponse {
 /// oracle applies no spread of its own — its job is to sign and publish
 /// the maker-side price the pricing service quoted for this direction.
 ///
-/// `publish_time` is the time at which the signed context is being
-/// produced (Unix seconds, UTC). Inside an active session this is `now`;
-/// outside, `MarketHoursCache` rounds it back to the most recent
-/// `session_close` so consumers see a freshness signal that tracks the
-/// market rather than the request clock.
+/// `publish_time` is the pricing quote's `source_ts` (Unix seconds, UTC).
+/// See `publish_time_from_quote`.
 ///
 /// Schema v1 context layout:
 /// - `context[0]`: schema version (Rain Float, = 1)
@@ -277,12 +274,12 @@ pub fn build_context(
 /// - `context[0]`: schema version (Rain Float)
 /// - `context[1]`: price (Rain Float; maker-side for the request's
 ///   direction, spread included — see `pick_rate_bytes`)
-/// - `context[2]`: publish_time (Rain Float, Unix seconds — `now`
-///   in-session, `last_session_close` out-of-session per RAI-693)
+/// - `context[2]`: publish_time (Rain Float, Unix seconds; the quote's
+///   `source_ts`)
 /// - `context[3]`: session tag (Rain IntOrAString bytes32; callers
-///   supply `Session::to_bytes32_v3`)
-/// - `context[4]`: start of the CURRENT session (Rain Float, Unix sec)
-/// - `context[5]`: end of the CURRENT session (Rain Float, Unix sec)
+///   supply `session::tag_bytes32_v3`)
+/// - `context[4]`: start of the quote's session (Rain Float, Unix sec)
+/// - `context[5]`: end of the quote's session (Rain Float, Unix sec)
 fn build_session_context(
     schema_version: u64,
     price_bytes: [u8; 32],
