@@ -239,6 +239,13 @@ groups:
       # whose own scope pricing reports as a planned closure (eligibility 0)
       # anywhere in that range is exempt, since it can close before the US
       # session does. A missing or unknown eligibility series does not exempt.
+      # A restarted pricing refuses every quote for its 420 s cold-start hold,
+      # so the probe arm also exempts a symbol while pricing reported the hold
+      # within the last 10 minutes, if the hold explains its staleness: in the
+      # last 15 minutes it has at most two more stale samples than held ones.
+      # A symbol already stale before the hold keeps paging. More than five
+      # held samples in 30 minutes (one hold gives at most four) is a restart
+      # loop and drops the exemption.
       - uid: s0xparitystal001
         title: oracle-quote-stale-or-unavailable
         condition: B
@@ -261,6 +268,12 @@ groups:
                     and on(env) (
                       max_over_time(timestamp(price_parity_market_session{env="production"})[8m:])
                       - min_over_time(timestamp(price_parity_market_session{env="production"})[8m:]) >= 360
+                    )
+                    unless on(symbol, env, chain) (
+                      count_eq_over_time(price_parity_oracle_quote_stale{env="production"}[15m], 1)
+                      <= on(env) group_left() (max by (env) (sum_over_time(price_parity_pricing_cold_start_holding{env="production"}[15m])) + 2)
+                      and on(env) (max by (env) (max_over_time(price_parity_pricing_cold_start_holding{env="production"}[10m])) == 1)
+                      and on(env) (max by (env) (sum_over_time(price_parity_pricing_cold_start_holding{env="production"}[30m])) <= 5)
                     )
                   )
                   or
@@ -298,7 +311,7 @@ groups:
           summary: >-
             Production has no fresh live oracle quote for {{ $labels.symbol }} on chain {{ $labels.chain }}
           description: >-
-            During regular trading hours, either two probe samples prove a stale or unavailable quote, or the symbol's pricing mark has stopped advancing for more than 15 minutes. A reported quote eligibility of 0 within the previous eight minutes suppresses this alert; missing or unknown eligibility (including -1) does not. After a one-minute hold, {{ $labels.symbol }} is treated as untradeable. This is not an inverted edge. Inspect the price board and oracle/pricing-WS logs. If t0-pricing reports "Broker has no position for upstream symbol", restore the Alpaca position. Otherwise resubscribe the pricing stream, or roll the oracle if it does not recover.
+            During regular trading hours, either two probe samples prove a stale or unavailable quote, or the symbol's pricing mark has stopped advancing for more than 15 minutes. A reported quote eligibility of 0 within the previous eight minutes suppresses this alert; missing or unknown eligibility (including -1) does not. A pricing cold-start hold within the previous ten minutes suppresses the probe arm for a symbol whose stale samples in the previous fifteen minutes exceed the held samples by at most two; repeated holds (more than five held samples in 30 minutes) do not. After a one-minute hold, {{ $labels.symbol }} is treated as untradeable. This is not an inverted edge. Inspect the price board and oracle/pricing-WS logs. If t0-pricing reports "Broker has no position for upstream symbol", restore the Alpaca position. Otherwise resubscribe the pricing stream, or roll the oracle if it does not recover.
         labels: {service: pricing, severity: critical}
       - uid: s0xparityprof001
         title: oracle-spread-off-profile
