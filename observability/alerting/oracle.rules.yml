@@ -243,7 +243,10 @@ groups:
       # so the probe arm also exempts a symbol while pricing reported the hold
       # within the last 10 minutes, if the hold explains its staleness: in the
       # last 15 minutes it has at most two more stale samples than held ones.
-      # A symbol already stale before the hold keeps paging. More than five
+      # The two-sample slack absorbs probe timing around the restart, so a
+      # symbol stale for up to two samples before the hold is exempt with it,
+      # and a page that is already firing can resolve until the hold ends. A
+      # symbol stale for longer before the hold keeps paging. More than five
       # held samples in 30 minutes (one hold gives at most four) is a restart
       # loop and drops the exemption.
       - uid: s0xparitystal001
@@ -311,7 +314,7 @@ groups:
           summary: >-
             Production has no fresh live oracle quote for {{ $labels.symbol }} on chain {{ $labels.chain }}
           description: >-
-            During regular trading hours, either two probe samples prove a stale or unavailable quote, or the symbol's pricing mark has stopped advancing for more than 15 minutes. A reported quote eligibility of 0 within the previous eight minutes suppresses this alert; missing or unknown eligibility (including -1) does not. A pricing cold-start hold within the previous ten minutes suppresses the probe arm for a symbol whose stale samples in the previous fifteen minutes exceed the held samples by at most two; repeated holds (more than five held samples in 30 minutes) do not. After a one-minute hold, {{ $labels.symbol }} is treated as untradeable. This is not an inverted edge. Inspect the price board and oracle/pricing-WS logs. If t0-pricing reports "Broker has no position for upstream symbol", restore the Alpaca position. Otherwise resubscribe the pricing stream, or roll the oracle if it does not recover.
+            During regular trading hours, either two probe samples prove a stale or unavailable quote, or the symbol's pricing mark has stopped advancing for more than 15 minutes. A reported quote eligibility of 0 within the previous eight minutes suppresses this alert; missing or unknown eligibility (including -1) does not. A pricing cold-start hold within the previous ten minutes suppresses the probe arm for a symbol whose stale samples in the previous fifteen minutes exceed the held samples by at most two, so a page that started up to two probe samples before the hold can resolve until the hold ends; repeated holds (more than five held samples in 30 minutes) do not. After a one-minute hold, {{ $labels.symbol }} is treated as untradeable. This is not an inverted edge. Inspect the price board and oracle/pricing-WS logs. If t0-pricing reports "Broker has no position for upstream symbol", restore the Alpaca position. Otherwise resubscribe the pricing stream, or roll the oracle if it does not recover.
         labels: {service: pricing, severity: critical}
       - uid: s0xparityprof001
         title: oracle-spread-off-profile
