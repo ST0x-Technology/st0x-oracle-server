@@ -33,10 +33,10 @@ name: robinhood-release
 #
 # CONCURRENCY, deliberately shared with production-release/release-tag:
 # both services live in project t0-oracle and both gate on the SAME
-# `app-deploy` PAM entitlement there. The shared workflow refuses to ride
-# an open grant whose justification is not its own, so two releases in
-# flight at once would make one of them fail on the other's grant. One
-# release at a time in t0-oracle, whichever chain it targets.
+# `app-deploy` PAM entitlement there. The shared workflow closes a grant
+# another run left open before it asks with its own justification, so a
+# release never rides an approval given for the other chain. One release
+# at a time in t0-oracle, whichever chain it targets.
 
 on:
   workflow_dispatch:
@@ -56,7 +56,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@4a1d2d28716072aa77c3038f9cf6d58bea5a2e9c # app-release @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@aa0b5e84363e4bfd9f36c8a95ba1edb7e4ff34b7 # app-release @ .github main
     with:
       environment: production
       runtime: cloud-run
