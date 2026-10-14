@@ -7,7 +7,8 @@ name: production-release
 # `app-deploy` entitlement in t0-oracle. One manual action plus the
 # app-deploy PAM approval in t0-oracle, or no new approval inside an
 # approved deploy-window grant (deploy-window.yml; a window covers Base
-# and Robinhood alike):
+# and Robinhood alike, for merged code from a v* tag or main with at
+# least 30 minutes of the window left, else a one-off approval):
 #   Actions -> production-release -> Run workflow
 #     version = vX.Y.Z  : image AND deploy/config/production.toml from that tag
 #                         (new version, re-deploy or rollback);
@@ -39,7 +40,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@99e02ccfeea6ace62853858f3a8d8c10c8d798c5 # app-release @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@4a1d2d28716072aa77c3038f9cf6d58bea5a2e9c # app-release @ .github main
     with:
       environment: production
       runtime: cloud-run

@@ -5,7 +5,8 @@ name: robinhood-release
 # Robinhood is a second Cloud Run service reading a second config from a
 # second runtime-config secret — the same image, the same attestor, the
 # same PAM gate as Base (an approved `deploy-window` grant in t0-oracle
-# covers this service too: inside it a release rolls with no new approval):
+# covers this service too: merged code from a v* tag or main, with at least
+# 30 minutes of the window left, rolls with no new approval):
 #
 #   Actions -> robinhood-release -> Run workflow
 #     version = vX.Y.Z  : image AND deploy/config/robinhood.toml from that
@@ -55,7 +56,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@99e02ccfeea6ace62853858f3a8d8c10c8d798c5 # app-release @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@4a1d2d28716072aa77c3038f9cf6d58bea5a2e9c # app-release @ .github main
     with:
       environment: production
       runtime: cloud-run
