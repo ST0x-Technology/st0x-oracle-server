@@ -4,7 +4,8 @@ name: robinhood-release
 # to roll it. One deployment serves one chain (README "Chains"), so
 # Robinhood is a second Cloud Run service reading a second config from a
 # second runtime-config secret — the same image, the same attestor, the
-# same PAM gate as Base:
+# same PAM gate as Base (an approved `deploy-window` grant in t0-oracle
+# covers this service too: inside it a release rolls with no new approval):
 #
 #   Actions -> robinhood-release -> Run workflow
 #     version = vX.Y.Z  : image AND deploy/config/robinhood.toml from that

@@ -224,7 +224,7 @@ chain signs frames its own orders will refuse.
 Each deployment rolls on its own: `deploy.yml` rolls Base staging on every main
 merge, `production-release.yml` rolls Base production, and
 `robinhood-release.yml` rolls Robinhood — one manual dispatch each, production
-and Robinhood both behind the `app-deploy` PAM grant in `t0-oracle`. They share
+and Robinhood both behind the `app-deploy` PAM grant in `t0-oracle` (or an approved `deploy-window` grant, which covers both). They share
 a concurrency group because they share that entitlement. One image serves all of
 them; only the config and the service differ. Every deployed config is validated
 on PRs by `config-check.yml` and again inside the exact digest it will run on
@@ -275,14 +275,14 @@ and region as the Base production service.
    `t0-artifacts`, scoped to the new objects:
    - `oracle-releaser@t0-artifacts.iam.gserviceaccount.com` —
      `run.services.get`/`update` on `t0-oracle-robinhood` **through the
-     `app-deploy` PAM entitlement only** (no standing deploy role), plus
+     `app-deploy` and `deploy-window` PAM entitlements only** (no standing deploy role), plus
      `secretmanager.viewer` + `secretVersionAdder` on
      `oracle-runtime-config-robinhood`, and `iam.serviceAccounts.actAs` on the
      service's runtime SA.
    - `oracle-labeler@t0-artifacts.iam.gserviceaccount.com` — nothing new;
      `config-check` only pulls the released image, which it can already do.
    - `oracle-deployer@…` — nothing new; it never touches this plane.
-5. **`app-deploy` PAM entitlement in `t0-oracle`** — extend its role bindings to
+5. **`app-deploy` and `deploy-window` PAM entitlements in `t0-oracle`** — extend its role bindings to
    cover the new service. Approvers see one justification naming
    `t0-oracle-robinhood`; if the entitlement's role doesn't reach the service,
    the grant activates and the deploy still 403s.
