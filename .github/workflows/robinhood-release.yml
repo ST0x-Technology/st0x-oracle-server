@@ -4,7 +4,9 @@ name: robinhood-release
 # to roll it. One deployment serves one chain (README "Chains"), so
 # Robinhood is a second Cloud Run service reading a second config from a
 # second runtime-config secret — the same image, the same attestor, the
-# same PAM gate as Base:
+# same PAM gate as Base (an approved `deploy-window` grant in t0-oracle
+# covers this service too: merged code from a v* tag or main, with at least
+# 30 minutes of the window left, rolls with no new approval):
 #
 #   Actions -> robinhood-release -> Run workflow
 #     version = vX.Y.Z  : image AND deploy/config/robinhood.toml from that
@@ -31,10 +33,10 @@ name: robinhood-release
 #
 # CONCURRENCY, deliberately shared with production-release/release-tag:
 # both services live in project t0-oracle and both gate on the SAME
-# `app-deploy` PAM entitlement there. The shared workflow refuses to ride
-# an open grant whose justification is not its own, so two releases in
-# flight at once would make one of them fail on the other's grant. One
-# release at a time in t0-oracle, whichever chain it targets.
+# `app-deploy` PAM entitlement there. The shared workflow closes a grant
+# another run left open before it asks with its own justification, so a
+# release never rides an approval given for the other chain. One release
+# at a time in t0-oracle, whichever chain it targets.
 
 on:
   workflow_dispatch:
@@ -54,7 +56,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@0780aeff7a248998e6d84deb45b7cd5c3be8b6cd # app-release @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@aa0b5e84363e4bfd9f36c8a95ba1edb7e4ff34b7 # app-release @ .github main
     with:
       environment: production
       runtime: cloud-run

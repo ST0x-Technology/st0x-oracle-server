@@ -5,7 +5,10 @@ name: production-release
 # config and is rolled by robinhood-release.yml; the two share the
 # `production-release` concurrency group because they share the
 # `app-deploy` entitlement in t0-oracle. One manual action plus the
-# app-deploy PAM approval in t0-oracle:
+# app-deploy PAM approval in t0-oracle, or no new approval inside an
+# approved deploy-window grant (deploy-window.yml; a window covers Base
+# and Robinhood alike, for merged code from a v* tag or main with at
+# least 30 minutes of the window left, else a one-off approval):
 #   Actions -> production-release -> Run workflow
 #     version = vX.Y.Z  : image AND deploy/config/production.toml from that tag
 #                         (new version, re-deploy or rollback);
@@ -37,7 +40,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@0780aeff7a248998e6d84deb45b7cd5c3be8b6cd # app-release @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@aa0b5e84363e4bfd9f36c8a95ba1edb7e4ff34b7 # app-release @ .github main
     with:
       environment: production
       runtime: cloud-run
