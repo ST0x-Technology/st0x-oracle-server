@@ -1,12 +1,11 @@
-pub mod alpaca;
 pub mod config;
-pub mod market_hours;
 pub mod metrics;
 pub mod oracle;
 pub mod pricing_client;
 pub mod registry;
 pub mod reload;
 pub mod reuse;
+pub mod session;
 pub mod sign;
 pub mod token_file;
 pub mod tokens;
@@ -29,7 +28,6 @@ use sign::Signer;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::market_hours::MarketHoursCache;
 use crate::metrics::MetricsHandle;
 use crate::pricing_client::{LiveClient, QuoteSnapshot};
 use crate::registry::{PriceDirection, ResolvedPair, TokenRegistry};
@@ -102,14 +100,8 @@ pub struct AppState {
     /// `oracle::SCHEMA_VERSION_V7`.
     chain_id: u64,
     /// Live WS subscription to st0x.pricing. Background-tasked, holds
-    /// the latest `Quote` per symbol in an RwLock<HashMap>. Replaces
-    /// the Alpaca polling cache (pre-RAI-360).
+    /// the latest `Quote` per symbol in an RwLock<HashMap>.
     pricing: LiveClient,
-    /// Market-hours source from Alpaca's calendar, used ONLY to classify
-    /// the current session for the v4/v5 session slots (tag +
-    /// start/end bounds). `publish_time` comes from the pricing quote's
-    /// own `source_ts_unix_ms`, not from this cache.
-    market_hours: Arc<MarketHoursCache>,
     /// Prometheus exposition format renderer for `/metrics`.
     metrics: MetricsHandle,
     /// Cross-frame signature reuse for v5/v6/v7 (see `reuse`).
@@ -124,7 +116,6 @@ impl AppState {
         chain_id: u64,
         pricing: LiveClient,
         configured_symbols: Vec<String>,
-        market_hours: Arc<MarketHoursCache>,
         metrics: MetricsHandle,
     ) -> Self {
         Self::with_tokens(
@@ -132,7 +123,6 @@ impl AppState {
             Tokens::new(TokenSet::new(registry, configured_symbols)),
             chain_id,
             pricing,
-            market_hours,
             metrics,
         )
     }
@@ -144,7 +134,6 @@ impl AppState {
         tokens: Tokens,
         chain_id: u64,
         pricing: LiveClient,
-        market_hours: Arc<MarketHoursCache>,
         metrics: MetricsHandle,
     ) -> Self {
         Self {
@@ -152,7 +141,6 @@ impl AppState {
             tokens,
             chain_id,
             pricing,
-            market_hours,
             metrics,
             // Off until `with_signature_reuse` is called: `main.rs` passes
             // the configured margin, tests opt in explicitly so nothing
@@ -249,7 +237,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
 pub struct ErrorResponse {
     /// Stable machine-readable code: `bad_request`, `internal_error`, or
     /// one of the `UnavailableReason` codes (`no_live_quote`,
-    /// `expired_quote`). Mirrors the HTTP status `AppError` maps to.
+    /// `expired_quote`, `legacy_schema`, `missing_session`,
+    /// `invalid_session`). Mirrors the HTTP status `AppError` maps to.
     pub error: String,
     /// Human-readable detail for logs and debugging.
     pub detail: String,
@@ -1004,14 +993,9 @@ async fn post_signed_context_pair_bound(
         .collect();
     let snapshot = state.pricing.snapshot_many(&needed_symbols).await;
 
-    // Session classification is snapshot once per batch; publish_time is
-    // per-quote (the pricing quote's own source_ts), read inside the builder.
-    let session_info = state.market_hours.session_info_for(Utc::now()).await;
-
     let built = build_slots(resolved, envelope, |(input_token, output_token, pair)| {
         let state = &state;
         let snapshot = &snapshot;
-        let session_info = &session_info;
         async move {
             let quote = snapshot
                 .get(&pair.symbol)
@@ -1022,7 +1006,6 @@ async fn post_signed_context_pair_bound(
                 quote,
                 input_token,
                 output_token,
-                session_info,
                 schema,
             )
             .await?;
@@ -1266,8 +1249,7 @@ fn pick_underlying_rate_bytes(
 /// market-hours truth, and trusting its `source_ts` means a stalled or
 /// frozen pricing feed surfaces directly — `source_ts` stops advancing,
 /// the signed timestamp goes stale, and the strategy's `max-staleness`
-/// rejects. The oracle's own `MarketHoursCache` is used only for the
-/// v4/v5 session slots, never for `publish_time`.
+/// rejects.
 ///
 /// One deliberate exception: while a v5/v6/v7 price is unchanged, the
 /// `reuse` layer serves the previous frame's signature, whose
@@ -1349,6 +1331,8 @@ pub enum UnavailableReason {
     NoLiveQuote,
     ExpiredQuote,
     LegacySchema,
+    MissingSession,
+    InvalidSession,
 }
 
 impl UnavailableReason {
@@ -1357,6 +1341,8 @@ impl UnavailableReason {
             Self::NoLiveQuote => "no_live_quote",
             Self::ExpiredQuote => "expired_quote",
             Self::LegacySchema => "legacy_schema",
+            Self::MissingSession => "missing_session",
+            Self::InvalidSession => "invalid_session",
         }
     }
 }
@@ -1413,6 +1399,34 @@ fn expired_quote_at(
         phase = phase.label(),
         %detail,
         "Refusing expired pricing quote"
+    );
+    unavailable(reason, endpoint, symbol, phase, detail)
+}
+
+fn session_refused(
+    endpoint: &'static str,
+    symbol: &str,
+    refusal: session::SessionRefusal,
+) -> AppError {
+    let phase = RefusalPhase::Admission;
+    let (reason, detail) = match refusal {
+        session::SessionRefusal::Missing => (
+            UnavailableReason::MissingSession,
+            format!("The pricing quote for {symbol} carries no market session."),
+        ),
+        session::SessionRefusal::Invalid(why) => (
+            UnavailableReason::InvalidSession,
+            format!("The pricing quote for {symbol} carries an invalid market session: {why}."),
+        ),
+    };
+    log_refusal!(
+        phase,
+        reason = reason.code(),
+        endpoint,
+        symbol,
+        phase = phase.label(),
+        %detail,
+        "Refusing pricing quote without a usable session"
     );
     unavailable(reason, endpoint, symbol, phase, detail)
 }
@@ -1639,7 +1653,7 @@ async fn build_response_from_quote(
 }
 
 /// Pair-bound response builder (v4/v5/v6/v7). Same publish_time logic as
-/// v1's `build_response_from_quote`, plus the session slots and the
+/// v1's `build_response_from_quote`, plus the quote's own session slots and the
 /// caller's raw input/output token addresses stamped into signed-context
 /// slots 6 and 7; v5/v6/v7 add the quote expiry at slot 8 and v6 the vault
 /// NAV ratio at slot 9. Slot 1 is the vault-share rate for v4/v5/v6 and the
@@ -1652,7 +1666,6 @@ async fn build_response_from_quote_pair_bound(
     quote: &QuoteSnapshot,
     input_token: Address,
     output_token: Address,
-    session_info: &crate::market_hours::SessionInfo,
     schema: PairSchema,
 ) -> Result<BuiltResponse, AppError> {
     validate_quote_liveness(quote, schema.tag(), &pair.symbol, RefusalPhase::Admission)?;
@@ -1672,19 +1685,12 @@ async fn build_response_from_quote_pair_bound(
         RefusalPhase::Admission,
     )?;
     // publish_time is the pricing quote's source_ts (see
-    // `build_response_from_quote`); session slots come from the oracle's
-    // own market-hours classification.
+    // `build_response_from_quote`); the session slots are the session the
+    // quote was priced in, on the asset's listing exchange.
     let publish_time = publish_time_from_quote(quote)?;
-    let session_start: u64 = session_info
-        .start
-        .timestamp()
-        .try_into()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("session_start out of range")))?;
-    let session_end: u64 = session_info
-        .end
-        .timestamp()
-        .try_into()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("session_end out of range")))?;
+    let session = session::SignedSession::from_quote(quote)
+        .map_err(|refusal| session_refused(schema.tag(), &pair.symbol, refusal))?;
+    let (session_start, session_end) = (session.start, session.end);
 
     // Pick the directional rate and invert it into Raindex ratio units
     // (Rain-Float precision). v4/v5/v6 sign the vault-share rate
@@ -1700,7 +1706,7 @@ async fn build_response_from_quote_pair_bound(
 
     // Build the context first: it is cheap (no KMS), and the reuse layer
     // compares the built slots rather than a hand-kept list of them.
-    let session_bytes = session_info.session.to_bytes32_v3();
+    let session_bytes = session::tag_bytes32_v3(session.tag);
     let expiry = if schema.signs_expiry() {
         Some(expiry_from_quote(quote)?)
     } else {
@@ -1823,7 +1829,7 @@ async fn build_response_from_quote_pair_bound(
                 input = %input_token,
                 output = %output_token,
                 candidate_publish_time = publish_time,
-                session = session_info.session.as_str(),
+                session = session.tag.as_str(),
                 session_start,
                 session_end,
                 source_ts_unix_ms = quote.source_ts_unix_ms,
@@ -1878,7 +1884,7 @@ async fn build_response_from_quote_pair_bound(
         input = %input_token,
         output = %output_token,
         publish_time,
-        session = session_info.session.as_str(),
+        session = session.tag.as_str(),
         session_start,
         session_end,
         source_ts_unix_ms = quote.source_ts_unix_ms,
@@ -2007,10 +2013,10 @@ impl From<anyhow::Error> for AppError {
 #[cfg(test)]
 mod expiry_tests {
     use super::*;
-    use crate::market_hours::{Session, SessionInfo};
     use crate::registry::PriceDirection;
     use st0x_pricing_types::{
-        ErrorCode, ErrorFrame, HaltFrame, ServerFrame, WireAddress, WireFloat, WireU256,
+        ErrorCode, ErrorFrame, HaltFrame, QuoteSession, ServerFrame, SessionTag, WireAddress,
+        WireFloat, WireU256,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -2054,6 +2060,11 @@ mod expiry_tests {
             nav_ratio: WireU256::ZERO,
             underlying_rate_base_to_quote: WireFloat::from_bytes(rate.into()),
             underlying_rate_quote_to_base: WireFloat::from_bytes(rate.into()),
+            session: Some(QuoteSession {
+                tag: SessionTag::Rth,
+                start_unix_ms: 0,
+                end_unix_ms: 30_000,
+            }),
         }
     }
 
@@ -2075,7 +2086,6 @@ mod expiry_tests {
             1,
             LiveClient::with_seeded(vec![], 1).await,
             vec!["COIN".into()],
-            Arc::new(MarketHoursCache::new()),
             MetricsHandle::install().unwrap(),
         )
         .with_signature_reuse(reuse_secs)
@@ -2161,7 +2171,6 @@ mod expiry_tests {
                 1,
                 LiveClient::with_seeded(quotes, 1).await,
                 vec!["COIN".into(), "DRAM".into()],
-                Arc::new(MarketHoursCache::new()),
                 MetricsHandle::install().unwrap(),
             )
             .with_clock(clock),
@@ -2293,7 +2302,6 @@ mod expiry_tests {
                 1,
                 pricing.clone(),
                 vec!["COIN".into()],
-                Arc::new(MarketHoursCache::new()),
                 MetricsHandle::install().unwrap(),
             )
             .with_clock(Arc::new(SequenceClock::new([1_000]))),
@@ -2368,7 +2376,6 @@ mod expiry_tests {
                 1,
                 pricing.clone(),
                 vec!["COIN".into()],
-                Arc::new(MarketHoursCache::new()),
                 MetricsHandle::install().unwrap(),
             )
             .with_clock(Arc::new(SequenceClock::new([1_000]))),
@@ -2438,7 +2445,6 @@ mod expiry_tests {
                     1,
                     pricing.clone(),
                     vec!["COIN".into()],
-                    Arc::new(MarketHoursCache::new()),
                     MetricsHandle::install().unwrap(),
                 )
                 .with_clock(Arc::new(SequenceClock::new([1_000]))),
@@ -2611,11 +2617,6 @@ mod expiry_tests {
             state.pricing.seed(test_quote(10_000)).await;
             let fresh = state.pricing.snapshot_many(&["DRAM", "COIN"]).await;
             assert!(fresh["COIN"].is_live());
-            let session = SessionInfo {
-                session: Session::Rth,
-                start: chrono::DateTime::from_timestamp(0, 0).unwrap(),
-                end: chrono::DateTime::from_timestamp(30, 0).unwrap(),
-            };
             for envelope in [false, true] {
                 let mut built = Vec::new();
                 for pair in &pairs {
@@ -2626,7 +2627,6 @@ mod expiry_tests {
                         quote,
                         pair.token,
                         Address::from([0x22; 20]),
-                        &session,
                         PairSchema::V5,
                     )
                     .await
@@ -2870,11 +2870,6 @@ mod expiry_tests {
             1_000, 1_000, 1_000, 1_000, // replacement remains live throughout
         ]));
         let state = test_state(clock, 1).await;
-        let session = SessionInfo {
-            session: Session::Rth,
-            start: chrono::DateTime::from_timestamp(0, 0).unwrap(),
-            end: chrono::DateTime::from_timestamp(30, 0).unwrap(),
-        };
         let input = Address::from([0x11; 20]);
         let output = Address::from([0x22; 20]);
 
@@ -2885,7 +2880,6 @@ mod expiry_tests {
             &first_quote,
             input,
             output,
-            &session,
             PairSchema::V5,
         )
         .await
@@ -2919,7 +2913,6 @@ mod expiry_tests {
             &replacement,
             input,
             output,
-            &session,
             PairSchema::V5,
         )
         .await
@@ -2947,11 +2940,6 @@ mod expiry_tests {
             1_000, 1_000, 10_000, // second response: admission, lookup, reuse return
         ]));
         let state = test_state(clock, 1).await;
-        let session = SessionInfo {
-            session: Session::Rth,
-            start: chrono::DateTime::from_timestamp(0, 0).unwrap(),
-            end: chrono::DateTime::from_timestamp(20, 0).unwrap(),
-        };
         let input = Address::from([0x11; 20]);
         let output = Address::from([0x22; 20]);
         let first_quote = test_snapshot(10_000);
@@ -2961,7 +2949,6 @@ mod expiry_tests {
             &first_quote,
             input,
             output,
-            &session,
             PairSchema::V5,
         )
         .await
@@ -2976,7 +2963,6 @@ mod expiry_tests {
             &next_quote,
             input,
             output,
-            &session,
             PairSchema::V5,
         )
         .await

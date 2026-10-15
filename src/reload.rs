@@ -335,6 +335,11 @@ mod tests {
             nav_ratio: WireU256::ZERO,
             underlying_rate_base_to_quote: WireFloat::default(),
             underlying_rate_quote_to_base: WireFloat::default(),
+            session: Some(st0x_pricing_types::QuoteSession {
+                tag: st0x_pricing_types::SessionTag::Rth,
+                start_unix_ms: 0,
+                end_unix_ms: i64::MAX,
+            }),
         }
     }
 

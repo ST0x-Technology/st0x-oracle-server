@@ -546,6 +546,7 @@ async fn apply_server_frame(
                 nav_ratio: p.nav_ratio,
                 underlying_rate_base_to_quote: p.underlying_rate_base_to_quote,
                 underlying_rate_quote_to_base: p.underlying_rate_quote_to_base,
+                session: p.session,
             };
             let mut guard = cache.write().await;
             // Checked under the write lock `LiveClient::forget` takes: a frame
@@ -762,7 +763,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use st0x_pricing_types::{
-        ErrorFrame, HaltFrame, PriceFrame, Venue, WireAddress, WireFloat, WireU256,
+        ErrorFrame, HaltFrame, PriceFrame, QuoteSession, SessionTag, Venue, WireAddress, WireFloat,
+        WireU256,
     };
 
     /// Base (8453) is what these tests treat as the configured chain.
@@ -788,6 +790,11 @@ mod tests {
             nav_ratio,
             underlying_rate_base_to_quote: WireFloat::from_bytes([0x44; 32]),
             underlying_rate_quote_to_base: WireFloat::from_bytes([0x45; 32]),
+            session: Some(QuoteSession {
+                tag: SessionTag::Rth,
+                start_unix_ms: 1_714_973_400_000,
+                end_unix_ms: 1_715_003_000_000,
+            }),
         })
     }
 
@@ -848,6 +855,30 @@ mod tests {
             "underlying quote->base rate must carry through bit-for-bit"
         );
         assert_eq!(q.execution_deadline_unix_ms, Some(1_715_000_060_000));
+    }
+
+    #[tokio::test]
+    async fn price_frame_stores_its_own_session_and_never_keeps_an_older_one() {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        apply_server_frame(&cache, None, price_frame("COIN", WireU256::ZERO)).await;
+        assert_eq!(
+            cached(&cache, CONFIGURED, "COIN").await.unwrap().session,
+            Some(QuoteSession {
+                tag: SessionTag::Rth,
+                start_unix_ms: 1_714_973_400_000,
+                end_unix_ms: 1_715_003_000_000,
+            })
+        );
+
+        let ServerFrame::Price(mut frame) = price_frame("COIN", WireU256::ZERO) else {
+            unreachable!()
+        };
+        frame.session = None;
+        apply_server_frame(&cache, None, ServerFrame::Price(frame)).await;
+        assert_eq!(
+            cached(&cache, CONFIGURED, "COIN").await.unwrap().session,
+            None
+        );
     }
 
     /// A halt fails closed: the cached quote is evicted immediately, so

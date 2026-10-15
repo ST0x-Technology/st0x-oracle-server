@@ -1,10 +1,9 @@
 use alloy::primitives::{Address, FixedBytes, B256, U256};
 use alloy::sol_types::SolValue;
 use axum::body::Bytes;
-use chrono::{Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
+use chrono::Utc;
 use http_body_util::BodyExt;
 use rain_math_float::Float;
-use st0x_oracle_server::market_hours::{MarketHoursCache, SessionWindow};
 use st0x_oracle_server::metrics::MetricsHandle;
 use st0x_oracle_server::oracle::{BatchItemResponse, OracleResponse};
 use st0x_oracle_server::pricing_client::LiveClient;
@@ -12,9 +11,8 @@ use st0x_oracle_server::registry::TokenRegistry;
 use st0x_oracle_server::sign::Signer;
 use st0x_oracle_server::tokens::{TokenSet, Tokens};
 use st0x_oracle_server::{create_app, AppState, ErrorResponse, EvaluableV4, OrderV4, IOV2};
-use st0x_pricing_types::{Quote, WireAddress, WireFloat, WireU256};
+use st0x_pricing_types::{Quote, QuoteSession, SessionTag, WireAddress, WireFloat, WireU256};
 use std::str::FromStr;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -110,6 +108,25 @@ fn fake_quote(symbol: &str, base_token: &str, quote_to_base: &str, base_to_quote
         // v7 signs the underlying, not the vault rate.
         underlying_rate_base_to_quote: wire_float_of(base_to_quote),
         underlying_rate_quote_to_base: wire_float_of(quote_to_base),
+        session: Some(rth_session()),
+    }
+}
+
+/// The regular session around `FIXED_PUBLISH_TIME` that every seeded quote
+/// carries unless a test replaces it.
+fn rth_session() -> QuoteSession {
+    session(
+        SessionTag::Rth,
+        FIXED_PUBLISH_TIME - 3_600,
+        FIXED_PUBLISH_TIME + 3_600,
+    )
+}
+
+fn session(tag: SessionTag, start_unix_secs: i64, end_unix_secs: i64) -> QuoteSession {
+    QuoteSession {
+        tag,
+        start_unix_ms: start_unix_secs * 1000,
+        end_unix_ms: end_unix_secs * 1000,
     }
 }
 
@@ -126,31 +143,20 @@ fn nav_ratio_pattern() -> WireU256 {
 /// Build a test app with a pre-populated pricing cache. Seeded quotes
 /// carry `source_ts_unix_ms = FIXED_PUBLISH_TIME * 1000`, and since the
 /// oracle signs the quote's source_ts as publish_time, tests assert the
-/// signed publish_time against `FIXED_PUBLISH_TIME`. The market-hours
-/// cache only affects the v4/v5 session slots, not publish_time.
+/// signed publish_time against `FIXED_PUBLISH_TIME`. Each quote carries
+/// `rth_session()`.
 async fn test_app() -> axum::Router {
     test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await
 }
 
 async fn test_app_with(entries: &[(&str, &str, Option<f64>)]) -> axum::Router {
-    test_app_full(entries, fixed_close_market_hours().await).await
+    test_app_full(entries, Some(rth_session())).await
 }
 
-/// Like `test_app_with`, but `now` sits inside a session window that is
-/// fixed when the app is built. Use it for tests that compare the bodies
-/// of SEPARATE requests on v4+ endpoints: with `fixed_close_market_hours`
-/// wall-clock `now` falls after every window, and the server then stamps
-/// slot 5 (session end) with `now` itself, so two requests that straddle
-/// a second boundary sign different bytes and the comparison flakes.
-async fn in_session_app_with(entries: &[(&str, &str, Option<f64>)]) -> axum::Router {
-    test_app_full(entries, always_in_session_market_hours().await).await
-}
-
-/// Same as `test_app_with` but lets a caller plug in any
-/// `MarketHoursCache` configuration — used by the publish_time tests.
+/// Same as `test_app_with` but every seeded quote carries `session`.
 async fn test_app_full(
     entries: &[(&str, &str, Option<f64>)],
-    market_hours: Arc<MarketHoursCache>,
+    session: Option<QuoteSession>,
 ) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
 
@@ -177,7 +183,9 @@ async fn test_app_full(
             // lucky values like 100).
             let inv_f = Float::parse(s.clone()).unwrap().inv().unwrap();
             let inv = inv_f.format().unwrap();
-            quotes.push(fake_quote(sym, addr, &inv, &s));
+            let mut quote = fake_quote(sym, addr, &inv, &s);
+            quote.session = session;
+            quotes.push(quote);
         }
     }
     let pricing = LiveClient::with_seeded(quotes, TEST_CHAIN_ID).await;
@@ -190,7 +198,6 @@ async fn test_app_full(
         TEST_CHAIN_ID,
         pricing,
         configured_symbols,
-        market_hours,
         metrics,
     );
     create_app(state)
@@ -217,7 +224,6 @@ async fn test_app_with_quotes(entries: &[(&str, &str)], quotes: Vec<Quote>) -> a
             .iter()
             .map(|(_, symbol)| (*symbol).to_string())
             .collect(),
-        fixed_close_market_hours().await,
         metrics,
     );
     create_app(state)
@@ -486,7 +492,6 @@ async fn a_replaced_token_set_applies_to_the_next_request() {
         tokens.clone(),
         TEST_CHAIN_ID,
         pricing.clone(),
-        fixed_close_market_hours().await,
         MetricsHandle::install().unwrap(),
     ));
     let sign = || post_status_and_json(app.clone(), "/context/v7", encode_single(USDC, WCOIN));
@@ -559,128 +564,9 @@ async fn test_app_asymmetric(quote_to_base: &str, base_to_quote: &str) -> axum::
         TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
-        fixed_close_market_hours().await,
         metrics,
     );
     create_app(state)
-}
-
-/// Cache with one prior session window in the past, so the app classifies
-/// as "out of session" for the v4/v5 session slots. publish_time is
-/// unaffected (it's the quote's source_ts); this just makes the session
-/// classification deterministic.
-async fn fixed_close_market_hours() -> Arc<MarketHoursCache> {
-    let mh = Arc::new(MarketHoursCache::new());
-    let close = Utc.timestamp_opt(FIXED_PUBLISH_TIME, 0).unwrap();
-    let open = close - ChronoDuration::hours(16);
-    let window = SessionWindow {
-        date: NaiveDate::from_ymd_opt(2027, 1, 14).unwrap(),
-        session_open: open,
-        rth_open: open + ChronoDuration::hours(5) + ChronoDuration::minutes(30), // 09:30 ET
-        rth_close: open + ChronoDuration::hours(12),                             // 16:00 ET
-        session_close: close,
-    };
-    mh.set(vec![window]).await;
-    mh
-}
-
-/// Cache that places `now` strictly inside an active session window, so
-/// the session slots classify as `rth`. publish_time is still the quote's
-/// source_ts regardless; used by the session-slot tests.
-async fn always_in_session_market_hours() -> Arc<MarketHoursCache> {
-    let mh = Arc::new(MarketHoursCache::new());
-    let now = Utc::now();
-    let window = SessionWindow {
-        date: now.date_naive(),
-        session_open: now - ChronoDuration::hours(8),
-        // Bracket `now` in the middle of the RTH sub-window too, so a
-        // session_info_for(now) classifies as Rth.
-        rth_open: now - ChronoDuration::hours(2),
-        rth_close: now + ChronoDuration::hours(2),
-        session_close: now + ChronoDuration::hours(8),
-    };
-    mh.set(vec![window]).await;
-    mh
-}
-
-/// Position the cached window so wall-clock `now` lands in pre-market:
-/// inside the extended session, before the RTH sub-window.
-async fn premarket_market_hours() -> Arc<MarketHoursCache> {
-    let mh = Arc::new(MarketHoursCache::new());
-    let now = Utc::now();
-    let window = SessionWindow {
-        date: now.date_naive(),
-        session_open: now - ChronoDuration::hours(1),
-        rth_open: now + ChronoDuration::hours(2),
-        rth_close: now + ChronoDuration::hours(8),
-        session_close: now + ChronoDuration::hours(12),
-    };
-    mh.set(vec![window]).await;
-    mh
-}
-
-/// After RTH closes but before the extended-session bell rings — `now`
-/// is inside the extended session, past `rth_close`.
-async fn afterhours_market_hours() -> Arc<MarketHoursCache> {
-    let mh = Arc::new(MarketHoursCache::new());
-    let now = Utc::now();
-    let window = SessionWindow {
-        date: now.date_naive(),
-        session_open: now - ChronoDuration::hours(12),
-        rth_open: now - ChronoDuration::hours(8),
-        rth_close: now - ChronoDuration::hours(1),
-        session_close: now + ChronoDuration::hours(2),
-    };
-    mh.set(vec![window]).await;
-    mh
-}
-
-/// Two adjacent weekday windows with `now` in the overnight gap between
-/// them. The gap is ~8 h (typical weekday overnight), below the 12 h
-/// threshold so the classifier returns `OvernightClosed`.
-async fn overnight_closed_market_hours() -> Arc<MarketHoursCache> {
-    let mh = Arc::new(MarketHoursCache::new());
-    let now = Utc::now();
-    let yesterday = SessionWindow {
-        date: (now - ChronoDuration::days(1)).date_naive(),
-        session_open: now - ChronoDuration::hours(20),
-        rth_open: now - ChronoDuration::hours(16),
-        rth_close: now - ChronoDuration::hours(10),
-        session_close: now - ChronoDuration::hours(2), // 2 h ago
-    };
-    let tomorrow = SessionWindow {
-        date: (now + ChronoDuration::days(1)).date_naive(),
-        session_open: now + ChronoDuration::hours(6), // 6 h ahead — 8 h overall gap, < 12 h
-        rth_open: now + ChronoDuration::hours(10),
-        rth_close: now + ChronoDuration::hours(16),
-        session_close: now + ChronoDuration::hours(20),
-    };
-    mh.set(vec![yesterday, tomorrow]).await;
-    mh
-}
-
-/// Two non-adjacent windows separated by a >= 12 h gap straddling
-/// `now`. Mimics Friday-night-through-Monday-morning. The classifier
-/// returns `WeekendClosed`.
-async fn weekend_closed_market_hours() -> Arc<MarketHoursCache> {
-    let mh = Arc::new(MarketHoursCache::new());
-    let now = Utc::now();
-    let friday = SessionWindow {
-        date: (now - ChronoDuration::days(2)).date_naive(),
-        session_open: now - ChronoDuration::hours(60),
-        rth_open: now - ChronoDuration::hours(56),
-        rth_close: now - ChronoDuration::hours(50),
-        session_close: now - ChronoDuration::hours(40), // 40 h ago
-    };
-    let monday = SessionWindow {
-        date: (now + ChronoDuration::days(2)).date_naive(),
-        session_open: now + ChronoDuration::hours(20), // 20 h ahead — 60 h overall gap
-        rth_open: now + ChronoDuration::hours(24),
-        rth_close: now + ChronoDuration::hours(30),
-        session_close: now + ChronoDuration::hours(36),
-    };
-    mh.set(vec![friday, monday]).await;
-    mh
 }
 
 /// Decode a session tag from slot 3 of the signed context. The
@@ -691,6 +577,13 @@ fn decode_session_tag_v3(b: alloy::primitives::FixedBytes<32>) -> String {
     let bytes: [u8; 32] = b.into();
     let len = (bytes[31] & 0x1f) as usize;
     String::from_utf8(bytes[31 - len..31].to_vec()).unwrap()
+}
+
+/// Whether a Rain Float slot, such as a session bound, equals `expected`.
+fn float_slot_is(b: alloy::primitives::FixedBytes<32>, expected: u64) -> bool {
+    Float::from(alloy::primitives::B256::from(b))
+        .eq(Float::parse(expected.to_string()).unwrap())
+        .unwrap()
 }
 
 /// Send a single buy through `/context/v5` and return the decoded
@@ -854,14 +747,9 @@ async fn legacy_schemas_refuse_new_signatures() {
 
 #[tokio::test]
 async fn test_v1_publish_time_is_quote_source_ts_even_when_in_session() {
-    // publish_time is ALWAYS the pricing quote's own `source_ts`, never
-    // the oracle's request clock. Here the market-hours cache says we're
-    // inside an active session — under the old behaviour that would have
-    // stamped `now`. The signed timestamp must instead be the quote's
-    // seeded source_ts (FIXED_PUBLISH_TIME), so the oracle trusts
-    // st0x.pricing's honest as-of stamp rather than re-deriving one.
-    let mh = always_in_session_market_hours().await;
-    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+    // publish_time is the pricing quote's own `source_ts`
+    // (FIXED_PUBLISH_TIME), never the oracle's request clock.
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await;
 
     let response = app
         .oneshot(
@@ -897,8 +785,7 @@ async fn test_v4_binds_input_and_output_tokens_at_slots_6_and_7() {
     // frame across pairs. This test asserts that binding is byte-exact:
     // the caller's USDC + WCOIN come back at slot 6 and slot 7 with
     // Ethereum's Address→bytes32 left-padding.
-    let mh = always_in_session_market_hours().await;
-    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await;
 
     let response = app
         .oneshot(
@@ -979,8 +866,7 @@ async fn test_v4_rejects_the_swapped_token_attack() {
     // for, not to what the victim order will read on-chain — so the
     // v4 strategy's `equal-to(signed-context<0 6> input-token())`
     // check fails and the order reverts.
-    let mh = always_in_session_market_hours().await;
-    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await;
 
     // Attacker requests: input = WCOIN, output = USDC (swapped from the
     // victim's (USDC, WCOIN) IO).
@@ -1031,74 +917,103 @@ async fn test_v4_rejects_the_swapped_token_attack() {
 }
 
 #[tokio::test]
-async fn test_v5_handler_signs_rth_when_now_inside_rth() {
-    let app = test_app_full(
-        &[(WCOIN, "COIN", Some(100.0))],
-        always_in_session_market_hours().await,
-    )
-    .await;
-    assert_eq!(v5_session_tag_for(app).await, "rth");
+async fn test_v5_handler_signs_the_quote_session_tag() {
+    for (tag, name) in [
+        (SessionTag::Rth, "rth"),
+        (SessionTag::Premarket, "premarket"),
+        (SessionTag::Afterhours, "afterhours"),
+        (SessionTag::Closed, "closed"),
+    ] {
+        let app = test_app_full(
+            &[(WCOIN, "COIN", Some(100.0))],
+            Some(session(
+                tag,
+                FIXED_PUBLISH_TIME - 60,
+                FIXED_PUBLISH_TIME + 60,
+            )),
+        )
+        .await;
+        assert_eq!(v5_session_tag_for(app).await, name);
+    }
 }
 
 #[tokio::test]
-async fn test_v5_handler_signs_premarket_when_now_before_rth_open() {
-    let app = test_app_full(
-        &[(WCOIN, "COIN", Some(100.0))],
-        premarket_market_hours().await,
+async fn test_quotes_in_one_batch_sign_their_own_sessions() {
+    // 2026-10-14 07:30 UTC: Paris is in continuous trading (07:00 to
+    // 15:30 UTC) while New York is closed until 08:00 UTC.
+    let read_at = 1_791_963_000;
+    let mut paris = fake_quote("COIN", WCOIN, "0.01", "100");
+    paris.source_ts_unix_ms = read_at * 1000;
+    paris.session = Some(session(SessionTag::Rth, 1_791_961_200, 1_791_991_800));
+    let mut new_york = fake_quote("DRAM", WDRAM, "0.02", "50");
+    new_york.source_ts_unix_ms = read_at * 1000;
+    new_york.session = Some(session(SessionTag::Closed, 1_791_936_000, 1_791_964_800));
+    let app =
+        test_app_with_quotes(&[(WCOIN, "COIN"), (WDRAM, "DRAM")], vec![paris, new_york]).await;
+
+    let (status, json) = post_json(
+        app,
+        "/context/v7",
+        encode_batch(&[(USDC, WCOIN), (USDC, WDRAM)]),
     )
     .await;
-    assert_eq!(v5_session_tag_for(app).await, "premarket");
+    assert_eq!(status, 200, "{json}");
+    let responses: Vec<OracleResponse> = serde_json::from_value(json).unwrap();
+    for (response, tag, start, end) in [
+        (&responses[0], "rth", 1_791_961_200, 1_791_991_800),
+        (&responses[1], "closed", 1_791_936_000, 1_791_964_800),
+    ] {
+        assert_eq!(decode_session_tag_v3(response.context[3]), tag);
+        assert!(float_slot_is(response.context[4], start), "{tag} start");
+        assert!(float_slot_is(response.context[5], end), "{tag} end");
+    }
 }
 
 #[tokio::test]
-async fn test_v5_handler_signs_afterhours_when_now_past_rth_close() {
-    let app = test_app_full(
-        &[(WCOIN, "COIN", Some(100.0))],
-        afterhours_market_hours().await,
-    )
-    .await;
-    assert_eq!(v5_session_tag_for(app).await, "afterhours");
+async fn test_a_quote_without_a_session_is_refused() {
+    let mut paris = fake_quote("COIN", WCOIN, "0.01", "100");
+    paris.session = None;
+    let new_york = fake_quote("DRAM", WDRAM, "0.02", "50");
+    let entries = [(WCOIN, "COIN"), (WDRAM, "DRAM")];
+    for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
+        let app = test_app_with_quotes(&entries, vec![paris.clone(), new_york.clone()]).await;
+        let (status, json) = post_json(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
+        assert_eq!(status, 503, "{endpoint}: {json}");
+        assert_eq!(json["error"], "missing_session", "{endpoint}: {json}");
+
+        let batch = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM)]);
+        let (status, json) = post_json(app.clone(), endpoint, batch.clone()).await;
+        assert_eq!(status, 503, "{endpoint} strict batch: {json}");
+        assert_eq!(json["error"], "missing_session", "{endpoint}: {json}");
+
+        let (status, json) = post_json(app, &format!("{endpoint}?allowFailure=true"), batch).await;
+        assert_eq!(status, 200, "{endpoint} allowFailure: {json}");
+        assert_eq!(json[0]["status"], "error", "{endpoint}: {json}");
+        assert_eq!(
+            json[0]["body"]["error"], "missing_session",
+            "{endpoint}: {json}"
+        );
+        assert_eq!(json[1]["status"], "ok", "{endpoint}: {json}");
+    }
 }
 
 #[tokio::test]
-async fn test_v5_handler_signs_overnight_closed_for_short_gap() {
-    let app = test_app_full(
-        &[(WCOIN, "COIN", Some(100.0))],
-        overnight_closed_market_hours().await,
-    )
-    .await;
-    assert_eq!(v5_session_tag_for(app).await, "overnight_closed");
-}
-
-#[tokio::test]
-async fn test_v5_handler_signs_weekend_closed_for_long_gap() {
-    let app = test_app_full(
-        &[(WCOIN, "COIN", Some(100.0))],
-        weekend_closed_market_hours().await,
-    )
-    .await;
-    assert_eq!(v5_session_tag_for(app).await, "weekend_closed");
-}
-
-#[tokio::test]
-async fn test_v5_session_tag_reflects_market_phase() {
-    // Out-of-session market_hours (fixed_close_market_hours pins us
-    // outside any active window) -> session tag should be a closed
-    // variant, not "rth". With only a single window in the cache and
-    // `now` after it, the cache returns OvernightClosed (no
-    // `next_open` to widen the gap).
-    let app = test_app_full(
-        &[(WCOIN, "COIN", Some(100.0))],
-        fixed_close_market_hours().await,
-    )
-    .await;
-    assert_eq!(v5_session_tag_for(app).await, "overnight_closed");
+async fn test_an_open_session_that_excludes_the_price_time_is_refused() {
+    let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
+    quote.session = Some(session(
+        SessionTag::Rth,
+        FIXED_PUBLISH_TIME + 1,
+        FIXED_PUBLISH_TIME + 3_600,
+    ));
+    let app = test_app_with_quotes(&[(WCOIN, "COIN")], vec![quote]).await;
+    let (status, json) = post_json(app, "/context/v7", encode_single(USDC, WCOIN)).await;
+    assert_eq!(status, 503, "{json}");
+    assert_eq!(json["error"], "invalid_session", "{json}");
 }
 
 #[tokio::test]
 async fn test_v5_batch_returns_length_matching_array_with_session() {
-    let mh = always_in_session_market_hours().await;
-    let app = test_app_full(&[(WCOIN, "COIN", Some(100.0))], mh).await;
+    let app = test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await;
     let response = app
         .oneshot(
             axum::http::Request::builder()
@@ -1416,7 +1331,6 @@ async fn test_v5_endpoint_signs_floored_quote_expiry() {
         TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
-        fixed_close_market_hours().await,
         metrics,
     );
     let app = create_app(state);
@@ -1469,7 +1383,6 @@ async fn test_app_with_nav_ratio(nav_ratio: WireU256) -> (axum::Router, i64) {
         TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
-        fixed_close_market_hours().await,
         metrics,
     );
     (create_app(state), expected_expiry_secs)
@@ -1596,7 +1509,6 @@ async fn test_app_with_underlying(vault_px: &str, underlying_px: &str) -> (axum:
         TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
-        fixed_close_market_hours().await,
         metrics,
     );
     (create_app(state), expected_expiry_secs)
@@ -1640,11 +1552,7 @@ async fn test_v7_endpoint_signs_underlying_price_at_slot_1() {
 /// frame stamped with that same chain id (the cache is chain-scoped, so a
 /// frame stamped for another chain is never served). Everything else
 /// matches `test_app_with_underlying`'s fixture.
-async fn test_app_on_chain(
-    chain_id: u64,
-    expiry_unix_secs: i64,
-    market_hours: Arc<MarketHoursCache>,
-) -> axum::Router {
+async fn test_app_on_chain(chain_id: u64, expiry_unix_secs: i64) -> axum::Router {
     let signer = Signer::new(TEST_KEY).unwrap();
     let registry = TokenRegistry::new(vec![(WCOIN.to_string(), "COIN".to_string())], USDC).unwrap();
     let mut quote = fake_quote("COIN", WCOIN, "0.01", "100");
@@ -1658,7 +1566,6 @@ async fn test_app_on_chain(
         chain_id,
         pricing,
         vec!["COIN".to_string()],
-        market_hours,
         metrics,
     );
     create_app(state)
@@ -1690,14 +1597,13 @@ async fn test_v7_signs_the_configured_chain_not_a_baked_in_base() {
     // deployment must sign 4663 — the whole point of the slot is that two
     // deployments sharing a token address sign distinguishable frames.
     let expiry_unix_secs = Utc::now().timestamp() + 3600;
-    let market_hours = always_in_session_market_hours().await;
     let base = context_of(
-        test_app_on_chain(TEST_CHAIN_ID, expiry_unix_secs, Arc::clone(&market_hours)).await,
+        test_app_on_chain(TEST_CHAIN_ID, expiry_unix_secs).await,
         "/context/v7",
     )
     .await;
     let other = context_of(
-        test_app_on_chain(OTHER_CHAIN_ID, expiry_unix_secs, market_hours).await,
+        test_app_on_chain(OTHER_CHAIN_ID, expiry_unix_secs).await,
         "/context/v7",
     )
     .await;
@@ -1793,7 +1699,6 @@ async fn test_v7_fails_closed_on_absent_underlying_rate() {
         TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string()],
-        fixed_close_market_hours().await,
         metrics,
     );
     let app = create_app(state);
@@ -1832,7 +1737,6 @@ async fn reuse_test_app(reuse_min_remaining_secs: u64) -> (axum::Router, LiveCli
         TEST_CHAIN_ID,
         pricing.clone(),
         vec!["COIN".to_string()],
-        always_in_session_market_hours().await,
         metrics,
     )
     .with_signature_reuse(reuse_min_remaining_secs);
@@ -2058,6 +1962,27 @@ async fn test_v6_reuse_requires_same_nav_ratio() {
     assert_ne!(third.context[9], first.context[9]);
 }
 
+#[tokio::test]
+async fn test_reuse_requires_the_same_quote_session() {
+    let (app, pricing) = reuse_test_app(10).await;
+    pricing.seed(frame("100", FIXED_PUBLISH_TIME, 60)).await;
+    let first = response_of(app.clone(), "/context/v7").await;
+
+    // Same price under another session: slots 3-5 change, so the price is
+    // signed again.
+    let mut q = frame("100", FIXED_PUBLISH_TIME + 5, 60);
+    q.session = Some(session(
+        SessionTag::Afterhours,
+        FIXED_PUBLISH_TIME,
+        FIXED_PUBLISH_TIME + 7_200,
+    ));
+    pricing.seed(q).await;
+    let second = response_of(app, "/context/v7").await;
+    assert_eq!(publish_time_of(&second), secs(FIXED_PUBLISH_TIME + 5));
+    assert_eq!(decode_session_tag_v3(second.context[3]), "afterhours");
+    assert_ne!(second.signature, first.signature);
+}
+
 /// Wire-level pin for the error body shape. `AppError::into_response`
 /// is the single funnel for every non-2xx `/context/v*` reply, and the
 /// batch envelope (`allowFailure=true`) reuses the same body per failed
@@ -2158,7 +2083,7 @@ async fn test_query_string_never_changes_single_tuple_responses() {
     for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
         // Happy path: the flag must NOT envelope a single tuple. In-session
         // app: the bodies of separate requests are compared below.
-        let app = in_session_app_with(&[(WCOIN, "COIN", Some(100.0))]).await;
+        let app = test_app_with(&[(WCOIN, "COIN", Some(100.0))]).await;
         let (base_status, base_body) =
             post(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
         assert_eq!(base_status, 200, "{endpoint}");
@@ -2237,7 +2162,7 @@ async fn test_batch_without_flag_keeps_all_or_nothing_behaviour() {
     for endpoint in ["/context/v5", "/context/v6", "/context/v7"] {
         // Healthy batch: bare array, identical across non-flag queries.
         // In-session app: the bodies of separate requests are compared.
-        let app = in_session_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+        let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
         let healthy = encode_batch(&[(USDC, WCOIN), (WCOIN, USDC)]);
         let (status, base) = post(app.clone(), endpoint, healthy.clone()).await;
         assert_eq!(status, 200, "{endpoint}");
@@ -2522,7 +2447,7 @@ async fn test_pair_bound_batch_with_flag_returns_per_item_envelope() {
     for endpoint in PAIR_BOUND_ENDPOINTS {
         // In-session app: envelope slots are compared with the bodies of
         // separate strict requests.
-        let app = in_session_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
+        let app = test_app_with(&[(WCOIN, "COIN", Some(100.0)), (WDRAM, "DRAM", None)]).await;
         let (_, buy_ref) = post_json(app.clone(), endpoint, encode_single(USDC, WCOIN)).await;
         let (_, sell_ref) = post_json(app.clone(), endpoint, encode_single(WCOIN, USDC)).await;
 
@@ -2985,7 +2910,6 @@ async fn test_v7_absent_underlying_rate_is_per_item_with_flag() {
         TEST_CHAIN_ID,
         pricing,
         vec!["COIN".to_string(), "DRAM".to_string()],
-        fixed_close_market_hours().await,
         metrics,
     ));
     let body = encode_batch(&[(USDC, WCOIN), (USDC, WDRAM)]);

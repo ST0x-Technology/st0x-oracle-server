@@ -69,8 +69,9 @@ groups:
       # never fired at an open boundary, only at 00:11-00:15.
       #
       # Sessions (price_parity_market_session, decoded from the oracle's own
-      # signed session tag, holiday-aware; see the price-parity probe):
-      #   0 weekend_closed  1 overnight_closed  2 premarket  3 rth  4 afterhours
+      # signed session tag, which is the pricing quote's session on the
+      # asset's listing exchange; see the price-parity probe):
+      #   1 closed  2 premarket  3 rth  4 afterhours
       # >= 2 means a live session. afterhours is deliberately NOT gated out:
       # we quote and takers can fill, so a thin edge there is real signal.
       #
@@ -639,3 +640,73 @@ groups:
           description: >-
             The last successful registry fetch is more than 120 seconds old. This instance keeps quoting its current token set but cannot adopt new registry changes. Check GCS access, metadata credentials and oracle_registry_fetch_errors_total. Confirm the timestamp advances after recovery.
         labels: {service: pricing, env: production, severity: warning}
+  - orgId: 1
+    name: oracle-sessions
+    folder: Alerts
+    interval: 1m
+    rules:
+      - uid: t0oraclesessn1
+        title: oracle-refuses-quote-session-production
+        condition: F
+        data:
+          - refId: A
+            queryType: timeSeriesList
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: cloudmon
+            model:
+              datasource: {type: stackdriver, uid: cloudmon}
+              queryType: timeSeriesList
+              refId: A
+              intervalMs: 60000
+              timeSeriesList:
+                projectName: t0-oracle
+                filters:
+                  - "metric.type"
+                  - "="
+                  - "prometheus.googleapis.com/oracle_quote_refusals_total/counter"
+                  - "AND"
+                  - "metric.label.reason"
+                  - "=~"
+                  - "missing_session|invalid_session"
+                alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_DELTA
+                crossSeriesReducer: REDUCE_SUM
+                preprocessor: none
+                groupBys:
+                  - "resource.label.job"
+                  - "metric.label.reason"
+                  - "metric.label.symbol"
+                view: FULL
+          - refId: B
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: reduce
+              reducer: sum
+              expression: A
+              refId: B
+          - refId: F
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {type: last}
+                  type: query
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: threshold
+              expression: B
+              refId: F
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        annotations:
+          summary: Production oracle {{ index $labels "resource.label.job" }} refused {{ index $labels "metric.label.symbol" }} quotes with {{ index $labels "metric.label.reason" }}
+          description: >-
+            The oracle refused {{ $values.B }} signature requests for {{ index $labels "metric.label.symbol" }} in the last 5 minutes because the pricing quote's market session is missing (missing_session) or does not contain the quote's source_ts (invalid_session). No order on that symbol can fill while this lasts. Read the symbol's session on pricing's /snapshot and the `detail` of a /context/v7 response for the symbol, then fix the session pricing sends.
+        labels: {service: pricing, env: production, severity: critical}

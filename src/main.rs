@@ -1,9 +1,5 @@
 use clap::Parser;
-use st0x_oracle_server::alpaca::AlpacaClient;
 use st0x_oracle_server::config::Config;
-use st0x_oracle_server::market_hours::{
-    refresh_once, spawn_market_hours_refresh, MarketHoursCache,
-};
 use st0x_oracle_server::metrics::MetricsHandle;
 use st0x_oracle_server::pricing_client::{LiveClient, LiveClientConfig};
 use st0x_oracle_server::reload::{record_applied, Reloader};
@@ -13,8 +9,6 @@ use st0x_oracle_server::tokens::Tokens;
 use st0x_oracle_server::{create_app, AppState};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -64,23 +58,13 @@ struct Cli {
     /// of the API key. Set true where pricing is a private Cloud Run service.
     #[arg(long, env = "PRICING_IAM_AUTH", action = clap::ArgAction::Set, default_value_t = false)]
     pricing_iam_auth: bool,
-
-    /// Alpaca Broker API key id. Used only for the trading calendar
-    /// endpoint — the oracle no longer polls Alpaca for reference
-    /// prices (live quotes come from st0x.pricing).
-    #[arg(long, env = "ALPACA_API_KEY_ID")]
-    alpaca_api_key_id: String,
-
-    /// Alpaca Broker API secret.
-    #[arg(long, env = "ALPACA_API_SECRET_KEY")]
-    alpaca_api_secret_key: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // `st0x-oracle-server validate [path]` — parse + validate a config file
     // with the rules boot uses and exit. Dispatched before clap so
-    // the serve-only required flags (pricing/Alpaca creds) are not needed:
+    // the serve-only required flags (pricing creds) are not needed:
     // CI validates candidate configs by running the shipped image with no
     // env at all. Path resolution mirrors --config: positional arg, then
     // CONFIG_PATH, then ./config.toml.
@@ -175,7 +159,6 @@ async fn main() -> anyhow::Result<()> {
              GCP Cloud KMS) or SIGNER_PRIVATE_KEY (local dev)"
         ),
     };
-    let alpaca = AlpacaClient::new(&cli.alpaca_api_key_id, &cli.alpaca_api_secret_key);
 
     tracing::info!("Signer address: {}", signer.address());
     tracing::info!(
@@ -218,27 +201,6 @@ async fn main() -> anyhow::Result<()> {
         "Spawned pricing WS subscriber (live quotes warm asynchronously)"
     );
 
-    // Prime market hours (Alpaca trading calendar). Used only to classify
-    // the session for the v2/v3/v4 session slots — `publish_time` comes
-    // from the pricing quote's `source_ts`, so a failure here just means
-    // sessions classify as closed until the hourly refresh succeeds.
-    let market_hours = Arc::new(MarketHoursCache::new());
-    match refresh_once(&market_hours, &alpaca).await {
-        Ok(()) => tracing::info!(
-            window_count = market_hours.window_count().await,
-            "Primed market hours from Alpaca calendar"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "Initial market hours fetch failed; session slots classify as closed until refresh succeeds"
-        ),
-    }
-    spawn_market_hours_refresh(
-        market_hours.clone(),
-        alpaca.clone(),
-        Duration::from_secs(3600),
-    );
-
     let tokens = Tokens::new(token_set);
     Reloader::new(tokens.clone(), assets_tx, pricing.clone()).spawn(
         static_table,
@@ -246,15 +208,8 @@ async fn main() -> anyhow::Result<()> {
         source,
         bucket,
     );
-    let state = AppState::with_tokens(
-        signer,
-        tokens,
-        config.chain_id,
-        pricing,
-        market_hours,
-        metrics,
-    )
-    .with_signature_reuse(config.signing.reuse_min_remaining_secs);
+    let state = AppState::with_tokens(signer, tokens, config.chain_id, pricing, metrics)
+        .with_signature_reuse(config.signing.reuse_min_remaining_secs);
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -372,10 +327,6 @@ mod tests {
             "t.toml",
             "--pricing-api-key",
             "k",
-            "--alpaca-api-key-id",
-            "a",
-            "--alpaca-api-secret-key",
-            "s",
         ])
         .err()
         .expect("serve has no --registry-file");

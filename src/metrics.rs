@@ -99,13 +99,14 @@ impl MetricsHandle {
         metrics::describe_counter!(
             "oracle_context_item_total",
             "Per-item verdicts that reached the wire, labelled by endpoint and outcome \
-             (ok / bad_request / no_live_quote / expired_quote / internal_error). In an allowFailure batch every \
+             (ok / bad_request / no_live_quote / expired_quote / missing_session / invalid_session / \
+             internal_error). In an allowFailure batch every \
              slot is counted; in strict mode a fully signed batch counts N ok and a failed one counts the \
              single aborting error. Join with oracle_context_request_total for a per-item failure rate."
         );
         metrics::describe_counter!(
             "oracle_upstream_failure_total",
-            "Upstream errors fetching reference prices (Alpaca polling today; pricing-service WS after PR 2)"
+            "Upstream errors on the pricing-service WS feed, labelled by kind"
         );
         metrics::describe_gauge!(
             "oracle_cache_freshness_seconds",
@@ -138,7 +139,8 @@ impl MetricsHandle {
         );
         metrics::describe_counter!(
             "oracle_quote_refusals_total",
-            "Quote requests refused because no live quote exists or the snapshotted quote expired"
+            "Quote requests refused, labelled by endpoint, symbol, phase and reason (no_live_quote / \
+             expired_quote / legacy_schema / missing_session / invalid_session)"
         );
         metrics::describe_gauge!(
             "oracle_signature_cache_entries",

@@ -89,17 +89,11 @@ struct CacheMap {
 }
 
 /// Content-addressed signature cache: `keccak256(abi.encodePacked(context))`
-/// to signature. The signed slots (price, publish_time, expiry) derive from
-/// the pricing frame and the pair, and the session slots from the
-/// market-hours cache, which changes only at session boundaries. Two
-/// requests for one pair inside one price frame therefore sign
-/// byte-identical data, and the second reuses the first signature.
-/// Consumers see no difference: same bytes, a valid signature.
-///
-/// Caveat: with an EMPTY market-hours cache (initial calendar fetch failed;
-/// retried hourly by `main.rs`) the session window degenerates to
-/// `start = end = now`, slots 4 and 5 change every second, and this cache
-/// stops helping until the calendar loads. It stays correct, just useless.
+/// to signature. The signed slots (price, publish_time, session, expiry)
+/// derive from the pricing frame and the pair. Two requests for one pair
+/// inside one price frame therefore sign byte-identical data, and the
+/// second reuses the first signature. Consumers see no difference: same
+/// bytes, a valid signature.
 struct SignatureCache {
     map: Mutex<CacheMap>,
     idle_ttl: Duration,
